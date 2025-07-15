@@ -1,0 +1,6 @@
+# @package _global_
+
+env: omnigibson
+
+task:
+  name: turning_on_radio

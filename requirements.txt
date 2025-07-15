@@ -1,0 +1,11 @@
+diffusers
+dm_tree
+einops
+hydra-core
+numpy
+omegaconf
+pytorch-lightning
+transformers
+wandb
+rich
+scikit-learn

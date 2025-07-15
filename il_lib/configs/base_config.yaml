@@ -1,0 +1,116 @@
+defaults:
+  - _self_  # all below configs will override this conf.yaml
+  - policy: ???
+  - task: ???
+
+run_name: "${policy_name}_${task.name}"
+exp_root_dir: .
+policy_name: ???  # filled by policy
+headless: true
+
+# ====== Main Config ======
+seed: -1
+gpus: 1
+num_nodes: 1
+lr: 7e-4
+use_cosine_lr: true
+lr_warmup_steps: 1000
+lr_cosine_steps: 300000
+lr_cosine_min: 5e-6
+lr_layer_decay: 1.0
+wd: 0.0
+bs: 256
+vbs: ${bs}
+data_dir: ???
+eval_interval: 10
+rollout_eval: false
+
+# ====== Action Keys ======
+action_keys: ["mobile_base", "torso", "left_arm", "left_gripper", "right_arm", "right_gripper"]
+action_key_dims:
+  mobile_base: 3
+  torso: 4
+  left_arm: 6
+  left_gripper: 1
+  right_arm: 6
+  right_gripper: 1
+
+# ====== Wandb ======
+use_wandb: true
+wandb_project: B1K
+wandb_group: ${policy_name}
+wandb_run_name: ${run_name}
+
+# ====== Policy Module ======
+module:
+  _target_: ???  # filled by policy
+  eval:
+    eval_on_validation: false
+    env: ${env}
+    task: ${task}
+    robot: ${robot}
+  # ====== learning ======
+  lr: ${lr}
+  use_cosine_lr: ${use_cosine_lr}
+  lr_warmup_steps: ${lr_warmup_steps}
+  lr_cosine_steps: ${lr_cosine_steps}
+  lr_cosine_min: ${lr_cosine_min}
+  lr_layer_decay: ${lr_layer_decay}
+  weight_decay: ${wd}
+  action_keys: ${action_keys}
+
+# ====== Data Module ======
+data_module:
+  _target_: il_lib.datas.BehaviorDataModule
+  data_path: ${data_dir}
+  batch_size: ${bs}
+  val_batch_size: ${vbs}
+  val_split_ratio: 0.1
+  dataloader_num_workers: 4
+  max_num_demos: null 
+  seed: ${seed}
+
+# ====== Trainer ======
+trainer:
+  accelerator: "gpu"
+  devices: ${gpus}
+  num_nodes: ${num_nodes}
+  precision: 32
+  strategy: ddp
+  benchmark: true  # enables cudnn.benchmark
+  accumulate_grad_batches: 1
+  num_sanity_val_steps: 1
+  max_epochs: 999999999
+  val_check_interval: null
+  check_val_every_n_epoch: ${eval_interval}
+  gradient_clip_val: 1.0
+  fast_dev_run: false
+  checkpoint:  # this sub-dict will be popped to send to ModelCheckpoint as args
+  - filename: "epoch{epoch}-train_loss{train/loss:.5f}"
+    save_on_train_epoch_end: true  # this is a training metric, so we save it at the end of training epoch
+    save_top_k: 100
+    save_last: true
+    monitor: "train/loss"
+    mode: min
+    auto_insert_metric_name: false  # prevent creating subfolder caused by the slash
+  - filename: "epoch{epoch}-val_l1_{val/l1:.5f}"
+    save_top_k: -1
+    save_last: true
+    monitor: "val/l1"
+    mode: min
+    auto_insert_metric_name: false  # prevent creating subfolder caused by the slash
+  callbacks:
+    - _target_: pytorch_lightning.callbacks.LearningRateMonitor
+      logging_interval: step
+    - _target_: pytorch_lightning.callbacks.RichModelSummary
+
+
+# ====== Resume training ======
+resume:
+  ckpt_path: null
+  full_state: false  # if true, resume all states including optimizer, amp, lightning callbacks
+  strict: true
+
+# ====== Evaluation ======
+eval: ??? # filled by policy
+log_path: ???
