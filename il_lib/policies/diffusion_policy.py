@@ -1,14 +1,16 @@
-
+import numpy as np
 import torch
+import torch.nn.functional as F
 from hydra.utils import instantiate
 from il_lib.nn.features import SimpleFeatureFusion
-from il_lib.optim import check_optimizer_groups
+from il_lib.optim import check_optimizer_groups, CosineScheduleFunction
 from il_lib.policies.policy_base import BasePolicy
 from il_lib.training.trainer import rank_zero_info
-from il_lib.utils.array_tensor_utils import any_slice, get_batch_size
+from il_lib.utils.array_tensor_utils import any_slice, get_batch_size, any_concat
 from il_lib.utils.functional_utils import call_once
 from omegaconf import DictConfig
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
+from il_lib.utils.eval_utils import PROPRIO_QPOS_INDICES, PROPRIOCEPTION_INDICES
 
 
 class DiffusionPolicy(BasePolicy):
@@ -21,11 +23,11 @@ class DiffusionPolicy(BasePolicy):
 
     def __init__(
         self,
-        *,
+        *args,
         prop_dim: int,
         prop_keys: List[str],
         # ====== Feature Extractors ======
-        feature_extractors: DictConfig,
+        feature_extractors: Dict[str, DictConfig],
         feature_fusion_hidden_depth: int = 1,
         feature_fusion_hidden_dim: int = 256,
         feature_fusion_output_dim: int = 256,
@@ -38,11 +40,22 @@ class DiffusionPolicy(BasePolicy):
         action_keys: List[str],
         action_key_dims: dict[str, int],
         num_latest_obs: int,
+        deployed_action_steps: int,
         # ====== Diffusion ======
         noise_scheduler: DictConfig,
         noise_scheduler_step_kwargs: Optional[dict] = None,
         num_denoise_steps_per_inference: int,
         horizon: int,
+        # ====== Learning ======
+        lr: float,
+        use_cosine_lr: bool = False,
+        lr_warmup_steps: Optional[int] = None,
+        lr_cosine_steps: Optional[int] = None,
+        lr_cosine_min: Optional[float] = None,
+        lr_layer_decay: float = 1.0,
+        optimizer: str = "adam",
+        weight_decay: float = 0.0,
+        **kwargs,
     ):
         super().__init__()
 
@@ -60,10 +73,10 @@ class DiffusionPolicy(BasePolicy):
         )
 
         self.backbone = instantiate(backbone)
-
-        self.action_dim = action_dim
+        
         assert sum(action_key_dims.values()) == action_dim
         assert set(action_keys) == set(action_key_dims.keys())
+        self.action_dim = action_dim
         self._action_keys = action_keys
         self._action_key_dims = action_key_dims
 
@@ -73,6 +86,16 @@ class DiffusionPolicy(BasePolicy):
 
         self.horizon = horizon
         self.num_latest_obs = num_latest_obs
+        self.deployed_action_steps = deployed_action_steps
+        # ====== Learning ======
+        self.lr = lr
+        self.use_cosine_lr = use_cosine_lr
+        self.lr_warmup_steps = lr_warmup_steps
+        self.lr_cosine_steps = lr_cosine_steps
+        self.lr_cosine_min = lr_cosine_min
+        self.lr_layer_decay = lr_layer_decay
+        self.optimizer = optimizer
+        self.weight_decay = weight_decay
 
     def forward(self, obs, noisy_traj, diffusion_timesteps):
         """
@@ -91,7 +114,7 @@ class DiffusionPolicy(BasePolicy):
         prop_obs = torch.cat(prop_obs, dim=-1)  # (B, L, Prop_dim)
         obs = {
             "proprioception": prop_obs,
-            "multi_view_cameras": obs["multi_view_cameras"],
+            "rgb": obs["rgb"],
         }
 
         self._check_forward_input_shape(obs, noisy_traj, diffusion_timesteps)
@@ -151,16 +174,149 @@ class DiffusionPolicy(BasePolicy):
             B_t = get_batch_size(diffusion_timesteps, strict=True)
             assert B_obs == B_traj == B_t, "Batch size must match"
 
+    def policy_training_step(self, batch, batch_idx):
+        batch["actions"] = any_concat(
+            [batch["actions"][k] for k in self._action_keys], dim=-1
+        )  # (B, ctx_len, A)
+        B = batch["actions"].shape[0]
+        batch = self.process_data(batch, extract_action=True)
+
+        # get padding mask
+        pad_mask = batch.pop("masks")
+        trajectories = batch.pop("actions")  # already normalized in [-1, 1], (B, T, A)
+        # sample noise
+        noise = torch.randn(trajectories.shape, device=trajectories.device)
+        # sample diffusion timesteps
+        timesteps = torch.randint(
+            0,
+            self.noise_scheduler.config.num_train_timesteps,
+            (B,),
+            device=trajectories.device,
+        ).long()
+        noisy_trajs = self.noise_scheduler.add_noise(
+            trajectories, noise, timesteps
+        )
+        pred = self.forward(
+            obs=batch, noisy_traj=noisy_trajs, diffusion_timesteps=timesteps
+        )
+        action_loss = F.mse_loss(pred, noise, reduction="none")  # (B, L, A)
+        action_loss = action_loss.mean(dim=-1).reshape(pad_mask.shape)  # (B, L)
+        # reduce the loss according to the action mask
+        # "True" indicates should calculate the loss
+        action_loss = action_loss * pad_mask
+        real_batch_size = pad_mask.sum()
+        action_loss = action_loss.sum() / real_batch_size
+        log_dict = {"diffusion_loss": action_loss}
+        loss = action_loss
+        return loss, log_dict, real_batch_size
+
+    def policy_evaluation_step(self, batch, batch_idx):
+        """
+        Will denoise as if it is in rollout
+        but no env interaction
+        """
+        batch["actions"] = any_concat(
+            [batch["actions"][k] for k in self._action_keys], dim=-1
+        )  # (B, ctx_len, A)
+        batch = self.process_data(batch, extract_action=True)
+        # get padding mask
+        pad_mask = batch.pop("masks")
+        gt_actions = batch.pop("actions")  # already normalized in [-1, 1]
+
+        noisy_traj = torch.randn(
+            size=gt_actions.shape,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        scheduler = self.noise_scheduler
+        scheduler.set_timesteps(self.num_denoise_steps_per_inference)
+        for t in scheduler.timesteps:
+            pred = self.forward(batch, noisy_traj, t)
+            # denosing
+            noisy_traj = scheduler.step(
+                pred, t, noisy_traj, **self.noise_scheduler_step_kwargs
+            ).prev_sample  # (B, T, action_dim)
+        pred_actions = noisy_traj[:, self.num_latest_obs - 1:]
+        gt_actions = gt_actions[:, self.num_latest_obs - 1:]
+        pad_mask = pad_mask[:, self.num_latest_obs - 1:]
+        l1_full_future_horizon = F.l1_loss(
+            pred_actions, gt_actions, reduction="none"
+        )  # (B, L, A)
+        l1_full_future_horizon = l1_full_future_horizon.mean(dim=-1).reshape(
+            pad_mask.shape
+        )  # (B, L)
+        l1_full_future_horizon = l1_full_future_horizon * pad_mask
+        real_batch_size_full_future_horizon = pad_mask.sum()
+
+        deployed_start_t = self.num_latest_obs - 1
+        deployed_end_t = deployed_start_t + self.deployed_action_steps
+        pred_actions_to_deploy = pred_actions[:, deployed_start_t:deployed_end_t]
+        gt_actions = gt_actions[:, deployed_start_t:deployed_end_t]
+        pad_mask = pad_mask[:, deployed_start_t:deployed_end_t]
+        l1_deployed_steps_only = F.l1_loss(
+            pred_actions_to_deploy, gt_actions, reduction="none"
+        )  # (B, L, A)
+        l1_deployed_steps_only = l1_deployed_steps_only.mean(dim=-1).reshape(
+            pad_mask.shape
+        )  # (B, L)
+        l1_deployed_steps_only = l1_deployed_steps_only * pad_mask
+        real_batch_size_deployed_steps_only = pad_mask.sum()
+
+        l1_full_future_horizon = l1_full_future_horizon.sum() / real_batch_size_full_future_horizon
+        l1_deployed_steps_only = l1_deployed_steps_only.sum() / real_batch_size_deployed_steps_only
+        return (
+            l1_full_future_horizon,
+            {
+                "l1": l1_full_future_horizon,
+                "l1_full_future_horizon": l1_full_future_horizon,
+                "l1_deployed_steps_only": l1_deployed_steps_only,
+            },
+            1,
+        )
+
+    def configure_optimizers(self):
+        if self.optimizer == "adamw":
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+        elif self.optimizer == "adam":
+            optimizer = torch.optim.Adam(
+                self.parameters(),
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+        else:
+            raise NotImplementedError
+
+        if self.use_cosine_lr:
+            scheduler_kwargs = dict(
+                base_value=1.0,  # anneal from the original LR value
+                final_value=self.lr_cosine_min / self.lr,
+                epochs=self.lr_cosine_steps,
+                warmup_start_value=self.lr_cosine_min / self.lr,
+                warmup_epochs=self.lr_warmup_steps,
+                steps_per_epoch=1,
+            )
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer=optimizer,
+                lr_lambda=CosineScheduleFunction(**scheduler_kwargs),
+            )
+            return (
+                [optimizer],
+                [{"scheduler": scheduler, "interval": "step"}],
+            )
+
+        return optimizer
+
     def get_optimizer_groups(self, weight_decay, lr_layer_decay, lr_scale=1.0):
-        (
-            feature_encoder_pg,
-            feature_encoder_pid,
-        ) = self.feature_extractor.get_optimizer_groups(
+        feature_encoder_pg, _ = self.feature_extractor.get_optimizer_groups(
             weight_decay=weight_decay,
             lr_layer_decay=lr_layer_decay,
             lr_scale=lr_scale,
         )
-        backbone_pg, backbone_pid = self.backbone.get_optimizer_groups(
+        backbone_pg, _ = self.backbone.get_optimizer_groups(
             weight_decay=weight_decay,
             lr_layer_decay=lr_layer_decay,
             lr_scale=lr_scale,
@@ -169,3 +325,23 @@ class DiffusionPolicy(BasePolicy):
         _, table_str = check_optimizer_groups(self, all_groups, verbose=True)
         rank_zero_info(table_str)
         return all_groups
+
+
+    def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
+        # process observation data
+        proprio = data_batch["obs"]["robot_r1::proprio"]
+        if proprio.ndim == 1:
+            # if proprio is 1D, we need to expand it to 3D
+            proprio = proprio[None, None, :].to(self.device)
+        data = {
+            "rgb": {k: data_batch["obs"][k].movedim(-1, -3) for k in data_batch["obs"] if "rgb" in k},
+            "qpos": {key: proprio[..., PROPRIO_QPOS_INDICES["R1Pro"][key]] for key in PROPRIO_QPOS_INDICES["R1Pro"]},
+            "odom": {"base_velocity": proprio[..., PROPRIOCEPTION_INDICES["R1Pro"]["base_qvel"]]},
+        }
+        if extract_action:
+            # extract action from data_batch
+            data.update({
+                "actions": data_batch["actions"],
+                "masks": data_batch["masks"],
+            })
+        return data

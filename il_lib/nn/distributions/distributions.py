@@ -708,7 +708,7 @@ class GMMHead(nn.Module):
 
         self._low_noise_eval = low_noise_eval
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> MixtureOfGaussian:
         logits = self._logits_mlp(x)
         mean = self._mean_mlp(x)  # (..., n_modes * action_dim)
         scale = self._scale_mlp(x)  # (..., n_modes * action_dim)

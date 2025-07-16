@@ -90,28 +90,28 @@ PROPRIO_QPOS_INDICES = {
 JOINT_RANGE = {
     "R1Pro": {
         "base": (
-            np.array([-0.75, -0.75, -1.0]),
-            np.array([0.75, 0.75, 1.0])
+            np.array([-0.75, -0.75, -1.0], dtype=np.float32),
+            np.array([0.75, 0.75, 1.0], dtype=np.float32)
         ),
         "torso": (
-            np.array([-1.1345, -2.7925, -1.8326, -3.0543]),
-            np.array([1.8326, 2.5307, 1.5708, 3.0543])
+            np.array([-1.1345, -2.7925, -1.8326, -3.0543], dtype=np.float32),
+            np.array([1.8326, 2.5307, 1.5708, 3.0543], dtype=np.float32)
         ),
         "left_arm": (
-            np.array([-4.4506, -0.1745, -2.3562, -2.0944, -2.3562, -1.0472, -1.5708]),
-            np.array([1.3090, 3.1416, 2.3562, 0.3491, 2.3562, 1.0472, 1.5708])
+            np.array([-4.4506, -0.1745, -2.3562, -2.0944, -2.3562, -1.0472, -1.5708], dtype=np.float32),
+            np.array([1.3090, 3.1416, 2.3562, 0.3491, 2.3562, 1.0472, 1.5708], dtype=np.float32)
         ),
         "right_arm": (
-            np.array([-4.4506, -3.1416, -2.3562, -2.0944, -2.3562, -1.0472, -1.5708]),
-            np.array([1.3090, 0.1745, 2.3562, 0.3491, 2.3562, 1.0472, 1.5708])
+            np.array([-4.4506, -3.1416, -2.3562, -2.0944, -2.3562, -1.0472, -1.5708], dtype=np.float32),
+            np.array([1.3090, 0.1745, 2.3562, 0.3491, 2.3562, 1.0472, 1.5708], dtype=np.float32)
         ),
         "left_gripper": (
-            np.array([-1]),
-            np.array([1])
+            np.array([-1], dtype=np.float32),
+            np.array([1], dtype=np.float32)
         ),
         "right_gripper": (
-            np.array([-1]),
-            np.array([1])
+            np.array([-1], dtype=np.float32),
+            np.array([1], dtype=np.float32)
         ),
     }
 }

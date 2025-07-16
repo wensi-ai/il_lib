@@ -12,6 +12,7 @@ class BehaviorDataModule(LightningDataModule):
     def __init__(
         self,
         data_path: str,
+        task_name: str,
         batch_size: int,
         val_batch_size: Optional[int],
         val_split_ratio: float,
@@ -23,6 +24,7 @@ class BehaviorDataModule(LightningDataModule):
     ):
         super().__init__()
         self._data_path = data_path
+        self._task_name = task_name
         self._batch_size = batch_size
         self._val_batch_size = val_batch_size if val_batch_size is not None else batch_size
         self._dataloader_num_workers = dataloader_num_workers
@@ -37,7 +39,7 @@ class BehaviorDataModule(LightningDataModule):
 
     def setup(self, stage: str) -> None:
         if stage == "fit" or stage is None:
-            all_demo_keys = BehaviorDataset.get_all_demo_keys(self._data_path)
+            all_demo_keys = BehaviorDataset.get_all_demo_keys(self._data_path, self._task_name)
             # limit number of demos
             if self._max_num_demos is not None:
                 all_demo_keys = all_demo_keys[: self._max_num_demos]
@@ -46,9 +48,23 @@ class BehaviorDataModule(LightningDataModule):
                 test_size=self._val_split_ratio,
                 random_state=self._seed,
             )
-            
-            self._train_dataset = BehaviorDataset(*self._args, **self._kwargs, seed=self._seed, demo_keys=self._train_demo_keys)
-            self._val_dataset = BehaviorDataset(*self._args, **self._kwargs, seed=self._seed, demo_keys=self._val_demo_keys)
+            # initialize datasets
+            self._train_dataset = BehaviorDataset(
+                *self._args,
+                **self._kwargs,
+                data_path=self._data_path,
+                task_name=self._task_name,
+                seed=self._seed,
+                demo_keys=self._train_demo_keys,
+            )
+            self._val_dataset = BehaviorDataset(
+                *self._args,
+                **self._kwargs,
+                data_path=self._data_path,
+                task_name=self._task_name,
+                seed=self._seed,
+                demo_keys=self._val_demo_keys,
+            )
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
@@ -57,7 +73,7 @@ class BehaviorDataModule(LightningDataModule):
             num_workers=min(self._batch_size, self._dataloader_num_workers),
             pin_memory=True,
             persistent_workers=True,
-            collate_fn=_seq_chunk_collate_fn,
+            # collate_fn=_seq_chunk_collate_fn,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -67,7 +83,7 @@ class BehaviorDataModule(LightningDataModule):
             num_workers=min(self._val_batch_size, self._dataloader_num_workers),
             pin_memory=True,
             persistent_workers=True,
-            collate_fn=_seq_chunk_collate_fn,
+            # collate_fn=_seq_chunk_collate_fn,
         )
 
     def on_train_epoch_start(self):

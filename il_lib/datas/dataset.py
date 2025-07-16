@@ -6,7 +6,7 @@ from copy import deepcopy
 from torch.utils.data import IterableDataset
 from il_lib.utils.array_tensor_utils import any_concat, any_ones_like, any_slice, any_stack, get_batch_size
 from il_lib.utils.eval_utils import ACTION_QPOS_INDICES, JOINT_RANGE
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from omnigibson.learning.utils.obs_utils import OBS_LOADER_MAP
 
@@ -14,13 +14,13 @@ from omnigibson.learning.utils.obs_utils import OBS_LOADER_MAP
 class BehaviorDataset(IterableDataset):
 
     @classmethod
-    def get_all_demo_keys(cls, data_path: str):
-        assert os.path.exists(data_path), f"Data path {data_path} does not exist!"
+    def get_all_demo_keys(cls, data_path: str, task_name: str):
+        assert os.path.exists(f"{data_path}/data/{task_name}"), f"Data path does not exist!"
         demo_keys = []
-        for file_name in sorted(os.listdir(f"{data_path}/low_dim")):
+        for file_name in sorted(os.listdir(f"{data_path}/data/{task_name}")):
             if file_name.endswith(".hdf5"):
                 base_name = file_name.split(".")[0]
-                with h5py.File(os.path.join(data_path, "low_dim", file_name), "r", swmr=True, libver="latest") as f:
+                with h5py.File(os.path.join(data_path, "data", task_name, file_name), "r", swmr=True, libver="latest") as f:
                     for demo_id in f["data"]:
                         demo_keys.append(f"{base_name}::{demo_id}")
         return demo_keys
@@ -28,6 +28,8 @@ class BehaviorDataset(IterableDataset):
     def __init__(
         self,
         *args,
+        data_path: str,
+        task_name: str,
         demo_keys: List[str],
         obs_window_size: int,
         ctx_len: int,
@@ -58,6 +60,8 @@ class BehaviorDataset(IterableDataset):
             shuffle (bool): Whether to shuffle the dataset.
         """
         super().__init__()
+        self._data_path = data_path
+        self._task_name = task_name
         self._demo_keys = demo_keys
         self._obs_window_size = obs_window_size
         self._ctx_len = ctx_len
@@ -79,10 +83,10 @@ class BehaviorDataset(IterableDataset):
 
         # get all demo keys
         self._demo_keys = []
-        for file_name in sorted(os.listdir(f"{data_path}/low_dim")):
+        for file_name in sorted(os.listdir(f"{self._data_path}/data/{self._task_name}")):
             if file_name.endswith(".hdf5"):
                 base_name = file_name.split(".")[0]
-                with h5py.File(os.path.join(data_path, "low_dim", file_name), "r", swmr=True, libver="latest") as f:
+                with h5py.File(os.path.join(data_path, "data", task_name, file_name), "r", swmr=True, libver="latest") as f:
                     for demo_id in f["data"]:
                         if self.robot_type is None:
                             self.robot_type = f["data"][demo_id].attrs["robot_type"]
@@ -115,7 +119,7 @@ class BehaviorDataset(IterableDataset):
             yield from self.get_streamed_data(demo_ptr)
 
     def get_streamed_data(self, demo_ptr: int):
-        self._data_chunk, self._mask_chunk, self._chunk_idxs = self._chunk_demo(self._all_demos[demo_ptr])
+        data_chunks, mask_chunks = self._chunk_demo(self._all_demos[demo_ptr])
         # Initialize obs loaders
         obs_loaders = dict()
         for obs_type in self._visual_obs_types:
@@ -127,31 +131,31 @@ class BehaviorDataset(IterableDataset):
                     kwargs = dict()
                     if obs_type == "seg":
                         kwargs["num_classes"] = 100
-                    obs_loaders[f"{camera_name}::{obs_type}"] = OBS_LOADER_MAP[obs_type](
-                        data_path=self._data_path,
+                    obs_loaders[f"{camera_name}::{obs_type}"] = iter(OBS_LOADER_MAP[obs_type](
+                        data_path=f"{self._data_path}/videos/{self._task_name}",
                         base_name=base_name,
                         demo_id=demo_id, 
                         camera_name=camera_name,
                         batch_size=self._obs_window_size,
                         stride=1,
                         **kwargs,
-                    )
-        for i in range(len(self._data_chunk)):
-            data, mask = self._data_chunk[i], self._mask_chunk[i]
+                    ))
+        for i in range(len(data_chunks)):
+            data, mask = data_chunks[i], mask_chunks[i]
             # load visual obs
             for obs_type in self._visual_obs_types:
                 if obs_type == "pcd":
                     continue # TODO: add pcd loader
                 else:
                     for camera_name in self._multi_view_cameras:
-                        data[f"{camera_name}::{obs_type}"] = next(obs_loaders[f"{camera_name}::{obs_type}"].get_frames())
-            data["mask"] = data["action_chunk_masks"] & mask[:, None] if self._use_action_chunks else mask
-            yield data, mask
+                        data["obs"][f"{camera_name}::{obs_type}"] = next(obs_loaders[f"{camera_name}::{obs_type}"])
+            data["masks"] = data["action_chunk_masks"] & mask[:, None] if self._use_action_chunks else mask
+            yield data
         for obs_type in self._visual_obs_types:
             for camera_name in self._multi_view_cameras:
                 obs_loaders[f"{camera_name}::{obs_type}"].close()
 
-    def _preload_demo(self, demo_key: str):
+    def _preload_demo(self, demo_key: str) -> dict:
         """
         Preload a single demo into memory. Currently it loads action, proprio, and task info.
         Args:
@@ -165,10 +169,12 @@ class BehaviorDataset(IterableDataset):
         
         # load low_dim data
         action_dict = dict()
-        with h5py.File(os.path.join(self._data_path, "low_dim", f"{base_name}.hdf5"), "r", swmr=True, libver="latest") as f:
-            demo["obs"]["proprio"] = f["data"][demo_id]["obs"]["robot_r1::proprio"][:-1].astype(np.float32) # remove last frame
+        with h5py.File(os.path.join(self._data_path, "data", self._task_name, f"{base_name}.hdf5"), "r", swmr=True, libver="latest") as f:
+            # TODO: Fix this (remove -1) with the new data format
+            demo["obs"]["robot_r1::proprio"] = f["data"][demo_id]["obs"]["robot_r1::proprio"][:-1].astype(np.float32) # remove last frame
+
             for key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
-                action_dict[key] = f["data"][demo_id]["action"][:, indices].astype(np.float32)
+                action_dict[key] = f["data"][demo_id]["action"][:, indices]
                 # action normalization
                 action_dict[key] = (action_dict[key] - self._joint_range[key][0]) / (self._joint_range[key][1] - self._joint_range[key][0])
             if self._load_task_info:
@@ -208,40 +214,33 @@ class BehaviorDataset(IterableDataset):
 
         return demo
 
-    def _chunk_demo(self, demo):
-        data_chunks = []
-        chunk_idxs = []
+    def _chunk_demo(self, demo: dict) -> Tuple[List[dict], List[torch.Tensor]]:
+        data_chunks, mask_chunks = [], []
         L = get_batch_size(demo, strict=True)
         assert L >= self._obs_window_size >= 1
         N_chunks = L - self._obs_window_size + 1
         # split obs into chunks
         for chunk_idx in range(N_chunks):
             s = np.s_[chunk_idx : chunk_idx + self._obs_window_size]
-            chunk_idxs.append(chunk_idx)
-            data_chunks.append(any_slice(demo, s))
-        # pad data chunks to equal length of ctx_len
-        data_structure = deepcopy(
-            any_slice(data_chunks[0], np.s_[0:1])
-        )  # (T = 1, ...)
-        padded_data_chunks = [
-            any_concat(
-                [
-                    _chunk,
-                ]
-                + [any_ones_like(data_structure)]
-                * (self._ctx_len - get_batch_size(_chunk)),
-                dim=0,
-            )
-            for _chunk in data_chunks
-        ]  # list of (ctx_len, ...)
-        mask_chunks = [
-            any_concat(
-                [
-                    np.ones((get_batch_size(_chunk),), dtype=bool),
-                    np.zeros((self._ctx_len - get_batch_size(_chunk),), dtype=bool),
-                ],
-                dim=0,
-            )
-            for _chunk in data_chunks
-        ]  # list of (ctx_len,)
-        return padded_data_chunks, mask_chunks, chunk_idxs
+            data = dict()
+            for k in demo:
+                if k == "actions":
+                    data[k] = any_slice(demo[k], np.s_[chunk_idx: chunk_idx + self._ctx_len])
+                    action_chunk_size = get_batch_size(data[k], strict=True)
+                    pad_size = self._ctx_len - action_chunk_size
+                    # pad action chunks to equal length of ctx_len
+                    data[k] = any_concat(
+                        [
+                            data[k],
+                        ]
+                        + [any_ones_like(any_slice(data[k], np.s_[0:1]))] * pad_size,
+                        dim=0,
+                    )
+                    mask_chunks.append(torch.cat([
+                        torch.ones((action_chunk_size,), dtype=torch.bool),
+                        torch.zeros((pad_size,), dtype=torch.bool),
+                    ], dim=0))
+                else:
+                    data[k] = any_slice(demo[k], s)
+            data_chunks.append(data)
+        return data_chunks, mask_chunks

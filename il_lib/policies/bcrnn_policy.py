@@ -1,13 +1,14 @@
 import torch
 import torch.nn as nn
+from hydra.utils import instantiate
 from il_lib.optim.lr_schedule import CosineScheduleFunction
 from il_lib.policies.policy_base import BasePolicy
-from typing import Any, List, Union, Optional, Tuple
-from il_lib.nn.common import MLP
-from il_lib.nn.distributions import GMMHead
-from il_lib.nn.features import SimpleFeatureFusion, MultiviewResNet18
+from typing import Any, Dict, List, Optional, Tuple
+from omegaconf import DictConfig
+from il_lib.nn.distributions import GMMHead, MixtureOfGaussian
+from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.utils.array_tensor_utils import any_slice, get_batch_size, any_concat
-from il_lib.utils.functional_utils import unstack_sequence_fields
+from il_lib.utils.eval_utils import ACTION_QPOS_INDICES, PROPRIOCEPTION_INDICES, PROPRIO_QPOS_INDICES
 
 
 class BC_RNN(BasePolicy):
@@ -17,16 +18,11 @@ class BC_RNN(BasePolicy):
     def __init__(
         self,
         *args,
-        # ====== policy ======
         prop_dim: int,
         prop_keys: List[str],
         action_keys: List[str],
-        obs_mlp_hidden_depth: int,
-        obs_mlp_hidden_dim: int,
-        resnet_output_dim: int,
-        resnet_token_dim: int,
-        resnet_enable_random_crop: bool,
-        resnet_random_crop_size: Optional[Union[int, List[int]]],
+        # ====== Feature Extractors ======
+        feature_extractors: Dict[str, DictConfig],
         feature_fusion_hidden_depth: int = 1,
         feature_fusion_hidden_dim: int = 256,
         feature_fusion_output_dim: int = 256,
@@ -59,24 +55,7 @@ class BC_RNN(BasePolicy):
 
         self._prop_keys = prop_keys
         self.feature_extractor = SimpleFeatureFusion(
-            extractors={
-                "proprioception": MLP(
-                    prop_dim,
-                    hidden_dim=obs_mlp_hidden_dim,
-                    output_dim=obs_mlp_hidden_dim,
-                    hidden_depth=obs_mlp_hidden_depth,
-                    add_output_activation=True,
-                ),
-                "multi_view_cameras": MultiviewResNet18(
-                    ["head_rgb", "left_wrist_rgb", "right_wrist_rgb"],
-                    resnet_output_dim=resnet_output_dim,
-                    token_dim=resnet_token_dim,
-                    load_pretrained=False,
-                    pretrained_ckpt_path=None,
-                    enable_random_crop=resnet_enable_random_crop,
-                    random_crop_size=resnet_random_crop_size,
-                ),
-            },
+            extractors={k: instantiate(v) for k, v in feature_extractors.items()},
             hidden_depth=feature_fusion_hidden_depth,
             hidden_dim=feature_fusion_hidden_dim,
             output_dim=feature_fusion_output_dim,
@@ -101,8 +80,7 @@ class BC_RNN(BasePolicy):
             low_noise_eval=gmm_low_noise_eval,
         )
         self._deterministic_inference = deterministic_inference
-    
-        self.action_keys = action_keys
+        self._action_keys = action_keys
 
         self.lr = lr
         self.use_cosine_lr = use_cosine_lr
@@ -113,12 +91,15 @@ class BC_RNN(BasePolicy):
         self.optimizer = optimizer
         self.weight_decay = weight_decay
 
-    def forward(self, obs: dict, policy_state: torch.Tensor) -> Tuple[torch.distributions.Distribution, torch.Tensor]:
+    def forward(self, 
+        obs: dict,
+        policy_state: Tuple[torch.Tensor, torch.Tensor]
+    ) -> Tuple[MixtureOfGaussian, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward pass of the ACT policy.
+        Forward pass of the BC-RNN policy.
         Args:
             obs: dict of (B, L=1, ...) observations
-            policy_state: rnn_state of shape (h_0, c_0) or h_0
+            policy_state: rnn_state of shape (h_0, c_0)
         Returns:
             action distribution, policy_state
         """
@@ -133,7 +114,7 @@ class BC_RNN(BasePolicy):
         prop_obs = torch.cat(prop_obs, dim=-1)  # (B, L, Prop_dim)
         obs = {
             "proprioception": prop_obs,
-            "multi_view_cameras": obs["multi_view_cameras"],
+            "rgb": obs["rgb"],
         }
 
         x = self.feature_extractor(obs)
@@ -141,11 +122,15 @@ class BC_RNN(BasePolicy):
         return self.action_net(x), policy_state
 
     @torch.no_grad()
-    def act(self, obs: dict, policy_state: torch.Tensor, deterministic: bool=None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def act(self, 
+        obs: dict,
+        policy_state: Tuple[torch.Tensor, torch.Tensor],
+        deterministic: Optional[bool]=None
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
             obs: dict of (B, L=1, ...) observations
-            policy_state: rnn_state of shape (h_0, c_0) or h_0
+            policy_state: rnn_state of shape (h_0, c_0)
             deterministic: if True, use mode of the distribution, otherwise sample
         Returns:
             action: (B, A) tensor of actions
@@ -170,54 +155,28 @@ class BC_RNN(BasePolicy):
 
     def policy_training_step(self, batch, batch_idx) -> Any:
         batch["actions"] = any_concat(
-            [batch["actions"][k] for k in self.action_keys], dim=-1
-        )  # (N_chunks, B, ctx_len, A)
-        B, T = batch["actions"].shape[1:3]
-        # main data is dict of (N_chunks, B, ctx_len, ...)
-        # we loop over chunk dim
-        main_data = unstack_sequence_fields(
-            batch, batch_size=get_batch_size(batch, strict=True)
+            [batch["actions"][k] for k in self._action_keys], dim=-1
+        )  # (B, ctx_len, A)
+        B = batch["actions"].shape[0]
+        print(batch["actions"].shape)
+        batch = self.process_data(batch, extract_action=True)
+
+        policy_state = self._get_initial_state(B)
+        # get padding mask
+        pad_mask = batch.pop("masks")
+        trajectories = batch.pop("actions")  # already normalized in [-1, 1], (B, T, A)
+        pi = self.forward(batch, policy_state)[0]
+        action_loss = pi.imitation_loss(trajectories, reduction="none").reshape(
+            pad_mask.shape
         )
-        all_loss = []
-        all_l1 = []
-        real_batch_size = []
-        for i, main_data_chunk in enumerate(main_data):
-            policy_state = self._get_initial_state(B)
-            # get padding mask
-            pad_mask = main_data_chunk.pop("pad_mask")
-
-            obs = {
-                "pointcloud": main_data_chunk["pointcloud"],
-            }
-            if "multi_view_cameras" in main_data_chunk:
-                obs["multi_view_cameras"] = main_data_chunk["multi_view_cameras"]
-            for k in self._prop_keys:
-                if "/" in k:
-                    group, key = k.split("/")
-                    if group not in obs:
-                        obs[group] = {}
-                    obs[group][key] = main_data_chunk[group][key]
-                else:
-                    obs[k] = main_data_chunk[k]
-
-            trajectories = main_data_chunk[
-                "actions"
-            ]  # already normalized in [-1, 1], (B, T, A)
-            pi = self.forward(obs, policy_state)[0]
-            action_loss = pi.imitation_loss(trajectories, reduction="none").reshape(
-                pad_mask.shape
-            )
-            # reduce the loss according to the action mask
-            # "True" indicates should calculate the loss
-            action_loss = action_loss * pad_mask
-            all_loss.append(action_loss)
-            # minus because imitation_accuracy returns negative l1 distance
-            l1 = -pi.imitation_accuracy(trajectories, pad_mask)
-            all_l1.append(l1)
-            real_batch_size.append(pad_mask.sum())
-        real_batch_size = torch.sum(torch.stack(real_batch_size)).item()
-        action_loss = torch.sum(torch.stack(all_loss)) / real_batch_size
-        l1 = torch.mean(torch.stack(all_l1))
+        # reduce the loss according to the action mask
+        # "True" indicates should calculate the loss
+        action_loss = action_loss * pad_mask
+        # minus because imitation_accuracy returns negative l1 distance
+        l1 = -pi.imitation_accuracy(trajectories, pad_mask)
+        real_batch_size = pad_mask.sum()
+        action_loss = action_loss.sum() / real_batch_size
+        l1 = torch.mean(l1)
         log_dict = {"gmm_loss": action_loss, "l1": l1}
         loss = action_loss
         return loss, log_dict, real_batch_size
@@ -262,9 +221,28 @@ class BC_RNN(BasePolicy):
 
         return optimizer
     
-    def _get_initial_state(self, batch_size: int):
+    def _get_initial_state(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
         h_0 = torch.zeros(
             self.rnn.num_layers, batch_size, self.rnn.hidden_size, device=self.device
         )
         c_0 = torch.zeros_like(h_0)
         return h_0, c_0
+
+    def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
+        # process observation data
+        proprio = data_batch["obs"]["robot_r1::proprio"]
+        if proprio.ndim == 1:
+            # if proprio is 1D, we need to expand it to 3D
+            proprio = proprio[None, None, :].to(self.device)
+        data = {
+            "rgb": {k: data_batch["obs"][k].movedim(-1, -3) for k in data_batch["obs"] if "rgb" in k},
+            "qpos": {key: proprio[..., PROPRIO_QPOS_INDICES["R1Pro"][key]] for key in PROPRIO_QPOS_INDICES["R1Pro"]},
+            "odom": {"base_velocity": proprio[..., PROPRIOCEPTION_INDICES["R1Pro"]["base_qvel"]]},
+        }
+        if extract_action:
+            # extract action from data_batch
+            data.update({
+                "actions": data_batch["actions"],
+                "masks": data_batch["masks"],
+            })
+        return data
