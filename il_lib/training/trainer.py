@@ -176,6 +176,9 @@ class Trainer:
     def validate(self):
         return self.trainer.validate(self.module, datamodule=self.data_module, ckpt_path=None)
 
+    def test(self):
+        return self.trainer.test(self.module, datamodule=self.data_module, ckpt_path=None)
+
 
 @rank_zero_only
 def rank_zero_print(*msg, **kwargs):

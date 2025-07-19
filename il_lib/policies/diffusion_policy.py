@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 import torch.nn.functional as F
 from hydra.utils import instantiate
@@ -10,7 +9,8 @@ from il_lib.utils.array_tensor_utils import any_slice, get_batch_size, any_conca
 from il_lib.utils.functional_utils import call_once
 from omegaconf import DictConfig
 from typing import Any, Dict, Optional, List
-from il_lib.utils.eval_utils import PROPRIO_QPOS_INDICES, PROPRIOCEPTION_INDICES
+
+from omnigibson.learning.utils.eval_utils import JOINT_RANGE_ARRAY
 
 
 class DiffusionPolicy(BasePolicy):
@@ -57,7 +57,7 @@ class DiffusionPolicy(BasePolicy):
         weight_decay: float = 0.0,
         **kwargs,
     ):
-        super().__init__()
+        super().__init__(*args, **kwargs)
 
         self._prop_keys = prop_keys
         self.feature_extractor = SimpleFeatureFusion(
@@ -129,7 +129,8 @@ class DiffusionPolicy(BasePolicy):
         return pred
 
     @torch.no_grad()
-    def act(self, obs):
+    def act(self, obs: dict) -> torch.Tensor:
+        obs = self.process_data(obs, extract_action=False)
         B = get_batch_size(obs, strict=True)
         noisy_traj = torch.randn(
             size=(B, self.horizon, self.action_dim),
@@ -145,13 +146,9 @@ class DiffusionPolicy(BasePolicy):
             noisy_traj = scheduler.step(
                 pred, t, noisy_traj, **self.noise_scheduler_step_kwargs
             ).prev_sample  # (B, L, action_dim)
-        action_prediction = noisy_traj[
-            :, self.num_latest_obs - 1 :
-        ].clone()  # (B, L, action_dim)
-        split_sections = [self._action_key_dims[k] for k in self._action_keys]
-        pred = torch.split(action_prediction, split_sections, dim=-1)
-        pred = {k: v for k, v in zip(self._action_keys, pred)}
-        return pred
+        action = noisy_traj[:, self.num_latest_obs - 1:].clone()  # (B, L, action_dim)
+        # denormalize action
+        return (action * JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]) + JOINT_RANGE_ARRAY[self.robot_type][0]
 
     def reset(self) -> None:
         pass
@@ -329,14 +326,10 @@ class DiffusionPolicy(BasePolicy):
 
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
-        proprio = data_batch["obs"]["robot_r1::proprio"]
-        if proprio.ndim == 1:
-            # if proprio is 1D, we need to expand it to 3D
-            proprio = proprio[None, None, :].to(self.device)
         data = {
             "rgb": {k: data_batch["obs"][k].movedim(-1, -3) for k in data_batch["obs"] if "rgb" in k},
-            "qpos": {key: proprio[..., PROPRIO_QPOS_INDICES["R1Pro"][key]] for key in PROPRIO_QPOS_INDICES["R1Pro"]},
-            "odom": {"base_velocity": proprio[..., PROPRIOCEPTION_INDICES["R1Pro"]["base_qvel"]]},
+            "qpos": data_batch["obs"]["qpos"],
+            "odom": data_batch["obs"]["odom"],
         }
         if extract_action:
             # extract action from data_batch

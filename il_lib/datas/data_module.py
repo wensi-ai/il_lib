@@ -1,11 +1,10 @@
-import torch
-from il_lib.datas.dataset import BehaviorDataset
+from il_lib.datas.dataset import BehaviorDataset, DummyDataset
 from pytorch_lightning import LightningDataModule
-from torch.utils.data import DataLoader
-from typing import List, Optional, Tuple
-from il_lib.utils.array_tensor_utils import any_stack, make_recursive_func
-from il_lib.utils.convert_utils import any_to_torch_tensor
 from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
+from typing import Optional
+
+from omnigibson.learning.utils.eval_utils import TASK_NAMES_TO_INDICES
 
 
 class BehaviorDataModule(LightningDataModule):
@@ -39,7 +38,8 @@ class BehaviorDataModule(LightningDataModule):
 
     def setup(self, stage: str) -> None:
         if stage == "fit" or stage is None:
-            all_demo_keys = BehaviorDataset.get_all_demo_keys(self._data_path, self._task_name)
+            task_id = TASK_NAMES_TO_INDICES[self._task_name]
+            all_demo_keys = BehaviorDataset.get_all_demo_keys(self._data_path, task_id)
             # limit number of demos
             if self._max_num_demos is not None:
                 all_demo_keys = all_demo_keys[: self._max_num_demos]
@@ -53,53 +53,52 @@ class BehaviorDataModule(LightningDataModule):
                 *self._args,
                 **self._kwargs,
                 data_path=self._data_path,
-                task_name=self._task_name,
-                seed=self._seed,
+                task_id=task_id,
                 demo_keys=self._train_demo_keys,
+                seed=self._seed,
             )
             self._val_dataset = BehaviorDataset(
                 *self._args,
                 **self._kwargs,
                 data_path=self._data_path,
-                task_name=self._task_name,
-                seed=self._seed,
+                task_id=task_id,
                 demo_keys=self._val_demo_keys,
+                seed=self._seed,
             )
 
     def train_dataloader(self) -> DataLoader:
+        assert self._train_dataset is not None
         return DataLoader(
             self._train_dataset,
             batch_size=self._batch_size,
             num_workers=min(self._batch_size, self._dataloader_num_workers),
             pin_memory=True,
             persistent_workers=True,
-            # collate_fn=_seq_chunk_collate_fn,
         )
 
     def val_dataloader(self) -> DataLoader:
+        assert self._val_dataset is not None
         return DataLoader(
             self._val_dataset,
             batch_size=self._val_batch_size,
             num_workers=min(self._val_batch_size, self._dataloader_num_workers),
             pin_memory=True,
             persistent_workers=True,
-            # collate_fn=_seq_chunk_collate_fn,
         )
 
-    def on_train_epoch_start(self):
+    def test_dataloader(self) -> DataLoader:
+        """
+        For test_step(), simply returns a dummy dataset.
+        """
+        return DataLoader(
+            DummyDataset(),
+            batch_size=1,
+            num_workers=0,
+            pin_memory=True,
+            shuffle=False,
+        )
+
+    def on_train_epoch_start(self) -> None:
         # set epoch for train dataset, which will trigger shuffling
+        assert self._train_dataset is not None and self.trainer is not None
         self._train_dataset.epoch = self.trainer.current_epoch
-
-
-def _seq_chunk_collate_fn(sample_list: List[Tuple]) -> dict:
-    """
-    sample_list: list of (T, ...). PyTorch's native collate_fn can stack all data.
-    But here we also add a leading singleton dimension, so it won't break the compatibility with episode data format.
-    """
-    stacked_list = any_stack(sample_list, dim=0)  # (B, T, ...)
-    return _nested_th_expand_dims(stacked_list, dim=0)  # (1, B, T, ...)
-
-
-@make_recursive_func
-def _nested_th_expand_dims(x, dim):
-    return torch.unsqueeze(x, dim=dim)

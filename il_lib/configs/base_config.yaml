@@ -19,11 +19,15 @@ lr_cosine_steps: 300000
 lr_cosine_min: 5e-6
 lr_layer_decay: 1.0
 wd: 0.0
-bs: 16
+bs: 256
 vbs: ${bs}
 data_dir: ???
 eval_interval: 10
 rollout_eval: false
+
+horizon: ???
+num_latest_obs: ???
+deployed_action_steps: ???
 
 # ====== Action Keys ======
 action_keys: ["base", "torso", "left_arm", "left_gripper", "right_arm", "right_gripper"]
@@ -46,9 +50,16 @@ module:
   _target_: ???  # filled by policy
   eval:
     eval_on_validation: false
+    write_video: true
     env: ${env}
     task: ${task}
     robot: ${robot}
+    policy_name: ${policy_name}
+    model:
+      _target_: omnigibson.learning.policies.VisionActionILPolicy
+      use_websocket: false
+      action_prediction_horizon: ${deployed_action_steps}
+      obs_window_size: ${num_latest_obs}
   # ====== learning ======
   lr: ${lr}
   use_cosine_lr: ${use_cosine_lr}
@@ -111,7 +122,3 @@ resume:
   ckpt_path: null
   full_state: false  # if true, resume all states including optimizer, amp, lightning callbacks
   strict: true
-
-# ====== Evaluation ======
-eval: ??? # filled by policy
-log_path: ???

@@ -49,9 +49,10 @@ class ACT(BasePolicy):
         lr_layer_decay: float = 1.0,
         weight_decay: float = 0.0,
         action_part_order: List[Literal["torso", "left_arm", "right_arm"]],
-        # not used, for compatibility
-        obs_mlp_hidden_depth=None,
-        obs_mlp_hidden_dim=None,
+        # ====== eval ======
+        action_steps_to_deploy: int,
+        temporal_aggregate: bool,
+        temporal_aggregation_factor: float,
         **kwargs,
     ) -> None:
         """
@@ -117,6 +118,23 @@ class ACT(BasePolicy):
         self.kl_weight = kl_weight
         self.action_dim = action_dim
 
+        # ====== learning ======
+        self.lr = lr
+        self.use_cosine_lr = use_cosine_lr
+        self.lr_warmup_steps = lr_warmup_steps
+        self.lr_cosine_steps = lr_cosine_steps
+        self.lr_cosine_min = lr_cosine_min
+        self.lr_layer_decay = lr_layer_decay
+        self.weight_decay = weight_decay
+
+        self._action_steps_to_deploy = action_steps_to_deploy
+        self._temporal_aggregate = temporal_aggregate
+        if temporal_aggregate:
+            assert temporal_aggregation_factor > 0
+        self._temporal_aggregation_factor = temporal_aggregation_factor
+
+        self._obs_statistics = None
+
     def forward(self, prop: torch.Tensor, goal: torch.Tensor, actions=None, is_pad=None):
         """
         Forward pass of the ACT policy.
@@ -133,20 +151,20 @@ class ACT(BasePolicy):
             # project action sequence to embedding dim, and concat with a CLS token
             action_embed = self.encoder_action_proj(actions)  # (bs, seq, hidden_dim)
             prop_embed = self.encoder_prop_proj(prop)  # (bs, hidden_dim)
-            prop_embed = torch.unsqueeze(prop_embed, axis=1)  # (bs, 1, hidden_dim)
+            prop_embed = torch.unsqueeze(prop_embed, dim=1)  # (bs, 1, hidden_dim)
             cls_embed = self.cls_embed.weight  # (1, hidden_dim)
-            cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(
+            cls_embed = torch.unsqueeze(cls_embed, dim=0).repeat(
                 bs, 1, 1
             )  # (bs, 1, hidden_dim)
             encoder_input = torch.cat(
-                [cls_embed, prop_embed, action_embed], axis=1
+                [cls_embed, prop_embed, action_embed], dim=1
             )  # (bs, seq+1, hidden_dim)
             encoder_input = encoder_input.permute(1, 0, 2)  # (seq+1, bs, hidden_dim)
             # do not mask cls token
             cls_joint_is_pad = torch.full((bs, 2), False).to(
                 prop.device
             )  # False: not a padding
-            is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)  # (bs, seq+1)
+            is_pad = torch.cat([cls_joint_is_pad, is_pad], dim=1)  # (bs, seq+1)
             # obtain position embedding
             pos_embed = self.pos_table.clone().detach()
             pos_embed = pos_embed.permute(1, 0, 2)  # (seq+1, 1, hidden_dim)
@@ -177,106 +195,67 @@ class ACT(BasePolicy):
     
     def reset(self) -> None:
         pass
-
-    def configure_optimizers(self):
-        optimizer_groups = self.policy._get_optimizer_groups(
-            weight_decay=self.weight_decay,
-            lr_layer_decay=self.lr_layer_decay,
-            lr_scale=1.0,
-        )
-
-        optimizer = torch.optim.AdamW(
-            optimizer_groups,
-            lr=self.lr,
-            weight_decay=self.weight_decay,
-        )
-
-        if self.use_cosine_lr:
-            scheduler_kwargs = dict(
-                base_value=1.0,  # anneal from the original LR value
-                final_value=self.lr_cosine_min / self.lr,
-                epochs=self.lr_cosine_steps,
-                warmup_start_value=self.lr_cosine_min / self.lr,
-                warmup_epochs=self.lr_warmup_steps,
-                steps_per_epoch=1,
-            )
-            scheduler = torch.optim.lr_scheduler.LambdaLR(
-                optimizer=optimizer,
-                lr_lambda=CosineScheduleFunction(**scheduler_kwargs),
-            )
-            return (
-                [optimizer],
-                [{"scheduler": scheduler, "interval": "step"}],
-            )
-
-        return optimizer
     
     def policy_training_step(self, batch, batch_idx) -> Any:
-        B = batch["action_chunks"].shape[1]
-        # obs data is dict of (N_chunks, B, window_size, ...)
-        # action chunks is (N_chunks, B, window_size, action_prediction_horizon, A)
-        # we loop over chunk dim
-        main_data = unstack_sequence_fields(
-            batch, batch_size=get_batch_size(batch, strict=True)
+        B = batch["actions"].shape[0]
+        # obs data is dict of (B, window_size, ...)
+        # action chunks is (B, window_size, action_prediction_horizon, A)
+        batch = self.process_data(batch, extract_action=True)
+
+        # get padding mask
+        pad_mask = batch.pop("masks")  # (B, window_size, L_pred_horizon)
+        pad_mask = pad_mask.reshape(-1, pad_mask.shape[-1])  # (B * window_size, L_pred_horizon)
+        # ACT assumes true for padding, false for not padding
+        pad_mask = ~pad_mask
+
+        prop_obs = any_concat(
+            [
+                any_to_torch_tensor(
+                    main_data_chunk[k], device=self.device, dtype=self.dtype
+                )
+                for k in self.prop_obs_keys
+            ],
+            dim=-1,
+        )  # (B, window_size, D)
+        # flatten first two dims
+        prop_obs = prop_obs.reshape(-1, prop_obs.shape[-1])  # (B * window_size, D)
+
+        goal_obs = any_concat(
+            [
+                any_to_torch_tensor(
+                    main_data_chunk[k], device=self.device, dtype=self.dtype
+                )
+                for k in self.goal_obs_keys
+            ],
+            dim=-1,
+        )  # (B, window_size, D)
+        # flatten first two dims
+        goal_obs = goal_obs.reshape(-1, goal_obs.shape[-1])  # (B * window_size, D)
+
+        gt_actions = main_data_chunk[
+            "action_chunks"
+        ]  # already normalized in [-1, 1], shape (B, window_size, L_pred_horizon, A)
+        # reindex to get policy actions
+        gt_actions = gt_actions[
+            ..., self._policy_train_gt_action_reindex
+        ]  # (B, T, L_pred_horizon, A)
+        # flatten first two dims
+        gt_actions = gt_actions.reshape(
+            -1, gt_actions.shape[-2], gt_actions.shape[-1]
         )
-        all_loss_dict = {}
-        for i, main_data_chunk in enumerate(main_data):
-            # get padding mask
-            pad_mask = main_data_chunk.pop(
-                "pad_mask"
-            )  # (B, window_size, L_pred_horizon)
-            pad_mask = pad_mask.reshape(
-                -1, pad_mask.shape[-1]
-            )  # (B * window_size, L_pred_horizon)
-            # ACT assumes true for padding, false for not padding
-            pad_mask = ~pad_mask
 
-            prop_obs = any_concat(
-                [
-                    any_to_torch_tensor(
-                        main_data_chunk[k], device=self.device, dtype=self.dtype
-                    )
-                    for k in self.prop_obs_keys
-                ],
-                dim=-1,
-            )  # (B, window_size, D)
-            # flatten first two dims
-            prop_obs = prop_obs.reshape(-1, prop_obs.shape[-1])  # (B * window_size, D)
+        loss_dict = self.policy._compute_loss(
+            prop=prop_obs,
+            goal=goal_obs,
+            actions=gt_actions,
+            is_pad=pad_mask,
+        )
+        for k, v in loss_dict.items():
+            if k not in all_loss_dict:
+                all_loss_dict[k] = []
+            all_loss_dict[k].append(v)
 
-            goal_obs = any_concat(
-                [
-                    any_to_torch_tensor(
-                        main_data_chunk[k], device=self.device, dtype=self.dtype
-                    )
-                    for k in self.goal_obs_keys
-                ],
-                dim=-1,
-            )  # (B, window_size, D)
-            # flatten first two dims
-            goal_obs = goal_obs.reshape(-1, goal_obs.shape[-1])  # (B * window_size, D)
 
-            gt_actions = main_data_chunk[
-                "action_chunks"
-            ]  # already normalized in [-1, 1], shape (B, window_size, L_pred_horizon, A)
-            # reindex to get policy actions
-            gt_actions = gt_actions[
-                ..., self._policy_train_gt_action_reindex
-            ]  # (B, T, L_pred_horizon, A)
-            # flatten first two dims
-            gt_actions = gt_actions.reshape(
-                -1, gt_actions.shape[-2], gt_actions.shape[-1]
-            )
-
-            loss_dict = self.policy._compute_loss(
-                prop=prop_obs,
-                goal=goal_obs,
-                actions=gt_actions,
-                is_pad=pad_mask,
-            )
-            for k, v in loss_dict.items():
-                if k not in all_loss_dict:
-                    all_loss_dict[k] = []
-                all_loss_dict[k].append(v)
         avg_all_loss_dict = {}
         for k, v in all_loss_dict.items():
             avg_all_loss_dict[k] = torch.mean(torch.stack(v), dim=0)
@@ -666,6 +645,39 @@ class ACT(BasePolicy):
         pbar.close()
         return 0, aggregated_metrics, 1
 
+    def configure_optimizers(self):
+        optimizer_groups = self._get_optimizer_groups(
+            weight_decay=self.weight_decay,
+            lr_layer_decay=self.lr_layer_decay,
+            lr_scale=1.0,
+        )
+
+        optimizer = torch.optim.AdamW(
+            optimizer_groups,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+
+        if self.use_cosine_lr:
+            scheduler_kwargs = dict(
+                base_value=1.0,  # anneal from the original LR value
+                final_value=self.lr_cosine_min / self.lr,
+                epochs=self.lr_cosine_steps,
+                warmup_start_value=self.lr_cosine_min / self.lr,
+                warmup_epochs=self.lr_warmup_steps,
+                steps_per_epoch=1,
+            )
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer=optimizer,
+                lr_lambda=CosineScheduleFunction(**scheduler_kwargs),
+            )
+            return (
+                [optimizer],
+                [{"scheduler": scheduler, "interval": "step"}],
+            )
+
+        return optimizer
+
     @property
     def joint_lower_limits(self):
         return torch.tensor(self._q_lo, device=self.device, dtype=torch.float32)
@@ -708,6 +720,14 @@ class ACT(BasePolicy):
         loss_dict["loss"] = loss_dict["l1"] + loss_dict["kl"] * self.kl_weight
         return loss_dict
     
+
+    def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
+        # process observation data
+        data = {}
+        for k in self.prop_obs_keys:
+            data[k] = data_batch["obs"][k]
+        return data
+
 
 class Transformer(nn.Module):
 

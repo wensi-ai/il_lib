@@ -3,6 +3,8 @@ import torch
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from omegaconf import DictConfig, OmegaConf
+from omnigibson.learning.utils.obs_utils import create_video_writer
+from omnigibson.macros import gm
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities.types import OptimizerLRScheduler
 
@@ -24,6 +26,7 @@ class BasePolicy(LightningModule, ABC):
         else:
             logger.warning("No evaluation config provided, online evaluation will not be performed during testing.")
         self.evaluator = None
+        self.test_id = 0
 
     @abstractmethod
     def forward(self, obs: dict, *args, **kwargs) -> torch.Tensor:
@@ -54,18 +57,18 @@ class BasePolicy(LightningModule, ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def configure_optimizers(self) -> OptimizerLRScheduler:
-        """
-        Get optimizers, which are subsequently used to train.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
     def policy_training_step(self, batch, batch_idx) -> Any:
         raise NotImplementedError
 
     @abstractmethod
     def policy_evaluation_step(self, batch, batch_idx) -> Any:
+        raise NotImplementedError
+
+    @abstractmethod
+    def configure_optimizers(self) -> OptimizerLRScheduler:
+        """
+        Get optimizers, which are subsequently used to train.
+        """
         raise NotImplementedError
 
     def training_step(self, *args, **kwargs):
@@ -95,15 +98,27 @@ class BasePolicy(LightningModule, ABC):
         return log_dict
 
     def test_step(self, *args, **kwargs):
+        assert self.evaluator is not None, "evaluator is not created!"
         self.evaluator.reset()
         self.evaluator.env._current_episode = 0
+        if self.eval_config.write_video:
+            video_name = f"videos/test_{self.test_id}.mp4"
+            self.evaluator.video_writer = create_video_writer(
+                fpath=video_name,
+                resolution=(720, 1080),
+            )
         done = False
         while not done:
             terminated, truncated = self.evaluator.step()
+            if self.eval_config.write_video:
+                self.evaluator._write_video()
             if terminated:
                 self.evaluator.env.reset()
             if truncated:
                 done = True
+        if self.eval_config.write_video:
+            self.evaluator.video_writer = None
+        self.test_id += 1
         results = {"eval/success_rate": self.evaluator.n_success_trials / self.evaluator.n_trials}
         return results
 
@@ -128,12 +143,16 @@ class BasePolicy(LightningModule, ABC):
     def create_evaluator(self):
         """
         Create a evaluator parameter config containing vectorized distributed envs.
-        This will be used to spawn the OmniGibson environments for online evaluation in self.imitation_evaluation_step()
+        This will be used to spawn the OmniGibson environments for online evaluation in self.on_test_start()
         """
+        # For performance optimization
+        gm.DEFAULT_VIEWER_WIDTH = 128
+        gm.DEFAULT_VIEWER_HEIGHT = 128
         # update parameters with policy cfg file
         assert self.eval_config is not None, "eval_config must be provided to create evaluator!"
         from omnigibson.learning.eval import Evaluator
         evaluator = Evaluator(self.eval_config)
         # set the policy for the evaluator
-        evaluator.policy = self
+        evaluator.policy.policy = self
+        evaluator.policy.device = self.device
         return evaluator

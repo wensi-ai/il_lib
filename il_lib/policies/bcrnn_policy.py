@@ -8,7 +8,8 @@ from omegaconf import DictConfig
 from il_lib.nn.distributions import GMMHead, MixtureOfGaussian
 from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.utils.array_tensor_utils import any_slice, get_batch_size, any_concat
-from il_lib.utils.eval_utils import ACTION_QPOS_INDICES, PROPRIOCEPTION_INDICES, PROPRIO_QPOS_INDICES
+
+from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES, PROPRIO_QPOS_INDICES
 
 
 class BC_RNN(BasePolicy):
@@ -158,7 +159,6 @@ class BC_RNN(BasePolicy):
             [batch["actions"][k] for k in self._action_keys], dim=-1
         )  # (B, ctx_len, A)
         B = batch["actions"].shape[0]
-        print(batch["actions"].shape)
         batch = self.process_data(batch, extract_action=True)
 
         policy_state = self._get_initial_state(B)
@@ -230,14 +230,10 @@ class BC_RNN(BasePolicy):
 
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
-        proprio = data_batch["obs"]["robot_r1::proprio"]
-        if proprio.ndim == 1:
-            # if proprio is 1D, we need to expand it to 3D
-            proprio = proprio[None, None, :].to(self.device)
         data = {
             "rgb": {k: data_batch["obs"][k].movedim(-1, -3) for k in data_batch["obs"] if "rgb" in k},
-            "qpos": {key: proprio[..., PROPRIO_QPOS_INDICES["R1Pro"][key]] for key in PROPRIO_QPOS_INDICES["R1Pro"]},
-            "odom": {"base_velocity": proprio[..., PROPRIOCEPTION_INDICES["R1Pro"]["base_qvel"]]},
+            "qpos": data_batch["obs"]["qpos"],
+            "odom": data_batch["obs"]["odom"],
         }
         if extract_action:
             # extract action from data_batch

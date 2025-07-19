@@ -11,6 +11,7 @@ def main(cfg):
     trainer_ = Trainer(cfg)
     trainer_.trainer.loggers[-1].log_hyperparams(omegaconf_to_dict(cfg))
     trainer_.fit()
+    trainer_.test()
 
 
 if __name__ == "__main__":

@@ -1,51 +1,54 @@
-import h5py
+import json
 import numpy as np
 import os
+import pandas as pd
 import torch
 from copy import deepcopy
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, Dataset
 from il_lib.utils.array_tensor_utils import any_concat, any_ones_like, any_slice, any_stack, get_batch_size
-from il_lib.utils.eval_utils import ACTION_QPOS_INDICES, JOINT_RANGE
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
+from omnigibson.learning.utils.eval_utils import ACTION_QPOS_INDICES, JOINT_RANGE, PROPRIO_QPOS_INDICES, PROPRIOCEPTION_INDICES
 from omnigibson.learning.utils.obs_utils import OBS_LOADER_MAP
 
 
 class BehaviorDataset(IterableDataset):
 
     @classmethod
-    def get_all_demo_keys(cls, data_path: str, task_name: str):
-        assert os.path.exists(f"{data_path}/data/{task_name}"), f"Data path does not exist!"
-        demo_keys = []
-        for file_name in sorted(os.listdir(f"{data_path}/data/{task_name}")):
-            if file_name.endswith(".hdf5"):
-                base_name = file_name.split(".")[0]
-                with h5py.File(os.path.join(data_path, "data", task_name, file_name), "r", swmr=True, libver="latest") as f:
-                    for demo_id in f["data"]:
-                        demo_keys.append(f"{base_name}::{demo_id}")
+    def get_all_demo_keys(cls, data_path: str, task_id: int):
+        task_dir_name = f"task-{task_id:04d}"
+        assert os.path.exists(f"{data_path}/data/{task_dir_name}"), f"Data path does not exist!"
+        demo_keys = sorted([
+            file_name.split(".")[0].split("_")[-1] for file_name in sorted(os.listdir(f"{data_path}/data/{task_dir_name}"))
+            if file_name.endswith(".parquet")
+        ])
         return demo_keys
 
     def __init__(
         self,
         *args,
         data_path: str,
-        task_name: str,
+        task_id: int,
         demo_keys: List[str],
         obs_window_size: int,
         ctx_len: int,
         use_action_chunks: bool = False,
         action_prediction_horizon: Optional[int] = None,
         visual_obs_types: List[str],
-        multi_view_cameras: Optional[List[str]] = None,
+        multi_view_cameras: Optional[Dict[str, str]] = None,
         load_task_info: bool = False,
         seed: int = 42,
         shuffle: bool = True,
         # dataset parameters
+        pcd_downsample_ratio: Optional[int] = None,
         pcd_downsample_points: Optional[int] = None,
+        **kwargs,
     ):
         """
         Args:
             data_path (str): Path to the data directory.
+            task_id (int): Task ID.
+            demo_keys (List[str]): List of demo keys.
             obs_window_size (int): Size of the observation window.
             ctx_len (int): Context length.
             use_action_chunks (bool): Whether to use action chunks.
@@ -53,15 +56,15 @@ class BehaviorDataset(IterableDataset):
             action_prediction_horizon (Optional[int]): Horizon of the action prediction.
                 Must not be None if use_action_chunks is True.
             visual_obs_types (List[str]): List of visual observation types to load.
-                Valid options are: "rgb", "depth", "pcd", "seg".
-            multi_view_cameras (Optional[List[str]]): List of multi-view camera names to load obs from.
+                Valid options are: "rgb", "depth", "seg".
+            multi_view_cameras (Optional[Dict[str, str]]): Dict of multi-view camera id-name pairs to load obs from.
             load_task_info (bool): Whether to load privileged task information.
             seed (int): Random seed.
             shuffle (bool): Whether to shuffle the dataset.
         """
         super().__init__()
         self._data_path = data_path
-        self._task_name = task_name
+        self._task_id = task_id
         self._demo_keys = demo_keys
         self._obs_window_size = obs_window_size
         self._ctx_len = ctx_len
@@ -74,26 +77,15 @@ class BehaviorDataset(IterableDataset):
         self._shuffle = shuffle
         self._epoch = 0
 
-        assert set(visual_obs_types).issubset({"rgb", "depth", "pcd", "seg"}), \
-            "visual_obs_types must be a subset of {'rgb', 'depth', 'pcd', 'seg'}!"
+        assert set(visual_obs_types).issubset({"rgb", "depth", "seg"}), \
+            "visual_obs_types must be a subset of {'rgb', 'depth', 'seg'}!"
         self._visual_obs_types = visual_obs_types
+
+        self._pcd_downsample_ratio = pcd_downsample_ratio
         self._pcd_downsample_points = pcd_downsample_points
         self._multi_view_cameras = multi_view_cameras
-        self.robot_type = None
+        self.robot_type = "R1Pro"
 
-        # get all demo keys
-        self._demo_keys = []
-        for file_name in sorted(os.listdir(f"{self._data_path}/data/{self._task_name}")):
-            if file_name.endswith(".hdf5"):
-                base_name = file_name.split(".")[0]
-                with h5py.File(os.path.join(data_path, "data", task_name, file_name), "r", swmr=True, libver="latest") as f:
-                    for demo_id in f["data"]:
-                        if self.robot_type is None:
-                            self.robot_type = f["data"][demo_id].attrs["robot_type"]
-                            self._joint_range = JOINT_RANGE[self.robot_type]
-                        else:
-                            assert self.robot_type == f["data"][demo_id].attrs["robot_type"]
-                        self._demo_keys.append(f"{base_name}::{demo_id}")
         self._demo_indices = list(range(len(self._demo_keys)))
         # Preload demos into memory 
         self._all_demos = [self._preload_demo(demo_key) for demo_key in self._demo_keys]
@@ -123,36 +115,40 @@ class BehaviorDataset(IterableDataset):
         # Initialize obs loaders
         obs_loaders = dict()
         for obs_type in self._visual_obs_types:
-            if obs_type == "pcd":
-                continue # TODO: add pcd loader
-            else:
-                base_name, demo_id = self._demo_keys[demo_ptr].split("::")
-                for camera_name in self._multi_view_cameras:
-                    kwargs = dict()
-                    if obs_type == "seg":
-                        kwargs["num_classes"] = 100
-                    obs_loaders[f"{camera_name}::{obs_type}"] = iter(OBS_LOADER_MAP[obs_type](
-                        data_path=f"{self._data_path}/videos/{self._task_name}",
-                        base_name=base_name,
-                        demo_id=demo_id, 
-                        camera_name=camera_name,
-                        batch_size=self._obs_window_size,
-                        stride=1,
-                        **kwargs,
-                    ))
+            for camera_id, camera_name in self._multi_view_cameras.items():
+                kwargs = dict()
+                if obs_type == "seg":
+                    kwargs["num_classes"] = 100
+                obs_loaders[f"{camera_name}::{obs_type}"] = iter(OBS_LOADER_MAP[obs_type](
+                    data_path=self._data_path,
+                    task_id=self._task_id,
+                    camera_id=camera_id, 
+                    demo_id=self._demo_keys[demo_ptr],
+                    batch_size=self._obs_window_size,
+                    stride=1,
+                    **kwargs,
+                ))
         for i in range(len(data_chunks)):
             data, mask = data_chunks[i], mask_chunks[i]
             # load visual obs
             for obs_type in self._visual_obs_types:
                 if obs_type == "pcd":
-                    continue # TODO: add pcd loader
+                    obs_dict = dict()
+                    for camera_name in self._multi_view_cameras.values():
+                        obs_dict[f"{camera_name}::{obs_type}"] = data["obs"][f"{camera_name}::{obs_type}"][::self._pcd_downsample_ratio, ::self._pcd_downsample_ratio]
+                    data["obs"]["fused_pcd"], _ = process_fused_point_cloud(
+                        obs=obs_dict,
+                        robot_name=self.robot_type,
+                        downsample_points=self._pcd_downsample_points,
+                        process_seg=False,
+                   )
                 else:
-                    for camera_name in self._multi_view_cameras:
+                    for camera_name in self._multi_view_cameras.values():
                         data["obs"][f"{camera_name}::{obs_type}"] = next(obs_loaders[f"{camera_name}::{obs_type}"])
             data["masks"] = data["action_chunk_masks"] & mask[:, None] if self._use_action_chunks else mask
             yield data
         for obs_type in self._visual_obs_types:
-            for camera_name in self._multi_view_cameras:
+            for camera_name in self._multi_view_cameras.values():
                 obs_loaders[f"{camera_name}::{obs_type}"].close()
 
     def _preload_demo(self, demo_key: str) -> dict:
@@ -165,20 +161,28 @@ class BehaviorDataset(IterableDataset):
         """
         demo = dict()
         demo["obs"] = dict()
-        base_name, demo_id = demo_key.split("::")
-        
         # load low_dim data
         action_dict = dict()
-        with h5py.File(os.path.join(self._data_path, "data", self._task_name, f"{base_name}.hdf5"), "r", swmr=True, libver="latest") as f:
-            # TODO: Fix this (remove -1) with the new data format
-            demo["obs"]["robot_r1::proprio"] = f["data"][demo_id]["obs"]["robot_r1::proprio"][:-1].astype(np.float32) # remove last frame
-
-            for key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
-                action_dict[key] = f["data"][demo_id]["action"][:, indices]
-                # action normalization
-                action_dict[key] = (action_dict[key] - self._joint_range[key][0]) / (self._joint_range[key][1] - self._joint_range[key][0])
-            if self._load_task_info:
-                demo["obs"]["task::low_dim"] = f["data"][demo_id]["obs"]["task::low_dim"][:]
+        df = pd.read_parquet(os.path.join(self._data_path, "data", f"task-{self._task_id:04d}", f"episode_{demo_key}.parquet"))
+        proprio = np.array(df["observation.state"].tolist(), dtype=np.float32)
+        demo["obs"] = {
+            "qpos": {
+                key: (proprio[..., PROPRIO_QPOS_INDICES[self.robot_type][key]] - JOINT_RANGE[self.robot_type][key][0]) / 
+                (JOINT_RANGE[self.robot_type][key][1] - JOINT_RANGE[self.robot_type][key][0])
+                for key in PROPRIO_QPOS_INDICES[self.robot_type]
+            },
+            "odom": {
+                "base_velocity": (proprio[..., PROPRIOCEPTION_INDICES[self.robot_type]["base_qvel"]] - JOINT_RANGE[self.robot_type]["base"][0]) / 
+                (JOINT_RANGE[self.robot_type]["base"][1] - JOINT_RANGE[self.robot_type]["base"][0])
+            },
+        }
+        action_arr = np.array(df["action"].tolist(), dtype=np.float32)
+        for key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
+            action_dict[key] = action_arr[:, indices]
+            # action normalization
+            action_dict[key] = (action_dict[key] - JOINT_RANGE[self.robot_type][key][0]) / (JOINT_RANGE[self.robot_type][key][1] - JOINT_RANGE[self.robot_type][key][0])
+        if self._load_task_info:
+            demo["obs"]["task::low_dim"] = np.array(df["observation.task_info"].tolist(), dtype=np.float32)
         if self._use_action_chunks:
             # make actions from (T, A) to (T, L_pred_horizon, A)
             # need to construct a mask
@@ -244,3 +248,24 @@ class BehaviorDataset(IterableDataset):
                     data[k] = any_slice(demo[k], s)
             data_chunks.append(data)
         return data_chunks, mask_chunks
+
+
+
+class DummyDataset(Dataset):
+    """
+    Dummy dataset for test_step().
+    Does absolutely nothing since we will do online evaluation.
+    """
+
+    def __init__(self, batch_size: int=1, epoch_len: int=1):
+        """
+        Still set batch_size because pytorch_lightning tracks it
+        """
+        self.n = epoch_len
+        self._batch_size = batch_size
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, i):
+        return np.zeros((self._batch_size,), dtype=bool)

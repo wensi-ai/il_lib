@@ -57,9 +57,9 @@ data_module:
   visual_obs_types: ["rgb"]
   load_task_info: false
   multi_view_cameras:
-    - robot_r1::robot_r1:left_realsense_link:Camera:0
-    - robot_r1::robot_r1:right_realsense_link:Camera:0
-    - robot_r1::robot_r1:zed_link:Camera:0
+    head: robot_r1::robot_r1:zed_link:Camera:0
+    left_wrist: robot_r1::robot_r1:left_realsense_link:Camera:0
+    right_wrist: robot_r1::robot_r1:right_realsense_link:Camera:0
 
 robot:
   type: R1Pro

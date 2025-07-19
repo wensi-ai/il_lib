@@ -13,11 +13,12 @@ from il_lib.nn.diffusion import WholeBodyUNetDiffusionHead
 from il_lib.optim import CosineScheduleFunction, default_optimizer_groups, check_optimizer_groups
 from il_lib.policies.policy_base import BasePolicy
 from il_lib.training.trainer import rank_zero_info
-from il_lib.utils.eval_utils import ACTION_QPOS_INDICES, PROPRIOCEPTION_INDICES, PROPRIO_QPOS_INDICES
 from il_lib.utils.array_tensor_utils import any_concat, any_slice, get_batch_size
 from il_lib.utils.functional_utils import unstack_sequence_fields
 from pytorch_lightning.utilities.types import OptimizerLRScheduler
 from typing import Any, List, Optional, Union
+
+from omnigibson.learning.utils.eval_utils import ACTION_QPOS_INDICES, PROPRIOCEPTION_INDICES, PROPRIO_QPOS_INDICES
 
 
 class WBVIMA(BasePolicy):
@@ -143,9 +144,6 @@ class WBVIMA(BasePolicy):
         self.loss_on_latest_obs_only = loss_on_latest_obs_only
 
         self.obs_window_size = obs_window_size
-        self._obs_history = deque(maxlen=obs_window_size)
-        self._action_traj_pred = None
-        self._action_idx = 0
 
     def forward(self, obs: dict) -> torch.Tensor:
         # construct prop obs
@@ -219,23 +217,11 @@ class WBVIMA(BasePolicy):
     @torch.no_grad()
     def act(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
         obs = self.process_data(data_batch=obs, extract_action=False)
-        if len(self._obs_history) == 0:
-            for _ in range(self.obs_window_size):
-                self._obs_history.append(obs)
-        else:
-            self._obs_history.append(obs)
-        obs = any_concat(self._obs_history, dim=1)
-
-        need_inference = self._action_idx % self.action_prediction_horizon == 0
-        if need_inference:
-            self._action_traj_pred = self._inference(obs=obs, return_last_timestep_only=True)  # dict of (B = 1, T_A, ...)
-            self._action_traj_pred = {
-                k: v[0].detach().cpu() for k, v in self._action_traj_pred.items()
-            }  # dict of (T_A, ...)
-            self._action_idx = 0
-        action = any_slice(self._action_traj_pred, np.s_[self._action_idx])
-        self._action_idx += 1
-        return torch.cat(list(action.values()))
+        self._action_traj_pred = self._inference(obs=obs, return_last_timestep_only=True)  # dict of (B = 1, T_A, ...)
+        self._action_traj_pred = {
+            k: v[0].detach().cpu() for k, v in self._action_traj_pred.items()
+        }  # dict of (T_A, ...)
+        return torch.cat(list(self._action_traj_pred.values()))
 
     def reset(self) -> None:
         pass
@@ -465,10 +451,6 @@ class WBVIMA(BasePolicy):
     
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
-        proprio = data_batch["obs"]["robot_r1::proprio"]
-        if proprio.ndim == 1:
-            # if proprio is 1D, we need to expand it to 3D
-            proprio = proprio[None, None, :].to(self.device)
         if "robot_r1::fused_pcd" in data_batch["obs"]:
             fused_pcd = data_batch["obs"]["robot_r1::fused_pcd"]
         else:
@@ -482,8 +464,8 @@ class WBVIMA(BasePolicy):
                 "rgb": fused_pcd[..., :3],
                 "xyz": fused_pcd[..., 3:],
             },
-            "qpos": {key: proprio[..., PROPRIO_QPOS_INDICES["R1Pro"][key]] for key in PROPRIO_QPOS_INDICES["R1Pro"]},
-            "odom": {"base_velocity": proprio[..., PROPRIOCEPTION_INDICES["R1Pro"]["base_qvel"]]},
+            "qpos": data_batch["obs"]["qpos"],
+            "odom": data_batch["obs"]["odom"],
         }
         if extract_action:
             # extract action from data_batch
