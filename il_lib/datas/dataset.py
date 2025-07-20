@@ -94,6 +94,7 @@ class BehaviorDataset(IterableDataset):
             L = get_batch_size(demo, strict=True)
             assert L >= self._obs_window_size >= 1
             self._demo_lengths.append(L - self._obs_window_size + 1)
+        print("Dataset chunk length:", sum(self._demo_lengths))
 
     @property
     def epoch(self):

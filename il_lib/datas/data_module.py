@@ -90,13 +90,7 @@ class BehaviorDataModule(LightningDataModule):
         """
         For test_step(), simply returns a dummy dataset.
         """
-        return DataLoader(
-            DummyDataset(),
-            batch_size=1,
-            num_workers=0,
-            pin_memory=True,
-            shuffle=False,
-        )
+        return DataLoader(DummyDataset())
 
     def on_train_epoch_start(self) -> None:
         # set epoch for train dataset, which will trigger shuffling
