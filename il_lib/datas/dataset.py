@@ -5,7 +5,7 @@ import torch
 from copy import deepcopy
 from torch.utils.data import IterableDataset, Dataset
 from il_lib.utils.array_tensor_utils import any_concat, any_ones_like, any_slice, any_stack, get_batch_size
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Generator
 
 from omnigibson.learning.utils.eval_utils import ACTION_QPOS_INDICES, JOINT_RANGE, PROPRIO_QPOS_INDICES, PROPRIOCEPTION_INDICES
 from omnigibson.learning.utils.obs_utils import OBS_LOADER_MAP
@@ -88,6 +88,12 @@ class BehaviorDataset(IterableDataset):
         self._demo_indices = list(range(len(self._demo_keys)))
         # Preload demos into memory 
         self._all_demos = [self._preload_demo(demo_key) for demo_key in self._demo_keys]
+        # get demo lengths (N_chunks)
+        self._demo_lengths = []
+        for demo in self._all_demos:
+            L = get_batch_size(demo, strict=True)
+            assert L >= self._obs_window_size >= 1
+            self._demo_lengths.append(L - self._obs_window_size + 1)
 
     @property
     def epoch(self):
@@ -110,7 +116,7 @@ class BehaviorDataset(IterableDataset):
             yield from self.get_streamed_data(demo_ptr)
 
     def get_streamed_data(self, demo_ptr: int):
-        data_chunks, mask_chunks = self._chunk_demo(self._all_demos[demo_ptr])
+        chunk_generator = self._chunk_demo(demo_ptr)
         # Initialize obs loaders
         obs_loaders = dict()
         for obs_type in self._visual_obs_types:
@@ -127,8 +133,8 @@ class BehaviorDataset(IterableDataset):
                     stride=1,
                     **kwargs,
                 ))
-        for i in range(len(data_chunks)):
-            data, mask = data_chunks[i], mask_chunks[i]
+        for _ in range(self._demo_lengths[demo_ptr]):
+            data, mask = next(chunk_generator)
             # load visual obs
             for obs_type in self._visual_obs_types:
                 if obs_type == "pcd":
@@ -217,13 +223,11 @@ class BehaviorDataset(IterableDataset):
 
         return demo
 
-    def _chunk_demo(self, demo: dict) -> Tuple[List[dict], List[torch.Tensor]]:
-        data_chunks, mask_chunks = [], []
-        L = get_batch_size(demo, strict=True)
-        assert L >= self._obs_window_size >= 1
-        N_chunks = L - self._obs_window_size + 1
+    def _chunk_demo(self, demo_ptr: int) -> Generator[Tuple[dict, torch.Tensor], None, None]:
+        demo = self._all_demos[demo_ptr]
         # split obs into chunks
-        for chunk_idx in range(N_chunks):
+        for chunk_idx in range(self._demo_lengths[demo_ptr]):
+            data, mask = [], []
             s = np.s_[chunk_idx : chunk_idx + self._obs_window_size]
             data = dict()
             for k in demo:
@@ -239,14 +243,13 @@ class BehaviorDataset(IterableDataset):
                         + [any_ones_like(any_slice(data[k], np.s_[0:1]))] * pad_size,
                         dim=0,
                     )
-                    mask_chunks.append(torch.cat([
+                    mask = torch.cat([
                         torch.ones((action_chunk_size,), dtype=torch.bool),
                         torch.zeros((pad_size,), dtype=torch.bool),
-                    ], dim=0))
+                    ], dim=0)
                 else:
                     data[k] = any_slice(demo[k], s)
-            data_chunks.append(data)
-        return data_chunks, mask_chunks
+            yield data, mask
 
 
 
