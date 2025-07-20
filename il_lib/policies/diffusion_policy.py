@@ -131,6 +131,8 @@ class DiffusionPolicy(BasePolicy):
     @torch.no_grad()
     def act(self, obs: dict) -> torch.Tensor:
         obs = self.process_data(obs, extract_action=False)
+        joint_range_low = JOINT_RANGE_ARRAY[self.robot_type][0].to(self.device)
+        joint_range_high = JOINT_RANGE_ARRAY[self.robot_type][1].to(self.device)
         B = get_batch_size(obs, strict=True)
         noisy_traj = torch.randn(
             size=(B, self.horizon, self.action_dim),
@@ -148,7 +150,7 @@ class DiffusionPolicy(BasePolicy):
             ).prev_sample  # (B, L, action_dim)
         action = noisy_traj[:, self.num_latest_obs - 1:].clone()  # (B, L, action_dim)
         # denormalize action
-        return (action * JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]) + JOINT_RANGE_ARRAY[self.robot_type][0]
+        return (action * joint_range_high - joint_range_low) + joint_range_low
 
     def reset(self) -> None:
         pass
@@ -327,7 +329,7 @@ class DiffusionPolicy(BasePolicy):
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
         data = {
-            "rgb": {k: data_batch["obs"][k].movedim(-1, -3) for k in data_batch["obs"] if "rgb" in k},
+            "rgb": {k: data_batch["obs"][k] for k in data_batch["obs"] if "rgb" in k},
             "qpos": data_batch["obs"]["qpos"],
             "odom": data_batch["obs"]["odom"],
         }

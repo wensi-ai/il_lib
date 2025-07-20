@@ -231,7 +231,7 @@ class BC_RNN(BasePolicy):
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
         data = {
-            "rgb": {k: data_batch["obs"][k].movedim(-1, -3) for k in data_batch["obs"] if "rgb" in k},
+            "rgb": {k: data_batch["obs"][k] for k in data_batch["obs"] if "rgb" in k},
             "qpos": data_batch["obs"]["qpos"],
             "odom": data_batch["obs"]["odom"],
         }

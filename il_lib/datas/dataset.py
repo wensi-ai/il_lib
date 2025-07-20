@@ -1,4 +1,3 @@
-import json
 import numpy as np
 import os
 import pandas as pd
@@ -144,7 +143,7 @@ class BehaviorDataset(IterableDataset):
                    )
                 else:
                     for camera_name in self._multi_view_cameras.values():
-                        data["obs"][f"{camera_name}::{obs_type}"] = next(obs_loaders[f"{camera_name}::{obs_type}"])
+                        data["obs"][f"{camera_name}::{obs_type}"] = next(obs_loaders[f"{camera_name}::{obs_type}"]).movedim(-1, -3)
             data["masks"] = data["action_chunk_masks"] & mask[:, None] if self._use_action_chunks else mask
             yield data
         for obs_type in self._visual_obs_types:
@@ -164,7 +163,7 @@ class BehaviorDataset(IterableDataset):
         # load low_dim data
         action_dict = dict()
         df = pd.read_parquet(os.path.join(self._data_path, "data", f"task-{self._task_id:04d}", f"episode_{demo_key}.parquet"))
-        proprio = np.array(df["observation.state"].tolist(), dtype=np.float32)
+        proprio = torch.from_numpy(np.array(df["observation.state"].tolist(), dtype=np.float32))
         demo["obs"] = {
             "qpos": {
                 key: (proprio[..., PROPRIO_QPOS_INDICES[self.robot_type][key]] - JOINT_RANGE[self.robot_type][key][0]) / 
@@ -176,13 +175,13 @@ class BehaviorDataset(IterableDataset):
                 (JOINT_RANGE[self.robot_type]["base"][1] - JOINT_RANGE[self.robot_type]["base"][0])
             },
         }
-        action_arr = np.array(df["action"].tolist(), dtype=np.float32)
+        action_arr = torch.from_numpy(np.array(df["action"].tolist(), dtype=np.float32))
         for key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
             action_dict[key] = action_arr[:, indices]
             # action normalization
             action_dict[key] = (action_dict[key] - JOINT_RANGE[self.robot_type][key][0]) / (JOINT_RANGE[self.robot_type][key][1] - JOINT_RANGE[self.robot_type][key][0])
         if self._load_task_info:
-            demo["obs"]["task::low_dim"] = np.array(df["observation.task_info"].tolist(), dtype=np.float32)
+            demo["obs"]["task::low_dim"] = torch.from_numpy(np.array(df["observation.task_info"].tolist(), dtype=np.float32))
         if self._use_action_chunks:
             # make actions from (T, A) to (T, L_pred_horizon, A)
             # need to construct a mask
@@ -195,8 +194,8 @@ class BehaviorDataset(IterableDataset):
                 pad_size = self._action_prediction_horizon - action_chunk_size
                 mask = any_concat(
                     [
-                        np.ones((action_chunk_size,), dtype=bool),
-                        np.zeros((pad_size,), dtype=bool),
+                        torch.ones((action_chunk_size,), dtype=torch.bool),
+                        torch.zeros((pad_size,), dtype=torch.bool),
                     ],
                     dim=0,
                 )  # (L_pred_horizon,)
@@ -210,7 +209,7 @@ class BehaviorDataset(IterableDataset):
                 action_chunks.append(action_chunk)
                 action_chunk_masks.append(mask)
             action_chunks = any_stack(action_chunks, dim=0)  # (T, L_pred_horizon, A)
-            action_chunk_masks = np.stack(action_chunk_masks, axis=0)  # (T, L_pred_horizon)
+            action_chunk_masks = torch.stack(action_chunk_masks, dim=0)  # (T, L_pred_horizon)
             demo["actions"] = action_chunks
             demo["action_masks"] = action_chunk_masks
         else:

@@ -5,6 +5,7 @@ policy_name: bcrnn
 # ====== BCRNN specific ======
 horizon: 5
 num_latest_obs: 5
+deployed_action_steps: 5
 
 # ------ module ------
 module:

@@ -19,10 +19,10 @@ lr_cosine_steps: 300000
 lr_cosine_min: 5e-6
 lr_layer_decay: 1.0
 wd: 0.0
-bs: 256
+bs: 64
 vbs: ${bs}
 data_dir: ???
-eval_interval: 10
+eval_interval: 1
 rollout_eval: false
 
 horizon: ???

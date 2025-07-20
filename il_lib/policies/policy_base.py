@@ -1,5 +1,6 @@
 import logging
 import torch
+import os
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from omegaconf import DictConfig, OmegaConf
@@ -27,6 +28,7 @@ class BasePolicy(LightningModule, ABC):
             logger.warning("No evaluation config provided, online evaluation will not be performed during testing.")
         self.evaluator = None
         self.test_id = 0
+        self.robot_type = "R1Pro"
 
     @abstractmethod
     def forward(self, obs: dict, *args, **kwargs) -> torch.Tensor:
@@ -103,6 +105,7 @@ class BasePolicy(LightningModule, ABC):
         self.evaluator.env._current_episode = 0
         if self.eval_config.write_video:
             video_name = f"videos/test_{self.test_id}.mp4"
+            os.makedirs("videos", exist_ok=True)
             self.evaluator.video_writer = create_video_writer(
                 fpath=video_name,
                 resolution=(720, 1080),
@@ -112,10 +115,9 @@ class BasePolicy(LightningModule, ABC):
             terminated, truncated = self.evaluator.step()
             if self.eval_config.write_video:
                 self.evaluator._write_video()
-            if terminated:
-                self.evaluator.env.reset()
-            if truncated:
+            if terminated or truncated:
                 done = True
+                self.evaluator.env.reset()
         if self.eval_config.write_video:
             self.evaluator.video_writer = None
         self.test_id += 1
