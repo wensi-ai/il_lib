@@ -22,8 +22,8 @@ wd: 0.0
 bs: 64
 vbs: ${bs}
 data_dir: ???
-eval_interval: 1
-rollout_eval: false
+eval_interval: 5
+test_on_validation: true
 
 horizon: ???
 num_latest_obs: ???
@@ -49,8 +49,9 @@ wandb_run_name: ${run_name}
 module:
   _target_: ???  # filled by policy
   eval:
-    eval_on_validation: false
+    test_on_validation: true
     write_video: true
+    headless: false
     env: ${env}
     task: ${task}
     robot: ${robot}
@@ -100,7 +101,7 @@ trainer:
   checkpoint:  # this sub-dict will be popped to send to ModelCheckpoint as args
   - filename: "epoch{epoch}-train_loss{train/loss:.5f}"
     save_on_train_epoch_end: true  # this is a training metric, so we save it at the end of training epoch
-    save_top_k: 100
+    save_top_k: 10
     save_last: true
     monitor: "train/loss"
     mode: min

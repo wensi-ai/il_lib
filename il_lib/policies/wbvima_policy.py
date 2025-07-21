@@ -2,23 +2,25 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import deque, defaultdict
+from collections import defaultdict
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from einops import rearrange
-from il_lib.nn.common import MLP
-from il_lib.nn.features import ObsTokenizer, PointNet
+from omegaconf import DictConfig
+from hydra.utils import instantiate
+from il_lib.nn.features import ObsTokenizer
 from il_lib.nn.gpt import GPT
 from il_lib.nn.diffusion import WholeBodyUNetDiffusionHead
 from il_lib.optim import CosineScheduleFunction, default_optimizer_groups, check_optimizer_groups
 from il_lib.policies.policy_base import BasePolicy
 from il_lib.training.trainer import rank_zero_info
-from il_lib.utils.array_tensor_utils import any_concat, any_slice, get_batch_size
+from il_lib.utils.array_tensor_utils import any_slice, get_batch_size
 from il_lib.utils.functional_utils import unstack_sequence_fields
 from pytorch_lightning.utilities.types import OptimizerLRScheduler
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
-from omnigibson.learning.utils.eval_utils import ACTION_QPOS_INDICES, PROPRIOCEPTION_INDICES, PROPRIO_QPOS_INDICES
+from omnigibson.learning.utils.eval_utils import CAMERA_INTRINSICS, JOINT_RANGE_ARRAY, ROBOT_CAMERA_NAMES
+from omnigibson.learning.utils.obs_utils import process_fused_point_cloud
 
 
 class WBVIMA(BasePolicy):
@@ -31,13 +33,9 @@ class WBVIMA(BasePolicy):
         *args,
         prop_dim: int,
         prop_keys: List[str],
-        prop_mlp_hidden_depth: int,
-        prop_mlp_hidden_dim: int,
-        pointnet_n_coordinates: int,
-        pointnet_n_color: int,
-        pointnet_hidden_depth: int,
-        pointnet_hidden_dim: int,
         num_latest_obs: int,
+        # ====== Obs Tokenizer ======
+        feature_extractors: Dict[str, DictConfig],
         use_modality_type_tokens: bool,
         # ====== Transformer ======
         xf_n_embd: int,
@@ -75,34 +73,17 @@ class WBVIMA(BasePolicy):
 
         self._prop_keys = prop_keys
         self.obs_tokenizer = ObsTokenizer(
-            {
-                "proprioception": MLP(
-                    prop_dim,
-                    hidden_dim=prop_mlp_hidden_dim,
-                    output_dim=xf_n_embd,
-                    hidden_depth=prop_mlp_hidden_depth,
-                    add_output_activation=True,
-                ),
-                "pointcloud": PointNet(
-                    n_coordinates=pointnet_n_coordinates,
-                    n_color=pointnet_n_color,
-                    output_dim=xf_n_embd,
-                    hidden_dim=pointnet_hidden_dim,
-                    hidden_depth=pointnet_hidden_depth,
-                ),
+            extractors={
+                k: instantiate(v) for k, v in feature_extractors.items()
             },
             use_modality_type_tokens=use_modality_type_tokens,
             token_dim=xf_n_embd,
-            token_concat_order=["proprioception", "pointcloud"],
+            token_concat_order=list(feature_extractors.keys()),
             strict=True,
         )
         self.num_latest_obs = num_latest_obs
         if learnable_action_readout_token:
-            self.action_readout_token = nn.Parameter(
-                torch.zeros(
-                    xf_n_embd,
-                )
-            )
+            self.action_readout_token = nn.Parameter(torch.zeros(xf_n_embd))
         else:
             self.action_readout_token = torch.zeros(xf_n_embd)
         self.transformer = GPT(
@@ -143,7 +124,13 @@ class WBVIMA(BasePolicy):
         self.weight_decay = weight_decay
         self.loss_on_latest_obs_only = loss_on_latest_obs_only
 
-        self.obs_window_size = obs_window_size
+        # camera intrinsics
+        self.camera_intrinsics = dict()
+        # TODO: PROPER PROCESSING 
+        for camera_id, camera_name in ROBOT_CAMERA_NAMES.items():
+            camera_intrinsics = CAMERA_INTRINSICS[camera_id]
+            camera_intrinsics = torch.from_numpy(camera_intrinsics) 
+            self.camera_intrinsics[camera_name] = camera_intrinsics
 
     def forward(self, obs: dict) -> torch.Tensor:
         # construct prop obs
@@ -217,11 +204,15 @@ class WBVIMA(BasePolicy):
     @torch.no_grad()
     def act(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
         obs = self.process_data(data_batch=obs, extract_action=False)
+        joint_range_low = JOINT_RANGE_ARRAY[self.robot_type][0].to(self.device)
+        joint_range_high = JOINT_RANGE_ARRAY[self.robot_type][1].to(self.device)
         self._action_traj_pred = self._inference(obs=obs, return_last_timestep_only=True)  # dict of (B = 1, T_A, ...)
         self._action_traj_pred = {
             k: v[0].detach().cpu() for k, v in self._action_traj_pred.items()
         }  # dict of (T_A, ...)
-        return torch.cat(list(self._action_traj_pred.values()))
+        action = torch.cat(list(self._action_traj_pred.values()))
+        # denormalize action
+        return (action * joint_range_high - joint_range_low) + joint_range_low
 
     def reset(self) -> None:
         pass
@@ -232,9 +223,6 @@ class WBVIMA(BasePolicy):
             any_slice(batch["action"], np.s_[0]),
             strict=True,
         )
-        # obs data is dict of (N_chunks, B, window_size, ...)
-        # action chunks is (N_chunks, B, window_size, action_prediction_horizon, A)
-        # we loop over chunk dim
         main_data = unstack_sequence_fields(batch, batch_size=get_batch_size(batch, strict=True))
         all_loss, all_mask_sum = [], 0
         for i, main_data_chunk in enumerate(main_data):
@@ -451,11 +439,12 @@ class WBVIMA(BasePolicy):
     
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
-        if "robot_r1::fused_pcd" in data_batch["obs"]:
-            fused_pcd = data_batch["obs"]["robot_r1::fused_pcd"]
-        else:
-            raise NotImplementedError("Fused point cloud is not implemented")
-            # fused_pcd = process_fused_point_cloud(data_batch["obs"])
+        fused_pcd = process_fused_point_cloud(
+            obs=data_batch["obs"],
+            robot_name="robot_r1",
+            camera_intrinsics=self.camera_intrinsics,
+            pcd_num_points=4096,
+        )
         # if fused_pcd is 1D, we need to expand it to 3D
         if fused_pcd.ndim == 2:
             fused_pcd = torch.from_numpy(fused_pcd[None, None, :]).to(self.device)
@@ -469,18 +458,9 @@ class WBVIMA(BasePolicy):
         }
         if extract_action:
             # extract action from data_batch
-            data.update(
-                {
-                    "action": {
-                        key: data_batch["action_chunks"][..., ACTION_QPOS_INDICES["R1Pro"][key]]
-                        for key in ACTION_QPOS_INDICES["R1Pro"]
-                    },
-                    "pad_mask": data_batch["action_chunk_masks"],
-                }
-            )
-        else:
-            # remove action from data_batch
-            data.pop("action", None)
-            data.pop("pad_mask", None)
+            data.update({
+                "actions": data_batch["actions"],
+                "masks": data_batch["masks"],
+            })
         return data
 

@@ -2,9 +2,8 @@ import torch
 import torch.nn.functional as F
 from hydra.utils import instantiate
 from il_lib.nn.features import SimpleFeatureFusion
-from il_lib.optim import check_optimizer_groups, CosineScheduleFunction
+from il_lib.optim import CosineScheduleFunction
 from il_lib.policies.policy_base import BasePolicy
-from il_lib.training.trainer import rank_zero_info
 from il_lib.utils.array_tensor_utils import any_slice, get_batch_size, any_concat
 from il_lib.utils.functional_utils import call_once
 from omegaconf import DictConfig
@@ -308,23 +307,6 @@ class DiffusionPolicy(BasePolicy):
             )
 
         return optimizer
-
-    def get_optimizer_groups(self, weight_decay, lr_layer_decay, lr_scale=1.0):
-        feature_encoder_pg, _ = self.feature_extractor.get_optimizer_groups(
-            weight_decay=weight_decay,
-            lr_layer_decay=lr_layer_decay,
-            lr_scale=lr_scale,
-        )
-        backbone_pg, _ = self.backbone.get_optimizer_groups(
-            weight_decay=weight_decay,
-            lr_layer_decay=lr_layer_decay,
-            lr_scale=lr_scale,
-        )
-        all_groups = feature_encoder_pg + backbone_pg
-        _, table_str = check_optimizer_groups(self, all_groups, verbose=True)
-        rank_zero_info(table_str)
-        return all_groups
-
 
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data

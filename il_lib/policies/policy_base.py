@@ -150,6 +150,8 @@ class BasePolicy(LightningModule, ABC):
         # For performance optimization
         gm.DEFAULT_VIEWER_WIDTH = 128
         gm.DEFAULT_VIEWER_HEIGHT = 128
+        gm.HEADLESS = self.eval_config.headless
+
         # update parameters with policy cfg file
         assert self.eval_config is not None, "eval_config must be provided to create evaluator!"
         from omnigibson.learning.eval import Evaluator

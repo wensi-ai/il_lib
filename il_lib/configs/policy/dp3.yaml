@@ -3,14 +3,14 @@
 policy_name: dp3
 
 # ====== DP specific ======
-horizon: 16
 num_latest_obs: 2
+horizon: 16
 deployed_action_steps: 8
 resnet_pretrained_ckpt_path: ???
 
 # ====== Policy Module ======
 module:
-  _target_: il_lib.policies.diffusion_policy.DiffusionPolicy
+  _target_: il_lib.policies.DiffusionPolicy
   prop_dim: 23
   prop_keys: ["odom/base_velocity", "qpos/torso", "qpos/left_arm", "qpos/left_gripper", "qpos/right_arm", "qpos/right_gripper"]
   # ====== Feature Extractors ======
@@ -23,7 +23,7 @@ module:
       hidden_depth: 2
       add_output_activation: true
     pcd:
-      _target_: il_lib.nn.pointnet.UncoloredPointNet
+      _target_: il_lib.nn.features.UncoloredPointNet
       n_coordinates: 3
       output_dim: 512
       hidden_dim: 512

@@ -76,8 +76,8 @@ class BehaviorDataset(IterableDataset):
         self._shuffle = shuffle
         self._epoch = 0
 
-        assert set(visual_obs_types).issubset({"rgb", "depth", "seg"}), \
-            "visual_obs_types must be a subset of {'rgb', 'depth', 'seg'}!"
+        assert set(visual_obs_types).issubset({"rgb", "depth_linear", "seg_instance_id"}), \
+            "visual_obs_types must be a subset of {'rgb', 'depth_linear', 'seg_instance_id'}!"
         self._visual_obs_types = visual_obs_types
 
         self._pcd_downsample_ratio = pcd_downsample_ratio
@@ -123,8 +123,7 @@ class BehaviorDataset(IterableDataset):
         for obs_type in self._visual_obs_types:
             for camera_id, camera_name in self._multi_view_cameras.items():
                 kwargs = dict()
-                if obs_type == "seg":
-                    kwargs["num_classes"] = 100
+                # TODO: ADD KWARGS
                 obs_loaders[f"{camera_name}::{obs_type}"] = iter(OBS_LOADER_MAP[obs_type](
                     data_path=self._data_path,
                     task_id=self._task_id,
@@ -138,20 +137,11 @@ class BehaviorDataset(IterableDataset):
             data, mask = next(chunk_generator)
             # load visual obs
             for obs_type in self._visual_obs_types:
-                if obs_type == "pcd":
-                    obs_dict = dict()
-                    for camera_name in self._multi_view_cameras.values():
-                        obs_dict[f"{camera_name}::{obs_type}"] = data["obs"][f"{camera_name}::{obs_type}"][::self._pcd_downsample_ratio, ::self._pcd_downsample_ratio]
-                    data["obs"]["fused_pcd"], _ = process_fused_point_cloud(
-                        obs=obs_dict,
-                        robot_name=self.robot_type,
-                        downsample_points=self._pcd_downsample_points,
-                        process_seg=False,
-                   )
-                else:
-                    for camera_name in self._multi_view_cameras.values():
-                        data["obs"][f"{camera_name}::{obs_type}"] = next(obs_loaders[f"{camera_name}::{obs_type}"]).movedim(-1, -3)
-            data["masks"] = data["action_chunk_masks"] & mask[:, None] if self._use_action_chunks else mask
+                for camera_name in self._multi_view_cameras.values():
+                    data["obs"][f"{camera_name}::{obs_type}"] = next(obs_loaders[f"{camera_name}::{obs_type}"])
+                    if obs_type == "rgb":
+                        data["obs"][f"{camera_name}::{obs_type}"] = data["obs"][f"{camera_name}::{obs_type}"].movedim(-1, -3)
+            data["masks"] = mask
             yield data
         for obs_type in self._visual_obs_types:
             for camera_name in self._multi_view_cameras.values():
@@ -182,6 +172,7 @@ class BehaviorDataset(IterableDataset):
                 (JOINT_RANGE[self.robot_type]["base"][1] - JOINT_RANGE[self.robot_type]["base"][0])
             },
         }
+        demo["obs"]["cam_rel_poses"] = torch.from_numpy(np.array(df["observation.cam_rel_poses"].tolist(), dtype=np.float32))
         action_arr = torch.from_numpy(np.array(df["action"].tolist(), dtype=np.float32))
         for key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
             action_dict[key] = action_arr[:, indices]
@@ -236,20 +227,27 @@ class BehaviorDataset(IterableDataset):
                     data[k] = any_slice(demo[k], np.s_[chunk_idx: chunk_idx + self._ctx_len])
                     action_chunk_size = get_batch_size(data[k], strict=True)
                     pad_size = self._ctx_len - action_chunk_size
-                    # pad action chunks to equal length of ctx_len
-                    data[k] = any_concat(
-                        [
-                            data[k],
-                        ]
-                        + [any_ones_like(any_slice(data[k], np.s_[0:1]))] * pad_size,
-                        dim=0,
-                    )
-                    mask = torch.cat([
-                        torch.ones((action_chunk_size,), dtype=torch.bool),
-                        torch.zeros((pad_size,), dtype=torch.bool),
-                    ], dim=0)
-                else:
+                    if self._use_action_chunks:
+                        assert pad_size == 0, "pad_size should be 0 if use_action_chunks is True!"
+                        mask = demo["action_masks"][chunk_idx: chunk_idx + self._ctx_len]
+                    else:
+                        # pad action chunks to equal length of ctx_len
+                        data[k] = any_concat(
+                            [
+                                data[k],
+                            ]
+                            + [any_ones_like(any_slice(data[k], np.s_[0:1]))] * pad_size,
+                            dim=0,
+                        )
+                        mask = torch.cat([
+                            torch.ones((action_chunk_size,), dtype=torch.bool),
+                            torch.zeros((pad_size,), dtype=torch.bool),
+                        ], dim=0)
+                elif k != "action_masks":
                     data[k] = any_slice(demo[k], s)
+                else:
+                    # action_masks has already been processed
+                    pass
             yield data, mask
 
 

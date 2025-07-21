@@ -9,3 +9,4 @@ transformers
 wandb
 rich
 scikit-learn
+tabulate
