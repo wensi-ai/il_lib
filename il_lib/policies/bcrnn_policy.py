@@ -9,7 +9,7 @@ from il_lib.nn.distributions import GMMHead, MixtureOfGaussian
 from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.utils.array_tensor_utils import any_slice, get_batch_size, any_concat
 
-from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES, PROPRIO_QPOS_INDICES
+from omnigibson.learning.utils.eval_utils import JOINT_RANGE_ARRAY
 
 
 class BC_RNN(BasePolicy):
@@ -137,6 +137,7 @@ class BC_RNN(BasePolicy):
             action: (B, A) tensor of actions
             policy_state: updated rnn_state
         """
+        obs = self.process_data(obs, extract_action=False)
         assert (
             get_batch_size(any_slice(obs, 0), strict=True) == 1
         ), "Use L=1 for act"
@@ -147,8 +148,9 @@ class BC_RNN(BasePolicy):
             action = dist.mode()
         else:
             action = dist.sample()
-        # action is (B, L=1, A), reduce to (B, A)
-        action = action[:, 0]
+        action = action[:, 0].cpu()  # (B, A)
+        # denormalize action
+        action = action * (JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]) + JOINT_RANGE_ARRAY[self.robot_type][0]
         return action, policy_state
 
     def reset(self) -> None:
@@ -231,7 +233,7 @@ class BC_RNN(BasePolicy):
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
         data = {
-            "rgb": {k: data_batch["obs"][k] for k in data_batch["obs"] if "rgb" in k},
+            "rgb": {k: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k},
             "qpos": data_batch["obs"]["qpos"],
             "odom": data_batch["obs"]["odom"],
         }

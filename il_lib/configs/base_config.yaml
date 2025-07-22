@@ -49,6 +49,7 @@ wandb_run_name: ${run_name}
 module:
   _target_: ???  # filled by policy
   eval:
+    ckpt: null  # path to the checkpoint to load for evaluation
     test_on_validation: true
     write_video: true
     headless: false

@@ -135,11 +135,11 @@ class BasePolicy(LightningModule, ABC):
         og.shutdown()
 
     def on_validation_start(self):
-        if self.eval_config is not None and self.eval_config.eval_on_validation:
+        if self.eval_config is not None and self.eval_config.test_on_validation:
             self.on_test_start()
 
     def on_validation_end(self):
-        if self.eval_config is not None and self.eval_config.eval_on_validation and not self.trainer.sanity_checking:
+        if self.eval_config is not None and self.eval_config.test_on_validation and not self.trainer.sanity_checking:
             self.test_step(None, None)
 
     def create_evaluator(self):

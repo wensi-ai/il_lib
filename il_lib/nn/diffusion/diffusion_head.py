@@ -280,7 +280,7 @@ class UNetDiffusionHead(DiffusionHead):
         pred = self.model(
             sample=noisy_action,
             timestep=diffusion_timestep,
-            global_cond=obs,
+            cond=obs,
         )  # (B * T_obs, T_act, A)
         pred = rearrange(pred, "(B T_obs) T_act A -> B T_obs T_act A", B=B, T_obs=T_obs)
         return pred
@@ -737,7 +737,7 @@ class WholeBodyUNetDiffusionHead(nn.Module):
                 timestep=rearrange(
                     diffusion_timestep[part_name], "B T_obs 1 -> (B T_obs)"
                 ),
-                global_cond=global_cond,
+                cond=global_cond,
             )  # (B * T_obs, T_act, A)
             pred_eps = rearrange(
                 pred_eps, "(B T_obs) T_act A -> B T_obs T_act A", B=B, T_obs=T_obs
@@ -876,7 +876,7 @@ class WholeBodyUNetDiffusionHead(nn.Module):
                 pred = self.models[part](
                     sample=denoise_in,
                     timestep=rearrange(timesteps, "B T_obs 1 -> (B T_obs)"),
-                    global_cond=global_cond,
+                    cond=global_cond,
                 )  # (B * T_obs, T_act, A)
                 noisy_traj = rearrange(
                     noisy_traj, "B T_obs T_act A -> (B T_obs) T_act A"

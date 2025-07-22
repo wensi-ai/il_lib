@@ -3,8 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import defaultdict
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from einops import rearrange
 from omegaconf import DictConfig
 from hydra.utils import instantiate
@@ -55,7 +53,7 @@ class WBVIMA(BasePolicy):
         action_keys: List[str],
         action_key_dims: dict[str, int],
         # ====== Diffusion ======
-        noise_scheduler: Union[DDPMScheduler, DDIMScheduler],
+        noise_scheduler: DictConfig,
         noise_scheduler_step_kwargs: Optional[dict] = None,
         num_denoise_steps_per_inference: int,
         # ====== learning ======
@@ -94,12 +92,12 @@ class WBVIMA(BasePolicy):
             use_geglu=xf_use_geglu,
         )
         self.action_decoder = WholeBodyUNetDiffusionHead(
-            whole_body_decoding_order=["mobile_base", "torso", "arms"],
-            action_dim_per_part={"mobile_base": 3, "torso": 4, "arms": 14},
+            whole_body_decoding_order=["base", "torso", "arms"],
+            action_dim_per_part={"base": 3, "torso": 4, "arms": 16},
             obs_dim=xf_n_embd,
             action_horizon=action_prediction_horizon,
             diffusion_step_embed_dim=diffusion_step_embed_dim,
-            noise_scheduler=noise_scheduler,
+            noise_scheduler=instantiate(noise_scheduler),
             noise_scheduler_step_kwargs=noise_scheduler_step_kwargs,
             inference_denoise_steps=num_denoise_steps_per_inference,
             unet_down_dims=unet_down_dims,
@@ -123,13 +121,13 @@ class WBVIMA(BasePolicy):
         self.lr_layer_decay = lr_layer_decay
         self.weight_decay = weight_decay
         self.loss_on_latest_obs_only = loss_on_latest_obs_only
-
+        # Save hyperparameters
+        self.save_hyperparameters()
         # camera intrinsics
         self.camera_intrinsics = dict()
         # TODO: PROPER PROCESSING 
         for camera_id, camera_name in ROBOT_CAMERA_NAMES.items():
-            camera_intrinsics = CAMERA_INTRINSICS[camera_id]
-            camera_intrinsics = torch.from_numpy(camera_intrinsics) 
+            camera_intrinsics = torch.from_numpy(CAMERA_INTRINSICS[camera_id]) 
             self.camera_intrinsics[camera_name] = camera_intrinsics
 
     def forward(self, obs: dict) -> torch.Tensor:
@@ -204,15 +202,13 @@ class WBVIMA(BasePolicy):
     @torch.no_grad()
     def act(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
         obs = self.process_data(data_batch=obs, extract_action=False)
-        joint_range_low = JOINT_RANGE_ARRAY[self.robot_type][0].to(self.device)
-        joint_range_high = JOINT_RANGE_ARRAY[self.robot_type][1].to(self.device)
         self._action_traj_pred = self._inference(obs=obs, return_last_timestep_only=True)  # dict of (B = 1, T_A, ...)
         self._action_traj_pred = {
             k: v[0].detach().cpu() for k, v in self._action_traj_pred.items()
         }  # dict of (T_A, ...)
-        action = torch.cat(list(self._action_traj_pred.values()))
+        action = torch.cat(list(self._action_traj_pred.values()), dim=1)  # (T_A, A)
         # denormalize action
-        return (action * joint_range_high - joint_range_low) + joint_range_low
+        return action * (JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]) + JOINT_RANGE_ARRAY[self.robot_type][0]
 
     def reset(self) -> None:
         pass
@@ -220,31 +216,24 @@ class WBVIMA(BasePolicy):
     def policy_training_step(self, batch, batch_idx) -> Any:
         batch = self.process_data(data_batch=batch, extract_action=True)
         B = get_batch_size(
-            any_slice(batch["action"], np.s_[0]),
+            any_slice(batch["actions"], np.s_[0]),
             strict=True,
         )
-        main_data = unstack_sequence_fields(batch, batch_size=get_batch_size(batch, strict=True))
-        all_loss, all_mask_sum = [], 0
-        for i, main_data_chunk in enumerate(main_data):
-            # get padding mask
-            pad_mask = main_data_chunk.pop("pad_mask")  # (B, window_size, L_pred_horizon)
-            target_action = main_data_chunk.pop("action")  # (B, window_size, L_pred_horizon, A)
-            gt_action = torch.cat([target_action[k] for k in self._action_keys], dim=-1)
-            transformer_output = self.forward(
-                main_data_chunk
-            )  # (B, L, E), where L is interleaved time and modality tokens
-            loss = self._compute_loss(
-                transformer_output=transformer_output,
-                gt_action=gt_action,
-            )  # (B, T_obs, T_act)
-            if self.loss_on_latest_obs_only:
-                mask = torch.zeros_like(pad_mask)
-                mask[:, -1] = 1
-                pad_mask = pad_mask * mask
-            loss = loss * pad_mask
-            all_loss.append(loss)
-            all_mask_sum += pad_mask.sum()
-        action_loss = torch.sum(torch.stack(all_loss)) / all_mask_sum
+        # get padding mask
+        pad_mask = batch.pop("masks")  # (B, window_size, L_pred_horizon)
+        target_action = batch.pop("actions")  # (B, window_size, L_pred_horizon, A)
+        gt_action = torch.cat([target_action[k] for k in self._action_keys], dim=-1)
+        transformer_output = self.forward(batch)  # (B, L, E), where L is interleaved time and modality tokens
+        loss = self._compute_loss(
+            transformer_output=transformer_output,
+            gt_action=gt_action,
+        )  # (B, T_obs, T_act)
+        if self.loss_on_latest_obs_only:
+            mask = torch.zeros_like(pad_mask)
+            mask[:, -1] = 1
+            pad_mask = pad_mask * mask
+        loss = loss * pad_mask
+        action_loss = torch.sum(loss) / pad_mask.sum()
         # sum over action_prediction_horizon dim instead of avg
         action_loss = action_loss * self.action_prediction_horizon
         log_dict = {"diffusion_loss": action_loss}
@@ -258,40 +247,32 @@ class WBVIMA(BasePolicy):
         """
         batch = self.process_data(data_batch=batch, extract_action=True)
         B = get_batch_size(
-            any_slice(batch["action"], np.s_[0]),
+            any_slice(batch["actions"], np.s_[0]),
             strict=True,
         )
-        # obs data is dict of (N_chunks, B, window_size, ...)
-        # action chunks is (N_chunks, B, window_size, action_prediction_horizon, A)
-        # we loop over chunk dim
-        main_data = unstack_sequence_fields(batch, batch_size=get_batch_size(batch, strict=True))
-        all_l1, all_mask_sum = defaultdict(list), 0
-        for i, main_data_chunk in enumerate(main_data):
-            # get padding mask
-            pad_mask = main_data_chunk.pop("pad_mask")  # (B, window_size, L_pred_horizon)
-            target_action = main_data_chunk.pop("action")  # (B, window_size, L_pred_horizon, A)
-            transformer_output = self.forward(
-                main_data_chunk
-            )  # (B, L, E), where L is interleaved time and modality tokens
-            pred_actions = self._inference(
-                transformer_output=transformer_output,
-                return_last_timestep_only=False,
-            )  # dict of (B, window_size, L_pred_horizon, A)
-            for action_k in pred_actions:
-                pred = pred_actions[action_k]
-                gt = target_action[action_k]
-                l1 = F.l1_loss(pred, gt, reduction="none")  # (B, window_size, L_pred_horizon, A)
-                # sum over action dim
-                l1 = l1.sum(dim=-1).reshape(pad_mask.shape)  # (B, window_size, L_pred_horizon)
-                if self.loss_on_latest_obs_only:
-                    mask = torch.zeros_like(pad_mask)
-                    mask[:, -1] = 1
-                    pad_mask = pad_mask * mask
-                all_l1[action_k].append(l1 * pad_mask)
-            all_mask_sum += pad_mask.sum()
+        # get padding mask
+        pad_mask = batch.pop("masks")  # (B, window_size, L_pred_horizon)
+        target_action = batch.pop("actions")  # (B, window_size, L_pred_horizon, A)
+        transformer_output = self.forward(batch)  # (B, L, E), where L is interleaved time and modality tokens
+        pred_actions = self._inference(
+            transformer_output=transformer_output,
+            return_last_timestep_only=False,
+        )  # dict of (B, window_size, L_pred_horizon, A)
+        all_l1 = dict()
+        for action_k in pred_actions:
+            pred = pred_actions[action_k]
+            gt = target_action[action_k]
+            l1 = F.l1_loss(pred, gt, reduction="none")  # (B, window_size, L_pred_horizon, A)
+            # sum over action dim
+            l1 = l1.sum(dim=-1).reshape(pad_mask.shape)  # (B, window_size, L_pred_horizon)
+            if self.loss_on_latest_obs_only:
+                mask = torch.zeros_like(pad_mask)
+                mask[:, -1] = 1
+                pad_mask = pad_mask * mask
+            all_l1[action_k] = l1 * pad_mask
         # avg on chunks dim, batch dim, and obs window dim so we can compare under different training settings
         all_loss = {
-            f"l1_{k}": torch.sum(torch.stack(v)) / all_mask_sum * self.action_prediction_horizon
+            f"l1_{k}": torch.sum(v) / pad_mask.sum() * self.action_prediction_horizon
             for k, v in all_l1.items()
         }
         summed_l1 = sum(all_loss.values())
@@ -393,12 +374,12 @@ class WBVIMA(BasePolicy):
             return_last_timestep_only=return_last_timestep_only,
         )  # (B, T_obs, T_act, A) or (B, T_act, A)
         return {
-            "mobile_base": pred["mobile_base"],
+            "base": pred["base"],
             "torso": pred["torso"],
-            "left_arm": pred["arms"][..., :6],
-            "left_gripper": pred["arms"][..., 6:7],
-            "right_arm": pred["arms"][..., 7:13],
-            "right_gripper": pred["arms"][..., 13:14],
+            "left_arm": pred["arms"][..., :7],
+            "left_gripper": pred["arms"][..., 7:8],
+            "right_arm": pred["arms"][..., 8:15],
+            "right_gripper": pred["arms"][..., 15:16],
         }
     
     def _compute_loss(
@@ -430,24 +411,36 @@ class WBVIMA(BasePolicy):
         loss = self.action_decoder.compute_loss(
             obs=action_readout_tokens,
             gt_action={
-                "mobile_base": mobile_base_action,
+                "base": mobile_base_action,
                 "torso": torso_action,
                 "arms": arms_action,
             },
         )
         return loss
     
+    def _get_action_readout_tokens(self, transformer_output: torch.Tensor):
+        B, _, E = transformer_output.shape
+        n_tokens_per_step = self.obs_tokenizer.num_tokens_per_step + 1
+        action_readout_tokens = transformer_output[
+            :, self.obs_tokenizer.num_tokens_per_step :: n_tokens_per_step
+        ]  # (B, T_obs, E)
+        assert action_readout_tokens.shape == (B, self.num_latest_obs, E)
+        return action_readout_tokens
+    
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
+        # first, move rgb dim back to the last dim
+        for key in data_batch["obs"]:
+            if "rgb" in key:
+                data_batch["obs"][key] = data_batch["obs"][key].movedim(-3, -1)
         # process observation data
         fused_pcd = process_fused_point_cloud(
             obs=data_batch["obs"],
-            robot_name="robot_r1",
             camera_intrinsics=self.camera_intrinsics,
             pcd_num_points=4096,
-        )
-        # if fused_pcd is 1D, we need to expand it to 3D
+        )[0]
+        # if fused_pcd is 2D, we need to expand it to 4D
         if fused_pcd.ndim == 2:
-            fused_pcd = torch.from_numpy(fused_pcd[None, None, :]).to(self.device)
+            fused_pcd = fused_pcd.unsqueeze(0).unsqueeze(0).to(self.device)
         data = {
             "pointcloud": {
                 "rgb": fused_pcd[..., :3],

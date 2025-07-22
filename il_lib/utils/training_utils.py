@@ -71,7 +71,7 @@ def load_torch(*fpath: str, map_location="cpu") -> dict:
     """
     fpath = str(f_join(fpath))
     try:
-        return torch.load(fpath, map_location=map_location)
+        return torch.load(fpath, map_location=map_location, weights_only=False)
     except RuntimeError as e:
         raise RuntimeError(f"{e}\n\n --- Error loading {fpath}")
 
