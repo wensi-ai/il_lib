@@ -71,8 +71,5 @@ module:
   optimizer: "adam"
 
 data_module:
-  obs_window_size: ${num_latest_obs}
-  ctx_len: ${horizon}
   use_action_chunks: false
-  visual_obs_types: ["pcd"]
-  load_task_info: false
+  visual_obs_types: ["rgb", "depth_linear"]

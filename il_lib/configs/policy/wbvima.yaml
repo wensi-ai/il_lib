@@ -11,8 +11,7 @@ eval:
 # ====== DP specific ======
 num_latest_obs: 2
 horizon: 2
-action_prediction_horizon: 8
-deployed_action_steps: 1
+deployed_action_steps: 8
 wd: 0.1
 
 # ====== module ======
@@ -47,7 +46,7 @@ module:
   # ====== Action Decoding ======
   learnable_action_readout_token: false
   action_dim: 23
-  action_prediction_horizon: ${action_prediction_horizon}
+  action_prediction_horizon: ${deployed_action_steps}
   diffusion_step_embed_dim: 128
   unet_down_dims: [64,128]
   unet_kernel_size: 5
@@ -73,16 +72,9 @@ module:
   loss_on_latest_obs_only: false
 
 data_module:
-  obs_window_size: ${num_latest_obs}
-  ctx_len: ${horizon}
   use_action_chunks: true
-  action_prediction_horizon: ${action_prediction_horizon}
   visual_obs_types: ["rgb", "depth_linear"]
-  load_task_info: false
-  multi_view_cameras:
-    head: robot_r1::robot_r1:zed_link:Camera:0
-    left_wrist: robot_r1::robot_r1:left_realsense_link:Camera:0
-    right_wrist: robot_r1::robot_r1:right_realsense_link:Camera:0
+  action_prediction_horizon: ${deployed_action_steps}
 
 robot:
   type: R1Pro

@@ -2,7 +2,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import defaultdict
 from einops import rearrange
 from omegaconf import DictConfig
 from hydra.utils import instantiate
@@ -13,12 +12,11 @@ from il_lib.optim import CosineScheduleFunction, default_optimizer_groups, check
 from il_lib.policies.policy_base import BasePolicy
 from il_lib.training.trainer import rank_zero_info
 from il_lib.utils.array_tensor_utils import any_slice, get_batch_size
-from il_lib.utils.functional_utils import unstack_sequence_fields
 from pytorch_lightning.utilities.types import OptimizerLRScheduler
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from omnigibson.learning.utils.eval_utils import CAMERA_INTRINSICS, JOINT_RANGE_ARRAY, ROBOT_CAMERA_NAMES
-from omnigibson.learning.utils.obs_utils import process_fused_point_cloud
+from omnigibson.learning.utils.obs_utils import process_fused_point_cloud, color_pcd_vis
 
 
 class WBVIMA(BasePolicy):
@@ -127,7 +125,8 @@ class WBVIMA(BasePolicy):
         self.camera_intrinsics = dict()
         # TODO: PROPER PROCESSING 
         for camera_id, camera_name in ROBOT_CAMERA_NAMES.items():
-            camera_intrinsics = torch.from_numpy(CAMERA_INTRINSICS[camera_id]) 
+            camera_intrinsics = torch.from_numpy(CAMERA_INTRINSICS[camera_id]) / 4.0
+            camera_intrinsics[-1, -1] = 1.0  # make it homogeneous
             self.camera_intrinsics[camera_name] = camera_intrinsics
 
     def forward(self, obs: dict) -> torch.Tensor:
@@ -440,6 +439,7 @@ class WBVIMA(BasePolicy):
         )[0]
         # if fused_pcd is 2D, we need to expand it to 4D
         if fused_pcd.ndim == 2:
+            color_pcd_vis(fused_pcd)
             fused_pcd = fused_pcd.unsqueeze(0).unsqueeze(0).to(self.device)
         data = {
             "pointcloud": {

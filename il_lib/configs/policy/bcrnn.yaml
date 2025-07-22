@@ -24,9 +24,9 @@ module:
     rgb:
       _target_: il_lib.nn.features.MultiviewResNet18
       views: 
+      - robot_r1::robot_r1:zed_link:Camera:0::rgb
       - robot_r1::robot_r1:left_realsense_link:Camera:0::rgb
       - robot_r1::robot_r1:right_realsense_link:Camera:0::rgb
-      - robot_r1::robot_r1:zed_link:Camera:0::rgb
       resnet_output_dim: 512
       token_dim: 512
       load_pretrained: false
@@ -52,15 +52,9 @@ module:
   optimizer: "adam"
 
 data_module:
-  obs_window_size: ${num_latest_obs}
-  ctx_len: ${horizon}
   use_action_chunks: false
   visual_obs_types: ["rgb"]
   load_task_info: false
-  multi_view_cameras:
-    head: robot_r1::robot_r1:zed_link:Camera:0
-    left_wrist: robot_r1::robot_r1:left_realsense_link:Camera:0
-    right_wrist: robot_r1::robot_r1:right_realsense_link:Camera:0
 
 robot:
   type: R1Pro

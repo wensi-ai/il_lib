@@ -60,7 +60,7 @@ module:
     model:
       _target_: omnigibson.learning.policies.VisionActionILPolicy
       use_websocket: false
-      action_prediction_horizon: ${deployed_action_steps}
+      deployed_action_steps: ${deployed_action_steps}
       obs_window_size: ${num_latest_obs}
   # ====== learning ======
   lr: ${lr}
@@ -83,6 +83,20 @@ data_module:
   dataloader_num_workers: 4
   max_num_demos: null 
   seed: ${seed}
+  # ====== Dataset ======
+  obs_window_size: ${num_latest_obs}
+  ctx_len: ${horizon}
+  load_task_info: false
+  multi_view_cameras:
+    head: 
+      name: robot_r1::robot_r1:zed_link:Camera:0
+      resolution: [180, 180]
+    left_wrist: 
+      name: robot_r1::robot_r1:left_realsense_link:Camera:0
+      resolution: [120, 120]
+    right_wrist: 
+      name: robot_r1::robot_r1:right_realsense_link:Camera:0
+      resolution: [120, 120]
 
 # ====== Trainer ======
 trainer:

@@ -5,7 +5,7 @@ import torch
 from copy import deepcopy
 from torch.utils.data import IterableDataset, Dataset
 from il_lib.utils.array_tensor_utils import any_concat, any_ones_like, any_slice, any_stack, get_batch_size
-from typing import Optional, List, Tuple, Dict, Generator
+from typing import Any, Optional, List, Tuple, Dict, Generator
 
 from omnigibson.learning.utils.eval_utils import ACTION_QPOS_INDICES, JOINT_RANGE, PROPRIO_QPOS_INDICES, PROPRIOCEPTION_INDICES
 from omnigibson.learning.utils.obs_utils import OBS_LOADER_MAP
@@ -34,7 +34,7 @@ class BehaviorDataset(IterableDataset):
         use_action_chunks: bool = False,
         action_prediction_horizon: Optional[int] = None,
         visual_obs_types: List[str],
-        multi_view_cameras: Optional[Dict[str, str]] = None,
+        multi_view_cameras: Optional[Dict[str, Any]] = None,
         load_task_info: bool = False,
         seed: int = 42,
         shuffle: bool = True,
@@ -56,7 +56,7 @@ class BehaviorDataset(IterableDataset):
                 Must not be None if use_action_chunks is True.
             visual_obs_types (List[str]): List of visual observation types to load.
                 Valid options are: "rgb", "depth", "seg".
-            multi_view_cameras (Optional[Dict[str, str]]): Dict of multi-view camera id-name pairs to load obs from.
+            multi_view_cameras (Optional[Dict[str, Any]]): Dict of id-camera pairs to load obs from.
             load_task_info (bool): Whether to load privileged task information.
             seed (int): Random seed.
             shuffle (bool): Whether to shuffle the dataset.
@@ -121,8 +121,8 @@ class BehaviorDataset(IterableDataset):
         # Initialize obs loaders
         obs_loaders = dict()
         for obs_type in self._visual_obs_types:
-            for camera_id, camera_name in self._multi_view_cameras.items():
-                kwargs = dict()
+            for camera_id in self._multi_view_cameras.keys():
+                camera_name = self._multi_view_cameras[camera_id]["name"]
                 # TODO: ADD KWARGS
                 obs_loaders[f"{camera_name}::{obs_type}"] = iter(OBS_LOADER_MAP[obs_type](
                     data_path=self._data_path,
@@ -131,21 +131,21 @@ class BehaviorDataset(IterableDataset):
                     demo_id=self._demo_keys[demo_ptr],
                     batch_size=self._obs_window_size,
                     stride=1,
-                    **kwargs,
+                    output_size=self._multi_view_cameras[camera_id]["resolution"],
                 ))
         for _ in range(self._demo_lengths[demo_ptr]):
             data, mask = next(chunk_generator)
             # load visual obs
             for obs_type in self._visual_obs_types:
-                for camera_name in self._multi_view_cameras.values():
-                    data["obs"][f"{camera_name}::{obs_type}"] = next(obs_loaders[f"{camera_name}::{obs_type}"])
+                for camera in self._multi_view_cameras.values():
+                    data["obs"][f"{camera['name']}::{obs_type}"] = next(obs_loaders[f"{camera['name']}::{obs_type}"])
                     if obs_type == "rgb":
-                        data["obs"][f"{camera_name}::{obs_type}"] = data["obs"][f"{camera_name}::{obs_type}"].movedim(-1, -3)
+                        data["obs"][f"{camera['name']}::{obs_type}"] = data["obs"][f"{camera['name']}::{obs_type}"].movedim(-1, -3)
             data["masks"] = mask
             yield data
         for obs_type in self._visual_obs_types:
-            for camera_name in self._multi_view_cameras.values():
-                obs_loaders[f"{camera_name}::{obs_type}"].close()
+            for camera in self._multi_view_cameras.values():
+                obs_loaders[f"{camera['name']}::{obs_type}"].close()
 
     def _preload_demo(self, demo_key: str) -> dict:
         """
