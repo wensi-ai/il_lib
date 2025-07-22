@@ -25,9 +25,9 @@ module:
     rgb:
       _target_: il_lib.nn.features.MultiviewResNet18
       views: 
-      - robot_r1::robot_r1:zed_link:Camera:0::rgb
       - robot_r1::robot_r1:left_realsense_link:Camera:0::rgb
       - robot_r1::robot_r1:right_realsense_link:Camera:0::rgb
+      - robot_r1::robot_r1:zed_link:Camera:0::rgb
       resnet_output_dim: 512
       token_dim: 512
       load_pretrained: false

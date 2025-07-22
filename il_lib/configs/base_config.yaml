@@ -62,6 +62,10 @@ module:
       use_websocket: false
       deployed_action_steps: ${deployed_action_steps}
       obs_window_size: ${num_latest_obs}
+      obs_output_size: 
+        left_wrist: [120, 120]
+        right_wrist: [120, 120]
+        head: [180, 180]
   # ====== learning ======
   lr: ${lr}
   use_cosine_lr: ${use_cosine_lr}
@@ -88,15 +92,15 @@ data_module:
   ctx_len: ${horizon}
   load_task_info: false
   multi_view_cameras:
-    head: 
-      name: robot_r1::robot_r1:zed_link:Camera:0
-      resolution: [180, 180]
     left_wrist: 
       name: robot_r1::robot_r1:left_realsense_link:Camera:0
       resolution: [120, 120]
     right_wrist: 
       name: robot_r1::robot_r1:right_realsense_link:Camera:0
       resolution: [120, 120]
+    head: 
+      name: robot_r1::robot_r1:zed_link:Camera:0
+      resolution: [180, 180]
 
 # ====== Trainer ======
 trainer:
