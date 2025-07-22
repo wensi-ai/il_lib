@@ -16,7 +16,7 @@ from pytorch_lightning.utilities.types import OptimizerLRScheduler
 from typing import Any, Dict, List, Optional
 
 from omnigibson.learning.utils.eval_utils import CAMERA_INTRINSICS, JOINT_RANGE_ARRAY, ROBOT_CAMERA_NAMES
-from omnigibson.learning.utils.obs_utils import process_fused_point_cloud, color_pcd_vis
+from omnigibson.learning.utils.obs_utils import process_fused_point_cloud
 
 
 class WBVIMA(BasePolicy):
@@ -436,11 +436,8 @@ class WBVIMA(BasePolicy):
             obs=data_batch["obs"],
             camera_intrinsics=self.camera_intrinsics,
             pcd_num_points=4096,
+            use_fps=True
         )[0]
-        # if fused_pcd is 2D, we need to expand it to 4D
-        if fused_pcd.ndim == 2:
-            color_pcd_vis(fused_pcd)
-            fused_pcd = fused_pcd.unsqueeze(0).unsqueeze(0).to(self.device)
         data = {
             "pointcloud": {
                 "rgb": fused_pcd[..., :3],

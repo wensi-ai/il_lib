@@ -52,7 +52,7 @@ module:
     ckpt: null  # path to the checkpoint to load for evaluation
     test_on_validation: true
     write_video: true
-    headless: false
+    headless: ${headless}
     env: ${env}
     task: ${task}
     robot: ${robot}
