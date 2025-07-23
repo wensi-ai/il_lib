@@ -173,13 +173,14 @@ class BehaviorDataset(IterableDataset):
         proprio = torch.from_numpy(np.array(df["observation.state"].tolist(), dtype=np.float32))
         demo["obs"] = {
             "qpos": {
-                key: (proprio[..., PROPRIO_QPOS_INDICES[self.robot_type][key]] - JOINT_RANGE[self.robot_type][key][0]) / 
-                (JOINT_RANGE[self.robot_type][key][1] - JOINT_RANGE[self.robot_type][key][0])
+                key: 2 * (proprio[..., PROPRIO_QPOS_INDICES[self.robot_type][key]] - JOINT_RANGE[self.robot_type][key][0]) / 
+                (JOINT_RANGE[self.robot_type][key][1] - JOINT_RANGE[self.robot_type][key][0]) - 1.0
                 for key in PROPRIO_QPOS_INDICES[self.robot_type]
             },
             "odom": {
-                "base_velocity": (proprio[..., PROPRIOCEPTION_INDICES[self.robot_type]["base_qvel"]] - JOINT_RANGE[self.robot_type]["base"][0]) / 
-                (JOINT_RANGE[self.robot_type]["base"][1] - JOINT_RANGE[self.robot_type]["base"][0])
+                "base_velocity": 2 * (
+                    proprio[..., PROPRIOCEPTION_INDICES[self.robot_type]["base_qvel"]] - JOINT_RANGE[self.robot_type]["base"][0]
+                ) / (JOINT_RANGE[self.robot_type]["base"][1] - JOINT_RANGE[self.robot_type]["base"][0]) - 1.0
             },
         }
         demo["obs"]["cam_rel_poses"] = torch.from_numpy(np.array(df["observation.cam_rel_poses"].tolist(), dtype=np.float32))
@@ -187,7 +188,9 @@ class BehaviorDataset(IterableDataset):
         for key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
             action_dict[key] = action_arr[:, indices]
             # action normalization
-            action_dict[key] = (action_dict[key] - JOINT_RANGE[self.robot_type][key][0]) / (JOINT_RANGE[self.robot_type][key][1] - JOINT_RANGE[self.robot_type][key][0])
+            action_dict[key] = 2 * (
+                action_dict[key] - JOINT_RANGE[self.robot_type][key][0]
+            ) / (JOINT_RANGE[self.robot_type][key][1] - JOINT_RANGE[self.robot_type][key][0]) - 1.0
         if self._load_task_info:
             demo["obs"]["task::low_dim"] = torch.from_numpy(np.array(df["observation.task_info"].tolist(), dtype=np.float32))
         if self._use_action_chunks:

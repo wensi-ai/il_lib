@@ -150,7 +150,9 @@ class BC_RNN(BasePolicy):
             action = dist.sample()
         action = action[:, 0].cpu()  # (B, A)
         # denormalize action
-        action = action * (JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]) + JOINT_RANGE_ARRAY[self.robot_type][0]
+        action = (action + 1) / 2 * (
+            JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]
+        ) + JOINT_RANGE_ARRAY[self.robot_type][0]
         return action, policy_state
 
     def reset(self) -> None:

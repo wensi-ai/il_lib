@@ -149,7 +149,9 @@ class DiffusionPolicy(BasePolicy):
             ).prev_sample  # (B, L, action_dim)
         action = noisy_traj[:, self.num_latest_obs - 1:].clone().cpu()  # (B, L, action_dim)
         # denormalize action
-        return action * (JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]) + JOINT_RANGE_ARRAY[self.robot_type][0]
+        return (action + 1) / 2 * (
+            JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]
+        ) + JOINT_RANGE_ARRAY[self.robot_type][0]
 
     def reset(self) -> None:
         pass

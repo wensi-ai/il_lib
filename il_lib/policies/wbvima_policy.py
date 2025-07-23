@@ -207,7 +207,9 @@ class WBVIMA(BasePolicy):
         }  # dict of (T_A, ...)
         action = torch.cat(list(self._action_traj_pred.values()), dim=1)  # (T_A, A)
         # denormalize action
-        return action * (JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]) + JOINT_RANGE_ARRAY[self.robot_type][0]
+        return (action + 1) / 2 * (
+            JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]
+        ) + JOINT_RANGE_ARRAY[self.robot_type][0]
 
     def reset(self) -> None:
         pass
