@@ -48,7 +48,7 @@ module:
   action_dim: 23
   action_prediction_horizon: ${deployed_action_steps}
   diffusion_step_embed_dim: 128
-  unet_down_dims: [64,128]
+  unet_down_dims: [64, 128]
   unet_kernel_size: 5
   unet_n_groups: 8
   unet_cond_predict_scale: true
@@ -73,7 +73,7 @@ module:
 
 data_module:
   use_action_chunks: true
-  visual_obs_types: ["rgb", "depth_linear"]
+  visual_obs_types: ["pcd"]
   action_prediction_horizon: ${deployed_action_steps}
 
 robot:

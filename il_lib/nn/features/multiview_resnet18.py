@@ -4,7 +4,6 @@ from typing import List, Optional, Union
 import torch.nn as nn
 from torchvision.models import ResNet18_Weights
 from torchvision import transforms
-import il_lib.utils as U
 from il_lib.utils.array_tensor_utils import any_concat
 from il_lib.utils.training_utils import load_torch, load_state_dict
 from il_lib.nn.features.resnet import resnet18

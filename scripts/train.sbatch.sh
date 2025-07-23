@@ -26,7 +26,7 @@ echo "working directory="$SLURM_SUBMIT_DIR
 
 source /vision/u/wsai/miniconda3/bin/activate behavior
 
-python train.py policy=diffusion_rgb_transformer task=turning_on_radio data_dir=/vision/u/wsai/behavior gpus=$SLURM_GPUS num_nodes=$SLURM_NNODES
+python train.py data_dir=/vision/u/wsai/behavior gpus=$SLURM_GPUS num_nodes=$SLURM_NNODES "$@"
 
 echo "Job finished."
 exit 0

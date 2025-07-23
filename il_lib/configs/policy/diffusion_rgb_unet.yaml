@@ -1,6 +1,6 @@
 # @package _global_
 
-policy_name: diffusion_rgb_transformer
+policy_name: diffusion_rgb_unet
 
 # ====== DP specific ======
 num_latest_obs: 2
@@ -48,18 +48,15 @@ module:
   num_latest_obs: ${num_latest_obs}
   # ====== Backbone ======
   backbone:
-    _target_: il_lib.nn.diffusion.TransformerForDiffusion
+    _target_: il_lib.nn.diffusion.ConditionalUnet1D
     input_dim: ${module.action_dim}
-    output_dim: ${module.action_dim}
-    horizon: ${horizon}
-    n_obs_steps: ${num_latest_obs}
-    cond_dim: ${module.feature_fusion_output_dim}
-    n_layer: 2
-    n_head: 8
-    n_emb: 256
-    p_drop_emb: 0.0
-    p_drop_attn: 0.01
-    n_cond_layers: 0
+    local_cond_dim: null
+    global_cond_dim: ${eval:'${module.feature_fusion_output_dim} * ${num_latest_obs}'}
+    diffusion_step_embed_dim: 128
+    down_dims: [64, 128]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: true
   # ====== Diffusion ======
   noise_scheduler:
     _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler

@@ -4,7 +4,7 @@ import torchvision.models as _models
 from il_lib.nn.common import get_activation
 from il_lib.nn.common import Conv2dWS
 from il_lib.utils.config_utils import register_class
-from typing import Callable
+from typing import Callable, List, Optional, Type, Union
 
 
 __all__ = ["create_resnet", "get_resnet_class", "get_all_resnet_names"]
@@ -57,39 +57,21 @@ def conv1x1(in_planes, out_planes, stride=1, ws=False):
     return _conv_op(ws)(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 
-class SELayer(nn.Module):
-    def __init__(self, channel, reduction):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channel, channel // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channel // reduction, channel, bias=False),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
-
-
 class BasicBlock(nn.Module):
-    expansion = 1
-
+    expansion: int = 1
+ 
     def __init__(
         self,
-        inplanes,
-        planes,
-        stride=1,
-        downsample=None,
-        groups=1,
-        base_width=64,
-        dilation=1,
-        norm_layer=None,
-        nonlinearity="relu",
-        ws=False,
+        inplanes: int,
+        planes: int,
+        stride: int = 1,
+        downsample: Optional[nn.Module] = None,
+        groups: int = 1,
+        base_width: int = 64,
+        dilation: int = 1,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+        nonlinearity: str = "relu",
+        ws: bool = False,
     ):
         super(BasicBlock, self).__init__()
         if norm_layer is None:
@@ -131,16 +113,16 @@ class LightBasicBlock(nn.Module):
 
     def __init__(
         self,
-        inplanes,
-        planes,
-        stride=1,
-        downsample=None,
-        groups=1,
-        base_width=64,
-        dilation=1,
-        norm_layer=None,
-        nonlinearity="relu",
-        ws=False,
+        inplanes: int,
+        planes: int,
+        stride: int = 1,
+        downsample: Optional[nn.Module] = None,
+        groups: int = 1,
+        base_width: int = 64,
+        dilation: int = 1,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+        nonlinearity: str = "relu",
+        ws: bool = False,
     ):
         super().__init__()
         if norm_layer is None:
@@ -178,20 +160,20 @@ class Bottleneck(nn.Module):
     # This variant is also known as ResNet V1.5 and improves accuracy according to
     # https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_pytorch.
 
-    expansion = 4
+    expansion: int = 4
 
     def __init__(
         self,
-        inplanes,
-        planes,
-        stride=1,
-        downsample=None,
-        groups=1,
-        base_width=64,
-        dilation=1,
-        norm_layer=None,
-        nonlinearity="relu",
-        ws=False,
+        inplanes: int,
+        planes: int,
+        stride: int = 1,
+        downsample: Optional[nn.Module] = None,
+        groups: int = 1,
+        base_width: int = 64,
+        dilation: int = 1,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+        nonlinearity: str = "relu",
+        ws: bool = False,
     ):
         super(Bottleneck, self).__init__()
         if norm_layer is None:
@@ -234,18 +216,18 @@ class Bottleneck(nn.Module):
 class ResNet(nn.Module):
     def __init__(
         self,
-        block,
-        layers,
-        output_dim=1000,
-        base_width=64,
-        zero_init_residual=True,
-        groups=1,
-        width_per_group=64,
-        replace_stride_with_dilation=None,
-        norm_layer=None,
-        nonlinearity="relu",
-        ws=False,
-        return_last_spatial_map=False,
+        block: Type[Union[BasicBlock, Bottleneck]],
+        layers: List[int],
+        output_dim: int = 1000,
+        base_width: int = 64,
+        zero_init_residual: bool = True,
+        groups: int = 1,
+        width_per_group: int = 64,
+        replace_stride_with_dilation: Optional[List[bool]] = None,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+        nonlinearity: str = "relu",
+        ws: bool = False,
+        return_last_spatial_map: bool = False,
     ):
         """
         Args:

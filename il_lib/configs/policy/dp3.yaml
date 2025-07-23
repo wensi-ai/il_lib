@@ -72,4 +72,4 @@ module:
 
 data_module:
   use_action_chunks: false
-  visual_obs_types: ["rgb", "depth_linear"]
+  visual_obs_types: ["pcd"]

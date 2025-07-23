@@ -427,17 +427,20 @@ class WBVIMA(BasePolicy):
         return action_readout_tokens
     
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
-        # first, move rgb dim back to the last dim
-        for key in data_batch["obs"]:
-            if "rgb" in key:
-                data_batch["obs"][key] = data_batch["obs"][key].movedim(-3, -1)
-        # process observation data
-        fused_pcd = process_fused_point_cloud(
-            obs=data_batch["obs"],
-            camera_intrinsics=self.camera_intrinsics,
-            pcd_num_points=4096,
-            use_fps=True
-        )[0]
+        if "pcd" in data_batch["obs"]:
+            fused_pcd = data_batch["obs"]["pcd"]
+        else:
+            # first, move rgb dim back to the last dim
+            for key in data_batch["obs"]:
+                if "rgb" in key:
+                    data_batch["obs"][key] = data_batch["obs"][key].movedim(-3, -1)
+            # process observation data
+            fused_pcd = process_fused_point_cloud(
+                obs=data_batch["obs"],
+                camera_intrinsics=self.camera_intrinsics,
+                pcd_num_points=4096,
+                use_fps=True
+            )[0]
         data = {
             "pointcloud": {
                 "rgb": fused_pcd[..., :3],

@@ -2,8 +2,10 @@ import numpy as np
 import os
 import pandas as pd
 import torch
+import h5py
 from copy import deepcopy
-from torch.utils.data import IterableDataset, Dataset
+from torch.utils.data import IterableDataset, Dataset, get_worker_info
+import torch.distributed as dist
 from il_lib.utils.array_tensor_utils import any_concat, any_ones_like, any_slice, any_stack, get_batch_size
 from typing import Any, Optional, List, Tuple, Dict, Generator
 
@@ -39,8 +41,7 @@ class BehaviorDataset(IterableDataset):
         seed: int = 42,
         shuffle: bool = True,
         # dataset parameters
-        pcd_downsample_ratio: Optional[int] = None,
-        pcd_downsample_points: Optional[int] = None,
+        online_pcd_generation: bool = False,
         **kwargs,
     ):
         """
@@ -60,8 +61,9 @@ class BehaviorDataset(IterableDataset):
             load_task_info (bool): Whether to load privileged task information.
             seed (int): Random seed.
             shuffle (bool): Whether to shuffle the dataset.
+            online_pcd_generation (bool): Whether to generate point clouds online or using pre-generated ones.
         """
-        super().__init__()
+        super().__init__(*args, **kwargs)
         self._data_path = data_path
         self._task_id = task_id
         self._demo_keys = demo_keys
@@ -76,13 +78,16 @@ class BehaviorDataset(IterableDataset):
         self._shuffle = shuffle
         self._epoch = 0
 
-        assert set(visual_obs_types).issubset({"rgb", "depth_linear", "seg_instance_id"}), \
-            "visual_obs_types must be a subset of {'rgb', 'depth_linear', 'seg_instance_id'}!"
-        self._visual_obs_types = visual_obs_types
+        assert set(visual_obs_types).issubset({"rgb", "depth_linear", "seg_instance_id", "pcd"}), \
+            "visual_obs_types must be a subset of {'rgb', 'depth_linear', 'seg_instance_id', 'pcd'}!"
+        self._visual_obs_types = set(visual_obs_types)
 
-        self._pcd_downsample_ratio = pcd_downsample_ratio
-        self._pcd_downsample_points = pcd_downsample_points
         self._multi_view_cameras = multi_view_cameras
+        self._online_pcd_generation = online_pcd_generation
+        if self._online_pcd_generation and "pcd" in self._visual_obs_types:
+            self._visual_obs_types.add("rgb")
+            self._visual_obs_types.add("depth_linear")
+
         self.robot_type = "R1Pro"
 
         self._demo_indices = list(range(len(self._demo_keys)))
@@ -109,45 +114,50 @@ class BehaviorDataset(IterableDataset):
             g.manual_seed(epoch + self._seed)
             self._demo_indices = torch.randperm(len(self._demo_keys), generator=g).tolist()
 
-    def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-        worker_id = worker_info.id if worker_info else 0
-        num_workers = worker_info.num_workers if worker_info else 1
-        for demo_ptr in self._demo_indices[worker_id::num_workers]:
+    def __iter__(self) -> Generator[Dict[str, Any], None, None]:
+        global_worker_id, total_global_workers = self._get_global_worker_id()
+        for demo_ptr in self._demo_indices[global_worker_id::total_global_workers]:
             yield from self.get_streamed_data(demo_ptr)
 
-    def get_streamed_data(self, demo_ptr: int):
+    def get_streamed_data(self, demo_ptr: int) -> Generator[Dict[str, Any], None, None]:
         chunk_generator = self._chunk_demo(demo_ptr)
         # Initialize obs loaders
         obs_loaders = dict()
         for obs_type in self._visual_obs_types:
-            for camera_id in self._multi_view_cameras.keys():
-                camera_name = self._multi_view_cameras[camera_id]["name"]
-                # TODO: ADD KWARGS
-                obs_loaders[f"{camera_name}::{obs_type}"] = iter(OBS_LOADER_MAP[obs_type](
-                    data_path=self._data_path,
-                    task_id=self._task_id,
-                    camera_id=camera_id, 
-                    demo_id=self._demo_keys[demo_ptr],
-                    batch_size=self._obs_window_size,
-                    stride=1,
-                    output_size=self._multi_view_cameras[camera_id]["resolution"],
-                ))
+            if obs_type == "pcd" and not self._online_pcd_generation:
+                # pcd_generator
+                f_pcd = h5py.File(f"{self._data_path}/pcd/task-{self._task_id:04d}/episode_{self._demo_keys[demo_ptr]}.hdf5", "r")
+                pcd_generator = iter(torch.from_numpy(f_pcd["data/demo_0/robot_r1::fused_pcd"][:]))
+            else:
+                for camera_id in self._multi_view_cameras.keys():
+                    camera_name = self._multi_view_cameras[camera_id]["name"]
+                    # TODO: ADD KWARGS
+                    obs_loaders[f"{camera_name}::{obs_type}"] = iter(OBS_LOADER_MAP[obs_type](
+                        data_path=self._data_path,
+                        task_id=self._task_id,
+                        camera_id=camera_id, 
+                        demo_id=self._demo_keys[demo_ptr],
+                        batch_size=self._obs_window_size,
+                        stride=1,
+                        output_size=tuple(self._multi_view_cameras[camera_id]["resolution"]),
+                    ))
         for _ in range(self._demo_lengths[demo_ptr]):
             data, mask = next(chunk_generator)
             # load visual obs
             for obs_type in self._visual_obs_types:
-                for camera in self._multi_view_cameras.values():
-                    data["obs"][f"{camera['name']}::{obs_type}"] = next(obs_loaders[f"{camera['name']}::{obs_type}"])
-                    if obs_type == "rgb":
-                        data["obs"][f"{camera['name']}::{obs_type}"] = data["obs"][f"{camera['name']}::{obs_type}"].movedim(-1, -3)
+                if obs_type == "pcd":
+                    # get file from 
+                    data["pcd"] = next(pcd_generator)
+                else:
+                    for camera in self._multi_view_cameras.values():
+                        data["obs"][f"{camera['name']}::{obs_type}"] = next(obs_loaders[f"{camera['name']}::{obs_type}"])
             data["masks"] = mask
             yield data
         for obs_type in self._visual_obs_types:
             for camera in self._multi_view_cameras.values():
                 obs_loaders[f"{camera['name']}::{obs_type}"].close()
 
-    def _preload_demo(self, demo_key: str) -> dict:
+    def _preload_demo(self, demo_key: str) -> Dict[str, Any]:
         """
         Preload a single demo into memory. Currently it loads action, proprio, and task info.
         Args:
@@ -250,7 +260,21 @@ class BehaviorDataset(IterableDataset):
                     pass
             yield data, mask
 
+    def _get_global_worker_id(self):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            num_workers = worker_info.num_workers if worker_info else 1
 
+            global_worker_id = rank * num_workers + worker_id
+            total_global_workers = world_size * num_workers
+        else:
+            global_worker_id = worker_id
+            total_global_workers = worker_info.num_workers if worker_info else 1
+        return global_worker_id, total_global_workers
+    
 
 class DummyDataset(Dataset):
     """

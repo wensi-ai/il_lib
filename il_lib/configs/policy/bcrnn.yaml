@@ -3,9 +3,10 @@
 policy_name: bcrnn
 
 # ====== BCRNN specific ======
-horizon: 5
 num_latest_obs: 5
+horizon: 5
 deployed_action_steps: 5
+resnet_pretrained_ckpt_path: ???
 
 # ------ module ------
 module:
@@ -29,7 +30,8 @@ module:
       - robot_r1::robot_r1:zed_link:Camera:0::rgb
       resnet_output_dim: 512
       token_dim: 512
-      load_pretrained: false
+      load_pretrained: true
+      pretrained_ckpt_path: ${resnet_pretrained_ckpt_path}
       enable_random_crop: true
       random_crop_size: 94
   # ====== Feature Fusion ======
@@ -54,7 +56,6 @@ module:
 data_module:
   use_action_chunks: false
   visual_obs_types: ["rgb"]
-  load_task_info: false
 
 robot:
   type: R1Pro

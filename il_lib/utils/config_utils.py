@@ -11,24 +11,8 @@ _CLASS_REGISTRY = {}  # for instantiation
 
 @call_once(on_second_call="noop")
 def register_omegaconf_resolvers():
-    import numpy as np
-
-    OmegaConf.register_new_resolver("scientific", lambda v, i=0: to_scientific_str(v, i))
-    OmegaConf.register_new_resolver("_optional", lambda v: f"_{v}" if v else "")
-    OmegaConf.register_new_resolver("optional_", lambda v: f"{v}_" if v else "")
-    OmegaConf.register_new_resolver("_optional_", lambda v: f"_{v}_" if v else "")
-    OmegaConf.register_new_resolver("__optional", lambda v: f"__{v}" if v else "")
-    OmegaConf.register_new_resolver("optional__", lambda v: f"{v}__" if v else "")
-    OmegaConf.register_new_resolver("__optional__", lambda v: f"__{v}__" if v else "")
-    OmegaConf.register_new_resolver("iftrue", lambda cond, v_default: cond if cond else v_default)
-    OmegaConf.register_new_resolver("ifelse", lambda cond, v1, v2="": v1 if cond else v2)
-    OmegaConf.register_new_resolver("ifequal", lambda query, key, v1, v2: v1 if query == key else v2)
-    OmegaConf.register_new_resolver("intbool", lambda cond: 1 if cond else 0)
-    OmegaConf.register_new_resolver("mult", lambda *x: np.prod(x).tolist())
-    OmegaConf.register_new_resolver("add", lambda *x: sum(x))
-    OmegaConf.register_new_resolver("div", lambda x, y: x / y)
-    OmegaConf.register_new_resolver("intdiv", lambda x, y: x // y)
-
+    OmegaConf.register_new_resolver("eval", eval)
+    
     # try each key until the key exists. Useful for multiple classes that have different
     # names for the same key
     def _try_key(cfg, *keys):
