@@ -116,6 +116,7 @@ class BehaviorDataset(IterableDataset):
 
     def __iter__(self) -> Generator[Dict[str, Any], None, None]:
         global_worker_id, total_global_workers = self._get_global_worker_id()
+        print(global_worker_id, total_global_workers, self._demo_indices)
         for demo_ptr in self._demo_indices[global_worker_id::total_global_workers]:
             yield from self.get_streamed_data(demo_ptr)
 

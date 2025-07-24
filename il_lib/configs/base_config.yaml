@@ -9,7 +9,7 @@ policy_name: ???  # filled by policy
 headless: true
 
 # ====== Main Config ======
-seed: -1
+seed: 42
 gpus: 1
 num_nodes: 1
 lr: 7e-4
@@ -135,6 +135,8 @@ trainer:
     - _target_: pytorch_lightning.callbacks.LearningRateMonitor
       logging_interval: step
     - _target_: pytorch_lightning.callbacks.RichModelSummary
+    - _target_: il_lib.training.trainer.CustomProgressBar
+      update_every_n: 1  # update every batch
 
 
 # ====== Resume training ======

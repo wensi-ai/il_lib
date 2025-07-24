@@ -10,15 +10,17 @@ import il_lib.utils.print_utils as PU
 from il_lib.utils.training_utils import load_torch
 import pytorch_lightning as pl
 import pytorch_lightning.loggers as pl_loggers
-from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.callbacks import Callback, TQDMProgressBar
 from pytorch_lightning.utilities import rank_zero_only
 from pytorch_lightning.utilities.rank_zero import rank_zero_debug as rank_zero_debug_pl
 from pytorch_lightning.utilities.rank_zero import rank_zero_info as rank_zero_info_pl
 from pytorch_lightning.callbacks import ModelCheckpoint
+from tqdm.auto import tqdm
 
 
 __all__ = [
     "Trainer",
+    "CustomProgressBar",
     "rank_zero_info",
     "rank_zero_debug",
     "rank_zero_warn",
@@ -210,3 +212,32 @@ def rank_zero_debug(*msg, **kwargs):
 
 
 rank_zero_debug.enabled = True
+
+
+class CustomProgressBar(TQDMProgressBar):
+    def __init__(self, update_every_n=1):
+        super().__init__()
+        self.update_every_n = update_every_n
+
+    def init_train_tqdm(self):
+        # tqdm bar with no total since we're using IterableDataset
+        bar = tqdm(
+            desc="Training",
+            position=0,
+            leave=True,
+            dynamic_ncols=True,
+            unit="batch",
+            smoothing=0.3
+        )
+        return bar
+
+    def get_metrics(self, trainer, model):
+        # don't show the version number
+        items = super().get_metrics(trainer, model)
+        items.pop("v_num", None)
+        return items
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        self.train_batch_idx += 1
+        if self.train_batch_idx % self.update_every_n == 0:
+            self.main_progress_bar.update(self.update_every_n)
