@@ -1,16 +1,20 @@
+import h5py
+import logging
 import numpy as np
 import os
 import pandas as pd
 import torch
-import h5py
-from copy import deepcopy
-from torch.utils.data import IterableDataset, Dataset, get_worker_info
 import torch.distributed as dist
+from copy import deepcopy
 from il_lib.utils.array_tensor_utils import any_concat, any_ones_like, any_slice, any_stack, get_batch_size
+from torch.utils.data import IterableDataset, Dataset, get_worker_info
 from typing import Any, Optional, List, Tuple, Dict, Generator
 
 from omnigibson.learning.utils.eval_utils import ACTION_QPOS_INDICES, JOINT_RANGE, PROPRIO_QPOS_INDICES, PROPRIOCEPTION_INDICES
 from omnigibson.learning.utils.obs_utils import OBS_LOADER_MAP
+
+
+logger = logging.getLogger("BehaviorDataset")
 
 
 class BehaviorDataset(IterableDataset):
@@ -99,7 +103,7 @@ class BehaviorDataset(IterableDataset):
             L = get_batch_size(demo, strict=True)
             assert L >= self._obs_window_size >= 1
             self._demo_lengths.append(L - self._obs_window_size + 1)
-        print("Dataset chunk length:", sum(self._demo_lengths))
+        logger.info(f"Dataset chunk length: {sum(self._demo_lengths)}")
 
     @property
     def epoch(self):
@@ -116,6 +120,7 @@ class BehaviorDataset(IterableDataset):
 
     def __iter__(self) -> Generator[Dict[str, Any], None, None]:
         global_worker_id, total_global_workers = self._get_global_worker_id()
+        logger.info(f"{global_worker_id}, {total_global_workers}")
         for demo_ptr in self._demo_indices[global_worker_id::total_global_workers]:
             yield from self.get_streamed_data(demo_ptr)
 
