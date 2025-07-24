@@ -44,6 +44,7 @@ use_wandb: true
 wandb_project: B1K
 wandb_group: ${policy_name}
 wandb_run_name: ${run_name}
+progress_bar_refresh_rate: 100
 
 # ====== Policy Module ======
 module:
@@ -136,7 +137,7 @@ trainer:
       logging_interval: step
     - _target_: pytorch_lightning.callbacks.RichModelSummary
     - _target_: il_lib.training.trainer.CustomProgressBar
-      update_every_n: 1  # update every batch
+      refresh_rate: ${progress_bar_refresh_rate}
 
 
 # ====== Resume training ======

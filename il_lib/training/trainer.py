@@ -215,10 +215,6 @@ rank_zero_debug.enabled = True
 
 
 class CustomProgressBar(TQDMProgressBar):
-    def __init__(self, update_every_n=1):
-        super().__init__()
-        self.update_every_n = update_every_n
-
     def init_train_tqdm(self):
         # tqdm bar with no total since we're using IterableDataset
         bar = tqdm(
@@ -230,14 +226,9 @@ class CustomProgressBar(TQDMProgressBar):
             smoothing=0.3
         )
         return bar
-
+    
     def get_metrics(self, trainer, model):
         # don't show the version number
         items = super().get_metrics(trainer, model)
         items.pop("v_num", None)
         return items
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        self.train_batch_idx += 1
-        if self.train_batch_idx % self.update_every_n == 0:
-            self.main_progress_bar.update(self.update_every_n)
