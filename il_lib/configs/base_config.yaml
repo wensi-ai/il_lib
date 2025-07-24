@@ -23,7 +23,7 @@ bs: 64
 vbs: ${bs}
 data_dir: ???
 eval_interval: 5
-test_on_validation: true
+online_eval: true
 
 horizon: ???
 num_latest_obs: ???
@@ -50,7 +50,7 @@ module:
   _target_: ???  # filled by policy
   eval:
     ckpt: null  # path to the checkpoint to load for evaluation
-    test_on_validation: ${test_on_validation}
+    online_eval: ${online_eval}
     write_video: true
     headless: ${headless}
     env: ${env}

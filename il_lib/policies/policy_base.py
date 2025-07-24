@@ -83,6 +83,7 @@ class BasePolicy(LightningModule, ABC):
             on_step=False,
             on_epoch=True,
             batch_size=batch_size,
+            sync_dist=True,
         )
         return loss
 
@@ -96,10 +97,43 @@ class BasePolicy(LightningModule, ABC):
             on_step=False,
             on_epoch=True,
             batch_size=real_batch_size,
+            sync_dist=True,
         )
         return log_dict
 
-    def test_step(self, *args, **kwargs):
+    def on_validation_end(self):
+        # only run test for global zero rank
+        if self.trainer.is_global_zero:
+            if self.eval_config is not None and self.eval_config.online_eval:
+                # evaluator for online evaluation should only be created once
+                if self.evaluator is None:
+                    self.evaluator = self.create_evaluator()
+                if not self.trainer.sanity_checking:
+                    self.log_dict(self.run_online_evaluation(), sync_dist=True)
+
+    def create_evaluator(self):
+        """
+        Create a evaluator parameter config containing vectorized distributed envs.
+        This will be used to spawn the OmniGibson environments for online evaluation
+        """
+        # For performance optimization
+        gm.DEFAULT_VIEWER_WIDTH = 128
+        gm.DEFAULT_VIEWER_HEIGHT = 128
+        gm.HEADLESS = self.eval_config.headless
+
+        # update parameters with policy cfg file
+        assert self.eval_config is not None, "eval_config must be provided to create evaluator!"
+        from omnigibson.learning.eval import Evaluator
+        evaluator = Evaluator(self.eval_config)
+        # set the policy for the evaluator
+        evaluator.policy.policy = self
+        evaluator.policy.device = self.device
+        return evaluator
+
+    def run_online_evaluation(self):
+        """
+        Run online evaluation using the evaluator.
+        """
         assert self.evaluator is not None, "evaluator is not created!"
         self.evaluator.reset()
         self.evaluator.env._current_episode = 0
@@ -123,40 +157,3 @@ class BasePolicy(LightningModule, ABC):
         self.test_id += 1
         results = {"eval/success_rate": self.evaluator.n_success_trials / self.evaluator.n_trials}
         return results
-
-    def on_test_start(self):
-        # evaluator for online evaluation should only be created once
-        if self.evaluator is None:
-            self.evaluator = self.create_evaluator()
-        assert self.evaluator is not None, "evaluator is not created!"
-
-    def on_test_end(self):
-        import omnigibson as og
-        og.shutdown()
-
-    def on_validation_start(self):
-        if self.eval_config is not None and self.eval_config.test_on_validation:
-            self.on_test_start()
-
-    def on_validation_end(self):
-        if self.eval_config is not None and self.eval_config.test_on_validation and not self.trainer.sanity_checking:
-            self.test_step(None, None)
-
-    def create_evaluator(self):
-        """
-        Create a evaluator parameter config containing vectorized distributed envs.
-        This will be used to spawn the OmniGibson environments for online evaluation in self.on_test_start()
-        """
-        # For performance optimization
-        gm.DEFAULT_VIEWER_WIDTH = 128
-        gm.DEFAULT_VIEWER_HEIGHT = 128
-        gm.HEADLESS = self.eval_config.headless
-
-        # update parameters with policy cfg file
-        assert self.eval_config is not None, "eval_config must be provided to create evaluator!"
-        from omnigibson.learning.eval import Evaluator
-        evaluator = Evaluator(self.eval_config)
-        # set the policy for the evaluator
-        evaluator.policy.policy = self
-        evaluator.policy.device = self.device
-        return evaluator

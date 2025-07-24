@@ -4,7 +4,7 @@
 #SBATCH --partition=viscam
 #SBATCH --exclude=viscam1
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:a5000:2
+#SBATCH --gres=gpu:a6000:2
 #SBATCH --ntasks-per-node=2
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=16
@@ -25,7 +25,7 @@ echo "working directory="$SLURM_SUBMIT_DIR
 
 source /vision/u/wsai/miniconda3/bin/activate behavior
 
-python train.py data_dir=/vision/u/wsai/behavior gpus=$SLURM_NTASKS num_nodes=$SLURM_NNODES "$@"
+srun python train.py data_dir=/vision/u/wsai/data/behavior gpus=$SLURM_NTASKS num_nodes=$SLURM_NNODES "$@"
 
 echo "Job finished."
 exit 0
