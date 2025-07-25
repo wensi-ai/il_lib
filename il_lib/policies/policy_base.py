@@ -102,17 +102,6 @@ class BasePolicy(LightningModule, ABC):
         )
         return log_dict
 
-    def on_train_epoch_start(self):
-        logger.info(f"Rank {self.global_rank} train epoch start!")
-        super().on_train_epoch_start()
-
-    def on_train_epoch_end(self):
-        logger.info(f"Rank {self.global_rank} train epoch end!")
-        if dist.is_initialized():
-            dist.barrier()  # Sync across ranks
-        logger.info(f"Rank {self.global_rank} crossed!")
-        super().on_train_epoch_end()
-
     def on_validation_end(self):
         # only run test for global zero rank
         if self.trainer.is_global_zero:

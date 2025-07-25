@@ -70,6 +70,7 @@ def sequential_sum_balanced_partitioning(nums, M, i):
     Split a list of numbers into M partitions, where the i-th partition is returned.
     The i-th partition is balanced such that the sum of the numbers in each partition
     is as equal as possible.
+    NOTE: if sum not divisible by M, the first `sum % M` partitions will have one more element.
     Args:
         nums: list of numbers to be partitioned
         M: number of partitions
@@ -77,10 +78,8 @@ def sequential_sum_balanced_partitioning(nums, M, i):
     Returns:
         start_idx: starting index of the i-th partition
         start_offset: offset of the first element in the i-th partition
-        end_idx: ending index of the i-th partition
+        end_idx: ending index of the i-th partition (not inclusive)
         end_offset: offset of the last element in the i-th partition
-    Raises:
-        ValueError: if i is out of range (i < 0 or i >= M)
     Example:
         nums = [1, 2, 3, 4, 5, 6]
         M = 3
@@ -89,36 +88,27 @@ def sequential_sum_balanced_partitioning(nums, M, i):
         Returns: (3, 1, 4, 4)
     """
     total = sum(nums)
-    target = total / M
+    target = total // M
+    num_offsets = total % M
 
     acc = 0
-    start_idx = end_idx = 0
-    start_offset = end_offset = 0
+    start_idx = end_idx = -1
+    start_offset = end_offset = -1
 
-    chunk_id = 0
-    partial_sum = 0
-
-    for idx, val in enumerate(nums):
-        while partial_sum + val > target * (chunk_id + 1) and chunk_id < M:
-            if chunk_id == i:
-                end_idx = idx
-                end_offset = int(target * (chunk_id + 1) - acc)
-            acc += partial_sum
-            partial_sum = 0
-            chunk_id += 1
-            if chunk_id == i:
-                start_idx = idx
-                start_offset = int(val - (acc - target * i))
-
-        partial_sum += val
-
-    if chunk_id == i:
-        end_idx = len(nums) - 1
-        end_offset = nums[end_idx]
-    elif chunk_id < i:
-        raise ValueError("Chunk index out of range")
-
-    return start_idx, int(start_offset), end_idx, int(end_offset)
+    # actual start / end indices of the i-th chunk
+    chunk_start_idx = target * i + min(num_offsets, i)
+    chunk_end_idx = target * (i + 1) + min(num_offsets, i + 1)
+    # find which number chunk_start_idx and chunk_end_idx fall into
+    for idx, num in enumerate(nums):
+        if start_idx == -1 and acc + num > chunk_start_idx:
+            start_idx = idx
+            start_offset = chunk_start_idx - acc
+        if end_idx == -1 and acc + num >= chunk_end_idx:
+            end_idx = idx
+            end_offset = chunk_end_idx - acc
+            break
+        acc += num
+    return start_idx, start_offset, end_idx, end_offset
 
 
 def load_torch(*fpath: str, map_location="cpu") -> dict:

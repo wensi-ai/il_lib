@@ -74,6 +74,7 @@ class BehaviorDataModule(LightningDataModule):
             num_workers=min(self._batch_size, self._dataloader_num_workers),
             pin_memory=True,
             persistent_workers=True,
+            drop_last=True,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -84,6 +85,7 @@ class BehaviorDataModule(LightningDataModule):
             num_workers=min(self._val_batch_size, self._dataloader_num_workers),
             pin_memory=True,
             persistent_workers=True,
+            drop_last=True,
         )
 
     def test_dataloader(self) -> DataLoader:

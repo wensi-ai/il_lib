@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 from copy import deepcopy
 from il_lib.utils.array_tensor_utils import any_concat, any_ones_like, any_slice, any_stack, get_batch_size
+from il_lib.utils.training_utils import sequential_sum_balanced_partitioning
 from torch.utils.data import IterableDataset, Dataset, get_worker_info
 from typing import Any, Optional, List, Tuple, Dict, Generator
 
@@ -120,11 +121,13 @@ class BehaviorDataset(IterableDataset):
 
     def __iter__(self) -> Generator[Dict[str, Any], None, None]:
         global_worker_id, total_global_workers = self._get_global_worker_id()
-        start_demo, start_idx, end_demo, end_idx = self._get_worker_data(global_worker_id, total_global_workers)
-        for demo_idx, demo_ptr in enumerate(self._demo_indices[start_demo:end_demo]):
-            logger.info(f"{global_worker_id}, {total_global_workers}, {demo_ptr}, {len(self._demo_indices)}")
-            start_idx = start_idx if demo_idx == 0 else 0
-            end_idx = end_idx if demo_idx == end_demo - start_demo else self._demo_lengths[demo_ptr]
+        demo_lengths_shuffled = [self._demo_lengths[i] for i in self._demo_indices]
+        start_demo_id, start_demo_idx, end_demo_id, end_demo_idx = sequential_sum_balanced_partitioning(
+            demo_lengths_shuffled, total_global_workers, global_worker_id
+        )
+        for demo_idx, demo_ptr in enumerate(self._demo_indices[start_demo_id:end_demo_id+1]):
+            start_idx = start_demo_idx if demo_idx == 0 else 0
+            end_idx = end_demo_idx if demo_idx == end_demo_id - start_demo_id else self._demo_lengths[demo_ptr]
             yield from self.get_streamed_data(demo_ptr, start_idx, end_idx)
 
     def get_streamed_data(self, demo_ptr: int, start_idx: int, end_idx: int) -> Generator[Dict[str, Any], None, None]:
@@ -137,8 +140,10 @@ class BehaviorDataset(IterableDataset):
                 f_pcd = h5py.File(f"{self._data_path}/pcd/task-{self._task_id:04d}/episode_{self._demo_keys[demo_ptr]}.hdf5", "r")
                 pcd_generator = iter(torch.from_numpy(f_pcd["data/demo_0/robot_r1::fused_pcd"][:]))
             else:
+                # calculate the start a
                 for camera_id in self._multi_view_cameras.keys():
                     camera_name = self._multi_view_cameras[camera_id]["name"]
+                    stride = 1
                     # TODO: ADD KWARGS
                     obs_loaders[f"{camera_name}::{obs_type}"] = iter(OBS_LOADER_MAP[obs_type](
                         data_path=self._data_path,
@@ -146,12 +151,12 @@ class BehaviorDataset(IterableDataset):
                         camera_id=camera_id, 
                         demo_id=self._demo_keys[demo_ptr],
                         batch_size=self._obs_window_size,
-                        stride=1,
-                        start_idx=start_idx,
-                        end_idx=end_idx,
+                        stride=stride,
+                        start_idx=start_idx * stride,
+                        end_idx=(end_idx - 1) * stride + self._obs_window_size,
                         output_size=tuple(self._multi_view_cameras[camera_id]["resolution"]),
                     ))
-        for _ in range(self._demo_lengths[demo_ptr]):
+        for _ in range(start_idx, end_idx):
             data, mask = next(chunk_generator)
             # load visual obs
             for obs_type in self._visual_obs_types:
@@ -286,16 +291,6 @@ class BehaviorDataset(IterableDataset):
             global_worker_id = worker_id
             total_global_workers = worker_info.num_workers if worker_info else 1
         return global_worker_id, total_global_workers
-
-    def _get_worker_data(self, worker_id: int, total_workers: int) -> Tuple[int]:
-        length = sum(self._demo_lengths) // total_workers
-        for demo_ptr in self._demo_indices:
-            if worker_id * length < demo_ptr < (worker_id + 1) * length:
-                start_demo = demo_ptr
-                start_idx = 0 if worker_id == 0 else self._demo_lengths[self._demo_indices[worker_id - 1]]
-                end_demo = demo_ptr + 1
-                end_idx = self._demo_lengths[demo_ptr]
-        return start_demo, start_idx, end_demo, end_idx
     
 
 class DummyDataset(Dataset):
