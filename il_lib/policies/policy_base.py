@@ -1,6 +1,7 @@
 import logging
-import torch
 import os
+import torch
+import torch.distributed as dist
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from omegaconf import DictConfig, OmegaConf
@@ -100,6 +101,17 @@ class BasePolicy(LightningModule, ABC):
             sync_dist=True,
         )
         return log_dict
+
+    def on_train_epoch_start(self):
+        logger.info(f"Rank {self.global_rank} train epoch start!")
+        super().on_train_epoch_start()
+
+    def on_train_epoch_end(self):
+        logger.info(f"Rank {self.global_rank} train epoch end!")
+        if dist.is_initialized():
+            dist.barrier()  # Sync across ranks
+        logger.info(f"Rank {self.global_rank} crossed!")
+        super().on_train_epoch_end()
 
     def on_validation_end(self):
         # only run test for global zero rank

@@ -120,12 +120,15 @@ class BehaviorDataset(IterableDataset):
 
     def __iter__(self) -> Generator[Dict[str, Any], None, None]:
         global_worker_id, total_global_workers = self._get_global_worker_id()
-        logger.info(f"{global_worker_id}, {total_global_workers}")
-        for demo_ptr in self._demo_indices[global_worker_id::total_global_workers]:
-            yield from self.get_streamed_data(demo_ptr)
+        start_demo, start_idx, end_demo, end_idx = self._get_worker_data(global_worker_id, total_global_workers)
+        for demo_idx, demo_ptr in enumerate(self._demo_indices[start_demo:end_demo]):
+            logger.info(f"{global_worker_id}, {total_global_workers}, {demo_ptr}, {len(self._demo_indices)}")
+            start_idx = start_idx if demo_idx == 0 else 0
+            end_idx = end_idx if demo_idx == end_demo - start_demo else self._demo_lengths[demo_ptr]
+            yield from self.get_streamed_data(demo_ptr, start_idx, end_idx)
 
-    def get_streamed_data(self, demo_ptr: int) -> Generator[Dict[str, Any], None, None]:
-        chunk_generator = self._chunk_demo(demo_ptr)
+    def get_streamed_data(self, demo_ptr: int, start_idx: int, end_idx: int) -> Generator[Dict[str, Any], None, None]:
+        chunk_generator = self._chunk_demo(demo_ptr, start_idx, end_idx)
         # Initialize obs loaders
         obs_loaders = dict()
         for obs_type in self._visual_obs_types:
@@ -144,6 +147,8 @@ class BehaviorDataset(IterableDataset):
                         demo_id=self._demo_keys[demo_ptr],
                         batch_size=self._obs_window_size,
                         stride=1,
+                        start_idx=start_idx,
+                        end_idx=end_idx,
                         output_size=tuple(self._multi_view_cameras[camera_id]["resolution"]),
                     ))
         for _ in range(self._demo_lengths[demo_ptr]):
@@ -233,10 +238,10 @@ class BehaviorDataset(IterableDataset):
 
         return demo
 
-    def _chunk_demo(self, demo_ptr: int) -> Generator[Tuple[dict, torch.Tensor], None, None]:
+    def _chunk_demo(self, demo_ptr: int, start_idx: int, end_idx: int) -> Generator[Tuple[dict, torch.Tensor], None, None]:
         demo = self._all_demos[demo_ptr]
         # split obs into chunks
-        for chunk_idx in range(self._demo_lengths[demo_ptr]):
+        for chunk_idx in range(start_idx, end_idx):
             data, mask = [], []
             s = np.s_[chunk_idx : chunk_idx + self._obs_window_size]
             data = dict()
@@ -275,13 +280,22 @@ class BehaviorDataset(IterableDataset):
             rank = dist.get_rank()
             world_size = dist.get_world_size()
             num_workers = worker_info.num_workers if worker_info else 1
-
             global_worker_id = rank * num_workers + worker_id
             total_global_workers = world_size * num_workers
         else:
             global_worker_id = worker_id
             total_global_workers = worker_info.num_workers if worker_info else 1
         return global_worker_id, total_global_workers
+
+    def _get_worker_data(self, worker_id: int, total_workers: int) -> Tuple[int]:
+        length = sum(self._demo_lengths) // total_workers
+        for demo_ptr in self._demo_indices:
+            if worker_id * length < demo_ptr < (worker_id + 1) * length:
+                start_demo = demo_ptr
+                start_idx = 0 if worker_id == 0 else self._demo_lengths[self._demo_indices[worker_id - 1]]
+                end_demo = demo_ptr + 1
+                end_idx = self._demo_lengths[demo_ptr]
+        return start_demo, start_idx, end_demo, end_idx
     
 
 class DummyDataset(Dataset):

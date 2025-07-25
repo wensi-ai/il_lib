@@ -4,8 +4,8 @@
 #SBATCH --partition=viscam
 #SBATCH --exclude=viscam1
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:a5000:2
-#SBATCH --ntasks-per-node=2
+#SBATCH --gres=gpu:a5000:4
+#SBATCH --ntasks-per-node=4
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=16
 #SBATCH --time=1-00:00:00
