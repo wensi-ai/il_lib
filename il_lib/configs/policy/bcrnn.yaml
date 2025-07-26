@@ -2,7 +2,7 @@
 
 policy_name: bcrnn
 
-# ====== BCRNN specific ======
+# ====== Policy specific ======
 num_latest_obs: 5
 horizon: 5
 deployed_action_steps: 5
@@ -56,7 +56,3 @@ module:
 data_module:
   use_action_chunks: false
   visual_obs_types: ["rgb"]
-
-robot:
-  type: R1Pro
-  controllers:

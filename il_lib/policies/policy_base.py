@@ -102,7 +102,7 @@ class BasePolicy(LightningModule, ABC):
         )
         return log_dict
 
-    def on_validation_end(self):
+    def on_validation_epoch_end(self):
         # only run test for global zero rank
         if self.trainer.is_global_zero:
             if self.eval_config is not None and self.eval_config.online_eval:

@@ -2,7 +2,7 @@
 
 policy_name: diffusion_rgb_unet
 
-# ====== DP specific ======
+# ====== Policy specific ======
 num_latest_obs: 2
 horizon: 16
 deployed_action_steps: 8
@@ -79,7 +79,3 @@ module:
 data_module:
   use_action_chunks: false
   visual_obs_types: ["rgb"]
-
-robot:
-  type: R1Pro
-  controllers:

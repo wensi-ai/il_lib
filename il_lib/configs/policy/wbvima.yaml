@@ -8,11 +8,12 @@ eval:
   ckpt_path: null  
   stict: False
 
-# ====== DP specific ======
+# ====== Policy specific ======
 num_latest_obs: 2
 horizon: 2
 deployed_action_steps: 8
 wd: 0.1
+bs: 128
 
 # ====== module ======
 module:
@@ -32,7 +33,7 @@ module:
       output_dim: ${module.xf_n_embd}
       hidden_depth: 2
       add_output_activation: true
-    pointcloud:
+    pcd:
       _target_: il_lib.nn.features.PointNet
       n_coordinates: 3
       n_color: 3
@@ -78,7 +79,3 @@ data_module:
   use_action_chunks: true
   visual_obs_types: ["pcd"]
   action_prediction_horizon: ${deployed_action_steps}
-
-robot:
-  type: R1Pro
-  controllers:

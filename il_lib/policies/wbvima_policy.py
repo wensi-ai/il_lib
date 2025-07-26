@@ -136,7 +136,7 @@ class WBVIMA(BasePolicy):
         obs_tokens = self.obs_tokenizer(
             {
                 "proprioception": prop_obs,
-                "pointcloud": obs["pointcloud"],
+                "pcd": obs["pcd"],
             }
         )  # (B, L, E), where L is interleaved modalities tokens
         B, _, E = obs_tokens.shape
@@ -424,7 +424,7 @@ class WBVIMA(BasePolicy):
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         fused_pcd = data_batch["obs"]["pcd"]
         data = {
-            "pointcloud": {
+            "pcd": {
                 "rgb": fused_pcd[..., :3],
                 "xyz": fused_pcd[..., 3:],
             },

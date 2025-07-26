@@ -59,6 +59,7 @@ class DiffusionPolicy(BasePolicy):
         super().__init__(*args, **kwargs)
 
         self._prop_keys = prop_keys
+        self._features = set(feature_extractors.keys())
         self.feature_extractor = SimpleFeatureFusion(
             extractors={
                 k: instantiate(v) for k, v in feature_extractors.items()
@@ -70,7 +71,6 @@ class DiffusionPolicy(BasePolicy):
             add_input_activation=feature_fusion_add_input_activation,
             add_output_activation=feature_fusion_add_output_activation,
         )
-
         self.backbone = instantiate(backbone)
         
         assert sum(action_key_dims.values()) == action_dim
@@ -113,11 +113,8 @@ class DiffusionPolicy(BasePolicy):
             else:
                 prop_obs.append(obs[prop_key])
         prop_obs = torch.cat(prop_obs, dim=-1)  # (B, L, Prop_dim)
-        obs = {
-            "proprioception": prop_obs,
-            "rgb": obs["rgb"],
-        }
-
+        obs["proprioception"] = prop_obs
+        obs = {k: obs[k] for k in self._features}  # filter obs to only include features we have
         self._check_forward_input_shape(obs, noisy_traj, diffusion_timesteps)
         obs_feature = self.feature_extractor(obs)  # (B, T_O, D)
 
@@ -313,10 +310,16 @@ class DiffusionPolicy(BasePolicy):
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
         data = {
-            "rgb": {k: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k},
             "qpos": data_batch["obs"]["qpos"],
             "odom": data_batch["obs"]["odom"],
         }
+        if "rgb" in self._features:
+            data["rgb"] = {k: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k}
+        if "pcd" in self._features:
+            data["pcd"] = {
+                "rgb": data_batch["obs"]["pcd"][..., :3],
+                "xyz": data_batch["obs"]["pcd"][..., 3:],
+            }
         if extract_action:
             # extract action from data_batch
             data.update({
