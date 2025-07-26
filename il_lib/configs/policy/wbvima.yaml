@@ -17,6 +17,9 @@ wd: 0.1
 # ====== module ======
 module:
   _target_: il_lib.policies.WBVIMA
+  eval:
+    model:
+      visual_obs_types: ["pcd"]
   prop_dim: 25
   prop_keys: ["odom/base_velocity", "qpos/torso", "qpos/left_arm", "qpos/left_gripper", "qpos/right_arm", "qpos/right_gripper"]
   num_latest_obs: ${num_latest_obs}

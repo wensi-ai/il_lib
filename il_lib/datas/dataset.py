@@ -138,7 +138,12 @@ class BehaviorDataset(IterableDataset):
             if obs_type == "pcd" and not self._online_pcd_generation:
                 # pcd_generator
                 f_pcd = h5py.File(f"{self._data_path}/pcd/task-{self._task_id:04d}/episode_{self._demo_keys[demo_ptr]}.hdf5", "r")
-                pcd_generator = iter(torch.from_numpy(f_pcd["data/demo_0/robot_r1::fused_pcd"][:]))
+                # Create a generator that yields sliding windows of point clouds
+                pcd_data = f_pcd["data/demo_0/robot_r1::fused_pcd"]
+                def pcd_window_generator(start_idx, end_idx):
+                    for i in range(start_idx, end_idx):
+                        yield torch.from_numpy(pcd_data[i : i + self._obs_window_size])
+                pcd_generator = pcd_window_generator(start_idx=start_idx, end_idx=end_idx)
             else:
                 # calculate the start a
                 for camera_id in self._multi_view_cameras.keys():
@@ -162,7 +167,7 @@ class BehaviorDataset(IterableDataset):
             for obs_type in self._visual_obs_types:
                 if obs_type == "pcd":
                     # get file from 
-                    data["pcd"] = next(pcd_generator)
+                    data["obs"]["pcd"] = next(pcd_generator)
                 else:
                     for camera in self._multi_view_cameras.values():
                         data["obs"][f"{camera['name']}::{obs_type}"] = next(obs_loaders[f"{camera['name']}::{obs_type}"])

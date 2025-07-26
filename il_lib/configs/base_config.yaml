@@ -67,6 +67,8 @@ module:
         left_wrist: [120, 120]
         right_wrist: [120, 120]
         head: [180, 180]
+      visual_obs_types: ["rgb"]
+      pcd_range: ${task.pcd_range}
   # ====== learning ======
   lr: ${lr}
   use_cosine_lr: ${use_cosine_lr}

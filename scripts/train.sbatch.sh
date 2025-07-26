@@ -20,12 +20,12 @@ echo "SLURM_JOBID="$SLURM_JOBID
 echo "SLURM_JOB_NAME="$SLURM_JOB_NAME
 echo "SLURM_JOB_NODELIST"=$SLURM_JOB_NODELIST
 echo "SLURM_NNODES"=$SLURM_NNODES
-echo "SLURM_NTASKS"=$SLURM_NTASKS
+echo "SLURM_NTASKS_PER_NODE"=$SLURM_NTASKS_PER_NODE
 echo "working directory="$SLURM_SUBMIT_DIR
 
 source /vision/u/wsai/miniconda3/bin/activate behavior
 
-srun python train.py data_dir=/vision/u/wsai/data/behavior gpus=$SLURM_NTASKS num_nodes=$SLURM_NNODES "$@"
+srun python train.py data_dir=/vision/u/wsai/data/behavior hydra.searchpath=[file:///vision/u/wsai/BEHAVIOR-1K/OmniGibson/omnigibson/learning/configs] gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES "$@"
 
 echo "Job finished."
 exit 0

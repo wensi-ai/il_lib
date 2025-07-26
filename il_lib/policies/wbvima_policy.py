@@ -15,8 +15,7 @@ from il_lib.utils.array_tensor_utils import any_slice, get_batch_size
 from pytorch_lightning.utilities.types import OptimizerLRScheduler
 from typing import Any, Dict, List, Optional
 
-from omnigibson.learning.utils.eval_utils import CAMERA_INTRINSICS, JOINT_RANGE_ARRAY, ROBOT_CAMERA_NAMES
-from omnigibson.learning.utils.obs_utils import process_fused_point_cloud
+from omnigibson.learning.utils.eval_utils import JOINT_RANGE_ARRAY
 
 
 class WBVIMA(BasePolicy):
@@ -121,13 +120,7 @@ class WBVIMA(BasePolicy):
         self.loss_on_latest_obs_only = loss_on_latest_obs_only
         # Save hyperparameters
         self.save_hyperparameters()
-        # camera intrinsics
-        self.camera_intrinsics = dict()
-        # TODO: PROPER PROCESSING 
-        for camera_id, camera_name in ROBOT_CAMERA_NAMES.items():
-            camera_intrinsics = torch.from_numpy(CAMERA_INTRINSICS[camera_id]) / 4.0
-            camera_intrinsics[-1, -1] = 1.0  # make it homogeneous
-            self.camera_intrinsics[camera_name] = camera_intrinsics
+
 
     def forward(self, obs: dict) -> torch.Tensor:
         # construct prop obs
@@ -429,20 +422,7 @@ class WBVIMA(BasePolicy):
         return action_readout_tokens
     
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
-        if "pcd" in data_batch["obs"]:
-            fused_pcd = data_batch["obs"]["pcd"]
-        else:
-            # first, move rgb dim back to the last dim
-            for key in data_batch["obs"]:
-                if "rgb" in key:
-                    data_batch["obs"][key] = data_batch["obs"][key].movedim(-3, -1)
-            # process observation data
-            fused_pcd = process_fused_point_cloud(
-                obs=data_batch["obs"],
-                camera_intrinsics=self.camera_intrinsics,
-                pcd_num_points=4096,
-                use_fps=True
-            )[0]
+        fused_pcd = data_batch["obs"]["pcd"]
         data = {
             "pointcloud": {
                 "rgb": fused_pcd[..., :3],
