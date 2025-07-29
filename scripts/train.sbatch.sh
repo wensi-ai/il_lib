@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name="train_policy"
 #SBATCH --account=viscam
-#SBATCH --partition=viscam
-#SBATCH --exclude=viscam1
-#SBATCH --nodes=1
-#SBATCH --gres=gpu:a5000:4
+#SBATCH --partition=svl
+#SBATCH --exclude=svl13
+#SBATCH --nodes=2
+#SBATCH --gres=gpu:titanrtx:4
 #SBATCH --ntasks-per-node=4
-#SBATCH --mem=120G
-#SBATCH --cpus-per-task=16
+#SBATCH --mem=300G
+#SBATCH --cpus-per-task=14
 #SBATCH --time=1-00:00:00
 #SBATCH --output=outputs/sc/train_policy_%j.out
 #SBATCH --error=outputs/sc/train_policy_%j.err
@@ -25,7 +25,7 @@ echo "working directory="$SLURM_SUBMIT_DIR
 
 source /vision/u/wsai/miniconda3/bin/activate behavior
 
-srun python train.py data_dir=/vision/u/wsai/data/behavior hydra.searchpath=[file:///vision/u/wsai/BEHAVIOR-1K/OmniGibson/omnigibson/learning/configs] gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES "$@"
+HYDRA_FULL_ERROR=1 srun python train.py data_dir=/vision/u/wsai/data/behavior hydra.searchpath=[file:///vision/u/wsai/BEHAVIOR-1K/OmniGibson/omnigibson/learning/configs] gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES "$@"
 
 echo "Job finished."
 exit 0
