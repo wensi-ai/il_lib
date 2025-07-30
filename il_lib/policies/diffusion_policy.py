@@ -9,8 +9,6 @@ from il_lib.utils.functional_utils import call_once
 from omegaconf import DictConfig
 from typing import Any, Dict, Optional, List
 
-from omnigibson.learning.utils.eval_utils import JOINT_RANGE_ARRAY
-
 
 class DiffusionPolicy(BasePolicy):
     """
@@ -146,9 +144,7 @@ class DiffusionPolicy(BasePolicy):
             ).prev_sample  # (B, L, action_dim)
         action = noisy_traj[:, self.num_latest_obs - 1:].clone().cpu()  # (B, L, action_dim)
         # denormalize action
-        return (action + 1) / 2 * (
-            JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]
-        ) + JOINT_RANGE_ARRAY[self.robot_type][0]
+        return self._denormalize_action(action)
 
     def reset(self) -> None:
         pass

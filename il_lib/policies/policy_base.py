@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional
 from omegaconf import DictConfig, OmegaConf
 from omnigibson.learning.utils.obs_utils import create_video_writer
+from omnigibson.learning.utils.eval_utils import ACTION_QPOS_INDICES, JOINT_RANGE
 from omnigibson.macros import gm
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities.types import OptimizerLRScheduler
@@ -161,3 +162,22 @@ class BasePolicy(LightningModule, ABC):
         self.test_id += 1
         results = {"eval/success_rate": self.evaluator.n_success_trials / self.evaluator.n_trials}
         return results
+    
+    def _denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """
+        Denormalize the action from [-1, 1] to [min, max] range.
+        Also, rectify gripper actions to either -1 or 1.
+        Args:
+            action: (B, L, A) where A is the action dimension
+        Returns:
+            unnormalized_action: (B, L, A)
+        """
+        # rectify gripper actions
+        for k, v in ACTION_QPOS_INDICES[self.robot_type].items():
+            if "gripper" in k:
+                action[..., v] = torch.where(action[..., v] > 0, 1.0, -1.0)
+            else:
+                action[..., v] = (action[..., v] + 1) / 2 * (
+                    JOINT_RANGE[self.robot_type][k][1] - JOINT_RANGE[self.robot_type][k][0]
+                ) + JOINT_RANGE[self.robot_type][k][0]
+        return action

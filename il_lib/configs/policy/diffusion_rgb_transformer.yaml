@@ -3,15 +3,15 @@
 policy_name: diffusion_rgb_transformer
 
 # ====== Policy specific ======
-num_latest_obs: 2
 horizon: 16
+num_latest_obs: 2
 deployed_action_steps: 8
 resnet_pretrained_ckpt_path: ???
 
 # ====== Policy Module ======
 module:
   _target_: il_lib.policies.DiffusionPolicy
-  prop_dim: 25
+  prop_dim: 23
   prop_keys: ["odom/base_velocity", "qpos/torso", "qpos/left_arm", "qpos/left_gripper", "qpos/right_arm", "qpos/right_gripper"]
   # ====== Feature Extractors ======
   feature_extractors:

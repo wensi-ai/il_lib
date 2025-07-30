@@ -15,8 +15,6 @@ from il_lib.utils.array_tensor_utils import any_slice, get_batch_size
 from pytorch_lightning.utilities.types import OptimizerLRScheduler
 from typing import Any, Dict, List, Optional
 
-from omnigibson.learning.utils.eval_utils import JOINT_RANGE_ARRAY
-
 
 class WBVIMA(BasePolicy):
     """
@@ -200,9 +198,7 @@ class WBVIMA(BasePolicy):
         }  # dict of (T_A, ...)
         action = torch.cat(list(self._action_traj_pred.values()), dim=1)  # (T_A, A)
         # denormalize action
-        return (action + 1) / 2 * (
-            JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]
-        ) + JOINT_RANGE_ARRAY[self.robot_type][0]
+        return self._denormalize_action(action)  # (T_A, A)
 
     def reset(self) -> None:
         pass

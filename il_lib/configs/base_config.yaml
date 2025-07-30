@@ -93,6 +93,7 @@ data_module:
   # ====== Dataset ======
   obs_window_size: ${num_latest_obs}
   ctx_len: ${horizon}
+  downsample_factor: 3 # downsample to 10Hz
   load_task_info: false
   multi_view_cameras:
     left_wrist: 

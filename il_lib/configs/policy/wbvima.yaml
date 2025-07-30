@@ -9,8 +9,8 @@ eval:
   stict: False
 
 # ====== Policy specific ======
-num_latest_obs: 2
 horizon: 2
+num_latest_obs: 2
 deployed_action_steps: 8
 wd: 0.1
 bs: 128
@@ -21,7 +21,7 @@ module:
   eval:
     model:
       visual_obs_types: ["pcd"]
-  prop_dim: 25
+  prop_dim: 23
   prop_keys: ["odom/base_velocity", "qpos/torso", "qpos/left_arm", "qpos/left_gripper", "qpos/right_arm", "qpos/right_gripper"]
   num_latest_obs: ${num_latest_obs}
   # ====== Feature Extractors ======

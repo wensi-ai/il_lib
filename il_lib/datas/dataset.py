@@ -40,6 +40,7 @@ class BehaviorDataset(IterableDataset):
         ctx_len: int,
         use_action_chunks: bool = False,
         action_prediction_horizon: Optional[int] = None,
+        downsample_factor: int = 1,
         visual_obs_types: List[str],
         multi_view_cameras: Optional[Dict[str, Any]] = None,
         load_task_info: bool = False,
@@ -60,6 +61,9 @@ class BehaviorDataset(IterableDataset):
                 Action will be from (T, A) to (T, L_pred_horizon, A)
             action_prediction_horizon (Optional[int]): Horizon of the action prediction.
                 Must not be None if use_action_chunks is True.
+            downsample_factor (int): Downsample factor for the data (with uniform temporal subsampling). 
+                Note that the original data is at 30Hz, so if factor=3 then data will be at 10Hz.
+                Default is 1 (no downsampling), must be >= 1.
             visual_obs_types (List[str]): List of visual observation types to load.
                 Valid options are: "rgb", "depth", "seg".
             multi_view_cameras (Optional[Dict[str, Any]]): Dict of id-camera pairs to load obs from.
@@ -78,6 +82,8 @@ class BehaviorDataset(IterableDataset):
         self._action_prediction_horizon = action_prediction_horizon
         assert self._action_prediction_horizon is not None if self._use_action_chunks else True, \
             "action_prediction_horizon must be provided if use_action_chunks is True!"
+        self._downsample_factor = downsample_factor
+        assert self._downsample_factor >= 1, "downsample_factor must be >= 1!"
         self._load_task_info = load_task_info
         self._seed = seed
         self._shuffle = shuffle
@@ -142,7 +148,7 @@ class BehaviorDataset(IterableDataset):
                 pcd_data = f_pcd["data/demo_0/robot_r1::fused_pcd"]
                 def pcd_window_generator(start_idx, end_idx):
                     for i in range(start_idx, end_idx):
-                        yield torch.from_numpy(pcd_data[i : i + self._obs_window_size])
+                        yield torch.from_numpy(pcd_data[i * self._downsample_factor : (i + self._obs_window_size) * self._downsample_factor : self._downsample_factor])
                 pcd_generator = pcd_window_generator(start_idx=start_idx, end_idx=end_idx)
             else:
                 # calculate the start a
@@ -157,8 +163,8 @@ class BehaviorDataset(IterableDataset):
                         demo_id=self._demo_keys[demo_ptr],
                         batch_size=self._obs_window_size,
                         stride=stride,
-                        start_idx=start_idx * stride,
-                        end_idx=(end_idx - 1) * stride + self._obs_window_size,
+                        start_idx=start_idx * stride * self._downsample_factor,
+                        end_idx=((end_idx - 1) * stride + self._obs_window_size) * self._downsample_factor,
                         output_size=tuple(self._multi_view_cameras[camera_id]["resolution"]),
                     ))
         for _ in range(start_idx, end_idx):
@@ -193,29 +199,46 @@ class BehaviorDataset(IterableDataset):
         # load low_dim data
         action_dict = dict()
         df = pd.read_parquet(os.path.join(self._data_path, "data", f"task-{self._task_id:04d}", f"episode_{demo_key}.parquet"))
-        proprio = torch.from_numpy(np.array(df["observation.state"].tolist(), dtype=np.float32))
+        proprio = torch.from_numpy(np.array(df["observation.state"][::self._downsample_factor].tolist(), dtype=np.float32))
         demo["obs"] = {
-            "qpos": {
-                key: 2 * (proprio[..., PROPRIO_QPOS_INDICES[self.robot_type][key]] - JOINT_RANGE[self.robot_type][key][0]) / 
-                (JOINT_RANGE[self.robot_type][key][1] - JOINT_RANGE[self.robot_type][key][0]) - 1.0
-                for key in PROPRIO_QPOS_INDICES[self.robot_type]
-            },
+            "qpos": dict(),
             "odom": {
                 "base_velocity": 2 * (
                     proprio[..., PROPRIOCEPTION_INDICES[self.robot_type]["base_qvel"]] - JOINT_RANGE[self.robot_type]["base"][0]
                 ) / (JOINT_RANGE[self.robot_type]["base"][1] - JOINT_RANGE[self.robot_type]["base"][0]) - 1.0
             },
         }
-        demo["obs"]["cam_rel_poses"] = torch.from_numpy(np.array(df["observation.cam_rel_poses"].tolist(), dtype=np.float32))
+        for key in PROPRIO_QPOS_INDICES[self.robot_type]:
+            if "gripper" in key:
+                # rectify gripper actions to {-1, 1}
+                demo["obs"]["qpos"][key] = torch.mean(proprio[..., PROPRIO_QPOS_INDICES[self.robot_type][key]], dim=-1, keepdim=True)
+                demo["obs"]["qpos"][key] = torch.where(
+                    demo["obs"]["qpos"][key] > (JOINT_RANGE[self.robot_type][key][0] + JOINT_RANGE[self.robot_type][key][1]) / 2, 1.0, -1.0
+                )
+            else:
+                # normalize the qpos to [-1, 1]
+                demo["obs"]["qpos"][key] = 2 * (
+                    proprio[..., PROPRIO_QPOS_INDICES[self.robot_type][key]] - JOINT_RANGE[self.robot_type][key][0]
+                ) / (JOINT_RANGE[self.robot_type][key][1] - JOINT_RANGE[self.robot_type][key][0]) - 1.0
+        demo["obs"]["cam_rel_poses"] = torch.from_numpy(np.array(df["observation.cam_rel_poses"][::self._downsample_factor].tolist(), dtype=np.float32))
+        # Note that we need to take the action at the timestamp before the next observation
         action_arr = torch.from_numpy(np.array(df["action"].tolist(), dtype=np.float32))
+        # First pad the action array so that it is divisible by the downsample factor
+        if action_arr.shape[0] % self._downsample_factor != 0:
+            pad_size = self._downsample_factor - (action_arr.shape[0] % self._downsample_factor)
+            # pad with the last action
+            action_arr = torch.cat([action_arr, action_arr[-1:].repeat(pad_size, 1)], dim=0)
+        # Now downsample the action array
+        action_arr = action_arr[self._downsample_factor - 1::self._downsample_factor]
         for key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
             action_dict[key] = action_arr[:, indices]
             # action normalization
-            action_dict[key] = 2 * (
-                action_dict[key] - JOINT_RANGE[self.robot_type][key][0]
-            ) / (JOINT_RANGE[self.robot_type][key][1] - JOINT_RANGE[self.robot_type][key][0]) - 1.0
+            if not "gripper" in key:    # Gripper actions are already normalized to [-1, 1]
+                action_dict[key] = 2 * (
+                    action_dict[key] - JOINT_RANGE[self.robot_type][key][0]
+                ) / (JOINT_RANGE[self.robot_type][key][1] - JOINT_RANGE[self.robot_type][key][0]) - 1.0
         if self._load_task_info:
-            demo["obs"]["task::low_dim"] = torch.from_numpy(np.array(df["observation.task_info"].tolist(), dtype=np.float32))
+            demo["obs"]["task::low_dim"] = torch.from_numpy(np.array(df["observation.task_info"][::self._downsample_factor].tolist(), dtype=np.float32))
         if self._use_action_chunks:
             # make actions from (T, A) to (T, L_pred_horizon, A)
             # need to construct a mask

@@ -9,8 +9,6 @@ from il_lib.nn.distributions import GMMHead, MixtureOfGaussian
 from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.utils.array_tensor_utils import any_slice, get_batch_size, any_concat
 
-from omnigibson.learning.utils.eval_utils import JOINT_RANGE_ARRAY
-
 
 class BC_RNN(BasePolicy):
     """
@@ -33,6 +31,7 @@ class BC_RNN(BasePolicy):
         # ====== RNN ======
         rnn_n_layers: int = 2,
         rnn_hidden_dim: int = 256,
+        rnn_horizon: int = 10,
         # ====== GMM Head ======
         action_dim: int,
         action_net_gmm_n_modes: int = 5,
@@ -82,6 +81,9 @@ class BC_RNN(BasePolicy):
         )
         self._deterministic_inference = deterministic_inference
         self._action_keys = action_keys
+        self._rnn_counter = 0
+        self._rnn_horizon = rnn_horizon
+        self._policy_state = None # (h_0, c_0) for the rnn
 
         self.lr = lr
         self.use_cosine_lr = use_cosine_lr
@@ -125,38 +127,37 @@ class BC_RNN(BasePolicy):
     @torch.no_grad()
     def act(self, 
         obs: dict,
-        policy_state: Tuple[torch.Tensor, torch.Tensor],
         deterministic: Optional[bool]=None
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> torch.Tensor:
         """
         Args:
             obs: dict of (B, L=1, ...) observations
-            policy_state: rnn_state of shape (h_0, c_0)
             deterministic: if True, use mode of the distribution, otherwise sample
         Returns:
             action: (B, A) tensor of actions
-            policy_state: updated rnn_state
         """
+        # process obs
         obs = self.process_data(obs, extract_action=False)
         assert (
             get_batch_size(any_slice(obs, 0), strict=True) == 1
         ), "Use L=1 for act"
-        dist, policy_state = self.forward(obs, policy_state)
+        if self._rnn_counter % self._rnn_horizon == 0:
+            # reset the rnn state
+            self._policy_state = self._get_initial_state(batch_size=1)
+        self._rnn_counter += 1
+        dist, self._policy_state = self.forward(obs, self._policy_state)
         if deterministic is None:
             deterministic = self._deterministic_inference
         if deterministic:
             action = dist.mode()
         else:
             action = dist.sample()
-        action = action[:, 0].cpu()  # (B, A)
         # denormalize action
-        action = (action + 1) / 2 * (
-            JOINT_RANGE_ARRAY[self.robot_type][1] - JOINT_RANGE_ARRAY[self.robot_type][0]
-        ) + JOINT_RANGE_ARRAY[self.robot_type][0]
-        return action, policy_state
+        action = action.cpu()   # (B, T, A)
+        return self._denormalize_action(action)
 
     def reset(self) -> None:
-        pass
+        self._rnn_counter = 0
 
     def policy_training_step(self, batch, batch_idx) -> Any:
         batch["actions"] = any_concat(
@@ -185,9 +186,9 @@ class BC_RNN(BasePolicy):
         loss = action_loss
         return loss, log_dict, real_batch_size
 
-    def policy_evaluation_step(self, *args, **kwargs) -> Any:
+    def policy_evaluation_step(self, batch, batch_idx) -> Any:
         with torch.no_grad():
-            return self.policy_training_step(*args, **kwargs)
+            return self.policy_training_step(batch, batch_idx)
 
     def configure_optimizers(self):
         if self.optimizer == "adamw":

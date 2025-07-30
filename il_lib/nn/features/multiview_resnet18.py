@@ -20,6 +20,7 @@ class MultiviewResNet18(nn.Module):
         token_dim: int,
         load_pretrained: bool = True,
         pretrained_ckpt_path: Optional[str] = None,
+        include_depth: bool = False,
         enable_random_crop: bool = True,
         random_crop_size: Optional[Union[int, List[int]]] = None,
     ):
@@ -34,6 +35,13 @@ class MultiviewResNet18(nn.Module):
             del ckpt["fc.weight"]
             del ckpt["fc.bias"]
             load_state_dict(self._resnet, ckpt, strict=False)
+            if include_depth:
+                rgbd_conv1 = nn.Conv2d(
+                    4, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+                )
+                rgbd_conv1.weight.data[:, :3, :, :] = self._resnet.conv1.weight.data
+                rgbd_conv1.weight.data[:, 3, :, :] = 0.0
+                self._resnet.conv1 = rgbd_conv1
         self._output_fc = nn.Linear(len(views) * resnet_output_dim, token_dim)
         self.output_dim = token_dim
 
