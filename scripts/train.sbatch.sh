@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name="train_policy"
 #SBATCH --account=viscam
-#SBATCH --partition=svl
-#SBATCH --exclude=svl13
-#SBATCH --nodes=2
+#SBATCH --partition=svl,viscam
+#SBATCH --exclude=svl13,svl12
+#SBATCH --nodes=1
 #SBATCH --gres=gpu:titanrtx:4
 #SBATCH --ntasks-per-node=4
 #SBATCH --mem=300G
 #SBATCH --cpus-per-task=14
-#SBATCH --time=1-00:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --output=outputs/sc/train_policy_%j.out
 #SBATCH --error=outputs/sc/train_policy_%j.err
 # notifications for job done & fail

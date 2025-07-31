@@ -1,5 +1,6 @@
 import os
 from typing import List, Optional, Union
+from functools import partial
 
 import torch.nn as nn
 from torchvision.models import ResNet18_Weights
@@ -49,8 +50,17 @@ class MultiviewResNet18(nn.Module):
         if enable_random_crop:
             train_transforms.append(transforms.RandomCrop(random_crop_size))
             eval_transforms.append(transforms.CenterCrop(random_crop_size))
-        train_transforms.append(ResNet18_Weights.DEFAULT.transforms())
-        eval_transforms.append(ResNet18_Weights.DEFAULT.transforms())
+        if include_depth:
+            # We do not normalize depth
+            train_transforms.append(
+                partial(ResNet18_Weights.DEFAULT.transforms, mean=(0.485, 0.456, 0.406, 0.0), std=(0.229, 0.224, 0.225, 1.0))()
+            )
+            eval_transforms.append(
+                partial(ResNet18_Weights.DEFAULT.transforms, mean=(0.485, 0.456, 0.406, 0.0), std=(0.229, 0.224, 0.225, 1.0))()
+            )
+        else:
+            train_transforms.append(ResNet18_Weights.DEFAULT.transforms())
+            eval_transforms.append(ResNet18_Weights.DEFAULT.transforms())
         self._train_transforms = transforms.Compose(train_transforms)
         self._eval_transforms = transforms.Compose(eval_transforms)
 

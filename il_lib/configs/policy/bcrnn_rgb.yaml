@@ -1,16 +1,19 @@
 # @package _global_
 
-policy_name: diffusion_rgb_transformer
+policy_name: bcrnn_rgbd
 
 # ====== Policy specific ======
-horizon: 16
-num_latest_obs: 2
-deployed_action_steps: 8
+horizon: 5
+num_latest_obs: ${horizon}
+deployed_action_steps: 1  # always deploy 1 action at a time
 resnet_pretrained_ckpt_path: ???
 
-# ====== Policy Module ======
+# ------ module ------
 module:
-  _target_: il_lib.policies.DiffusionPolicy
+  _target_: il_lib.policies.BC_RNN
+  eval:
+    model:
+      obs_window_size: 1  # At run time, we only use the latest observation
   prop_dim: 23
   prop_keys: [odom/base_velocity, qpos/torso, qpos/left_arm, qpos/left_gripper, qpos/right_arm, qpos/right_gripper]
   # ====== Feature Extractors ======
@@ -32,6 +35,7 @@ module:
       token_dim: 512
       load_pretrained: true
       pretrained_ckpt_path: ${resnet_pretrained_ckpt_path}
+      include_depth: false
       enable_random_crop: true
       random_crop_size: 94
   # ====== Feature Fusion ======
@@ -41,42 +45,17 @@ module:
   feature_fusion_activation: relu
   feature_fusion_add_input_activation: false
   feature_fusion_add_output_activation: true
+  rnn_n_layers: 2
+  rnn_hidden_dim: 512
+  rnn_horizon: ${horizon}
   # ====== Action ======
   action_dim: 23
-  action_keys: ${action_keys}
-  action_key_dims: ${action_key_dims}
-  num_latest_obs: ${num_latest_obs}
-  # ====== Backbone ======
-  backbone:
-    _target_: il_lib.nn.diffusion.TransformerForDiffusion
-    input_dim: ${module.action_dim}
-    output_dim: ${module.action_dim}
-    horizon: ${horizon}
-    n_obs_steps: ${num_latest_obs}
-    cond_dim: ${module.feature_fusion_output_dim}
-    n_layer: 2
-    n_head: 8
-    n_emb: 256
-    p_drop_emb: 0.0
-    p_drop_attn: 0.01
-    n_cond_layers: 0
-  # ====== Diffusion ======
-  noise_scheduler:
-    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
-    num_train_timesteps: 100
-    beta_start: 0.0001
-    beta_end: 0.02
-    # beta_schedule is important
-    # this is the best we found
-    beta_schedule: squaredcos_cap_v2
-    clip_sample: True
-    set_alpha_to_one: True
-    steps_offset: 0
-    prediction_type: epsilon # or sample
-  noise_scheduler_step_kwargs: null
-  num_denoise_steps_per_inference: 16
-  horizon: ${horizon}
-  deployed_action_steps: ${deployed_action_steps}
+  action_net_gmm_n_modes: 5
+  action_net_hidden_dim: 128
+  action_net_hidden_depth: 3
+  action_net_activation: relu
+  deterministic_inference: true
+  gmm_low_noise_eval: true
   optimizer: adam
 
 data_module:

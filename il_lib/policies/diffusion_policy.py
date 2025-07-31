@@ -6,6 +6,7 @@ from il_lib.optim import CosineScheduleFunction
 from il_lib.policies.policy_base import BasePolicy
 from il_lib.utils.array_tensor_utils import any_slice, get_batch_size, any_concat
 from il_lib.utils.functional_utils import call_once
+from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
 from omegaconf import DictConfig
 from typing import Any, Dict, Optional, List
 
@@ -310,7 +311,11 @@ class DiffusionPolicy(BasePolicy):
             "odom": data_batch["obs"]["odom"],
         }
         if "rgb" in self._features:
-            data["rgb"] = {k: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k}
+            data["rgb"] = {k.rsplit("::", 1)[0]: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k}
+        if "rgbd" in self._features:
+            rgb = {k.rsplit("::", 1)[0]: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k}
+            depth = {k.rsplit("::", 1)[0]: (data_batch["obs"][k].float() - MIN_DEPTH) / (MAX_DEPTH - MIN_DEPTH) for k in data_batch["obs"] if "depth" in k}
+            data["rgbd"] = {k: torch.cat([rgb[k], depth[k].unsqueeze(-3)], dim=-3) for k in rgb}
         if "pcd" in self._features:
             data["pcd"] = {
                 "rgb": data_batch["obs"]["pcd"][..., :3],

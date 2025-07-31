@@ -5,6 +5,7 @@ from il_lib.optim.lr_schedule import CosineScheduleFunction
 from il_lib.policies.policy_base import BasePolicy
 from typing import Any, Dict, List, Optional, Tuple
 from omegaconf import DictConfig
+from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
 from il_lib.nn.distributions import GMMHead, MixtureOfGaussian
 from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.utils.array_tensor_utils import any_slice, get_batch_size, any_concat
@@ -54,6 +55,7 @@ class BC_RNN(BasePolicy):
         super().__init__(*args, **kwargs)
 
         self._prop_keys = prop_keys
+        self._features = set(feature_extractors.keys())
         self.feature_extractor = SimpleFeatureFusion(
             extractors={k: instantiate(v) for k, v in feature_extractors.items()},
             hidden_depth=feature_fusion_hidden_depth,
@@ -115,11 +117,8 @@ class BC_RNN(BasePolicy):
             else:
                 prop_obs.append(obs[prop_key])
         prop_obs = torch.cat(prop_obs, dim=-1)  # (B, L, Prop_dim)
-        obs = {
-            "proprioception": prop_obs,
-            "rgb": obs["rgb"],
-        }
-
+        obs["proprioception"] = prop_obs
+        obs = {k: obs[k] for k in self._features}  # filter obs to only include features we have
         x = self.feature_extractor(obs)
         x, policy_state = self.rnn(x, policy_state)
         return self.action_net(x), policy_state
@@ -236,10 +235,15 @@ class BC_RNN(BasePolicy):
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
         data = {
-            "rgb": {k: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k},
             "qpos": data_batch["obs"]["qpos"],
             "odom": data_batch["obs"]["odom"],
         }
+        if "rgb" in self._features:
+            data["rgb"] = {k.rsplit("::", 1)[0]: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k}
+        if "rgbd" in self._features:
+            rgb = {k.rsplit("::", 1)[0]: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k}
+            depth = {k.rsplit("::", 1)[0]: (data_batch["obs"][k].float() - MIN_DEPTH) / (MAX_DEPTH - MIN_DEPTH) for k in data_batch["obs"] if "depth" in k}
+            data["rgbd"] = {k: torch.cat([rgb[k], depth[k].unsqueeze(-3)], dim=-3) for k in rgb}
         if extract_action:
             # extract action from data_batch
             data.update({

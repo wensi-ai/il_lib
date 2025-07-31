@@ -1,6 +1,6 @@
 # @package _global_
 
-policy_name: dp3
+policy_name: diffusion_rgbd_unet
 
 # ====== Policy specific ======
 horizon: 16
@@ -13,7 +13,7 @@ module:
   _target_: il_lib.policies.DiffusionPolicy
   eval:
     model:
-      visual_obs_types: [pcd]
+      visual_obs_types: [rgb, depth_linear]
   prop_dim: 23
   prop_keys: [odom/base_velocity, qpos/torso, qpos/left_arm, qpos/left_gripper, qpos/right_arm, qpos/right_gripper]
   # ====== Feature Extractors ======
@@ -25,17 +25,24 @@ module:
       output_dim: 512
       hidden_depth: 2
       add_output_activation: true
-    pcd:
-      _target_: il_lib.nn.features.UncoloredPointNet
-      n_coordinates: 3
-      output_dim: 512
-      hidden_dim: 512
-      hidden_depth: 2
+    rgbd:
+      _target_: il_lib.nn.features.MultiviewResNet18
+      views: 
+      - robot_r1::robot_r1:left_realsense_link:Camera:0
+      - robot_r1::robot_r1:right_realsense_link:Camera:0
+      - robot_r1::robot_r1:zed_link:Camera:0
+      resnet_output_dim: 512
+      token_dim: 512
+      load_pretrained: true
+      pretrained_ckpt_path: ${resnet_pretrained_ckpt_path}
+      include_depth: true
+      enable_random_crop: true
+      random_crop_size: 94
   # ====== Feature Fusion ======
   feature_fusion_hidden_depth: 2
   feature_fusion_hidden_dim: 512
   feature_fusion_output_dim: 512
-  feature_fusion_activation: relu
+  feature_fusion_activation: "relu"
   feature_fusion_add_input_activation: false
   feature_fusion_add_output_activation: true
   # ====== Action ======
@@ -45,12 +52,12 @@ module:
   num_latest_obs: ${num_latest_obs}
   # ====== Backbone ======
   backbone:
-    _target_: il_lib.nn.diffusion.unet.ConditionalUnet1D
+    _target_: il_lib.nn.diffusion.ConditionalUnet1D
     input_dim: ${module.action_dim}
     local_cond_dim: null
     global_cond_dim: ${eval:'${module.feature_fusion_output_dim} * ${num_latest_obs}'}
     diffusion_step_embed_dim: 128
-    down_dims: [64,128]
+    down_dims: [64, 128]
     kernel_size: 5
     n_groups: 8
     cond_predict_scale: true
@@ -75,5 +82,4 @@ module:
 
 data_module:
   use_action_chunks: false
-  visual_obs_types: [pcd]
-  use_gt_pcd: false
+  visual_obs_types: [rgb, depth_linear]

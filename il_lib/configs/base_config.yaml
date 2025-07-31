@@ -22,7 +22,7 @@ wd: 0.0
 bs: 64
 vbs: ${bs}
 data_dir: ???
-eval_interval: 5
+eval_interval: 10
 online_eval: true
 
 horizon: ???
@@ -30,7 +30,7 @@ num_latest_obs: ???
 deployed_action_steps: ???
 
 # ====== Action Keys ======
-action_keys: ["base", "torso", "left_arm", "left_gripper", "right_arm", "right_gripper"]
+action_keys: [base, torso, left_arm, left_gripper, right_arm, right_gripper]
 action_key_dims:
   base: 3
   torso: 4
@@ -67,7 +67,7 @@ module:
         left_wrist: [120, 120]
         right_wrist: [120, 120]
         head: [180, 180]
-      visual_obs_types: ["rgb"]
+      visual_obs_types: [rgb]
       pcd_range: ${task.pcd_range}
   # ====== learning ======
   lr: ${lr}

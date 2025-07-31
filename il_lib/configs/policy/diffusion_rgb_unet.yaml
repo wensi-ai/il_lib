@@ -12,7 +12,7 @@ resnet_pretrained_ckpt_path: ???
 module:
   _target_: il_lib.policies.DiffusionPolicy
   prop_dim: 23
-  prop_keys: ["odom/base_velocity", "qpos/torso", "qpos/left_arm", "qpos/left_gripper", "qpos/right_arm", "qpos/right_gripper"]
+  prop_keys: [odom/base_velocity, qpos/torso, qpos/left_arm, qpos/left_gripper, qpos/right_arm, qpos/right_gripper]
   # ====== Feature Extractors ======
   feature_extractors:
     proprioception:
@@ -25,13 +25,14 @@ module:
     rgb:
       _target_: il_lib.nn.features.MultiviewResNet18
       views: 
-      - robot_r1::robot_r1:left_realsense_link:Camera:0::rgb
-      - robot_r1::robot_r1:right_realsense_link:Camera:0::rgb
-      - robot_r1::robot_r1:zed_link:Camera:0::rgb
+      - robot_r1::robot_r1:left_realsense_link:Camera:0
+      - robot_r1::robot_r1:right_realsense_link:Camera:0
+      - robot_r1::robot_r1:zed_link:Camera:0
       resnet_output_dim: 512
       token_dim: 512
       load_pretrained: true
       pretrained_ckpt_path: ${resnet_pretrained_ckpt_path}
+      include_depth: false
       enable_random_crop: true
       random_crop_size: 94
   # ====== Feature Fusion ======
@@ -74,8 +75,8 @@ module:
   num_denoise_steps_per_inference: 16
   horizon: ${horizon}
   deployed_action_steps: ${deployed_action_steps}
-  optimizer: "adam"
+  optimizer: adam
 
 data_module:
   use_action_chunks: false
-  visual_obs_types: ["rgb"]
+  visual_obs_types: [rgb]

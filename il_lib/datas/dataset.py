@@ -47,7 +47,7 @@ class BehaviorDataset(IterableDataset):
         seed: int = 42,
         shuffle: bool = True,
         # dataset parameters
-        online_pcd_generation: bool = False,
+        use_gt_pcd: bool = False,
         **kwargs,
     ):
         """
@@ -70,7 +70,7 @@ class BehaviorDataset(IterableDataset):
             load_task_info (bool): Whether to load privileged task information.
             seed (int): Random seed.
             shuffle (bool): Whether to shuffle the dataset.
-            online_pcd_generation (bool): Whether to generate point clouds online or using pre-generated ones.
+            use_gt_pcd (bool): Whether to use ground truth point clouds (as opposed to video-generated ones).
         """
         super().__init__(*args, **kwargs)
         self._data_path = data_path
@@ -94,10 +94,7 @@ class BehaviorDataset(IterableDataset):
         self._visual_obs_types = set(visual_obs_types)
 
         self._multi_view_cameras = multi_view_cameras
-        self._online_pcd_generation = online_pcd_generation
-        if self._online_pcd_generation and "pcd" in self._visual_obs_types:
-            self._visual_obs_types.add("rgb")
-            self._visual_obs_types.add("depth_linear")
+        self._use_gt_pcd = use_gt_pcd
 
         self.robot_type = "R1Pro"
 
@@ -141,9 +138,15 @@ class BehaviorDataset(IterableDataset):
         # Initialize obs loaders
         obs_loaders = dict()
         for obs_type in self._visual_obs_types:
-            if obs_type == "pcd" and not self._online_pcd_generation:
+            if obs_type == "pcd":
+                data_folder = "pcd_gt" if self._use_gt_pcd else "pcd_vid"
                 # pcd_generator
-                f_pcd = h5py.File(f"{self._data_path}/pcd/task-{self._task_id:04d}/episode_{self._demo_keys[demo_ptr]}.hdf5", "r", swmr=True, libver='latest')
+                f_pcd = h5py.File(
+                    f"{self._data_path}/{data_folder}/task-{self._task_id:04d}/episode_{self._demo_keys[demo_ptr]}.hdf5", 
+                    "r", 
+                    swmr=True, 
+                    libver='latest'
+                )
                 # Create a generator that yields sliding windows of point clouds
                 pcd_data = f_pcd["data/demo_0/robot_r1::fused_pcd"]
                 def pcd_window_generator(start_idx, end_idx):
