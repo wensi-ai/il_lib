@@ -41,7 +41,6 @@ class Trainer:
         """
         cfg = deepcopy(cfg)
         OmegaConf.set_struct(cfg, False)
-        self.cfg = cfg
         CU.register_omegaconf_resolvers()
         run_name = self.generate_run_name(cfg)
         self.run_dir = FU.f_join(cfg.exp_root_dir, run_name)
@@ -96,7 +95,7 @@ class Trainer:
         return instantiate(cfg.module, _recursive_=False)
 
     def create_data_module(self, cfg):
-        return instantiate(cfg.data_module)
+        return instantiate(cfg.data)
 
     def generate_run_name(self, cfg):
         return cfg.run_name + "_" + time.strftime("%Y%m%d-%H%M%S")

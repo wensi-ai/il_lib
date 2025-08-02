@@ -1,0 +1,24 @@
+# @package _global_
+
+online_eval:
+  _target_: omnigibson.learning.eval.Evaluator
+  cfg:
+    ckpt: null  # path to the checkpoint to load for evaluation
+    write_video: true
+    headless: ${headless}
+    env_type: ${env_type}
+    task: ${task}
+    robot: ${robot}
+    policy_name: ${arch_name}
+    model:
+      _target_: omnigibson.learning.policies.VisionActionILPolicy
+      robot_type: ${robot.type}
+      use_websocket: false
+      deployed_action_steps: ${deployed_action_steps}
+      obs_window_size: ${num_latest_obs}
+      obs_output_size: 
+        left_wrist: [120, 120]
+        right_wrist: [120, 120]
+        head: [180, 180]
+      visual_obs_types: ${data.visual_obs_types}
+      pcd_range: ${task.pcd_range}

@@ -1,6 +1,6 @@
 # @package _global_
 
-policy_name: bcrnn_rgbd
+arch_name: bcrnn_rgbd
 
 # ====== Policy specific ======
 horizon: 5
@@ -12,9 +12,9 @@ resnet_pretrained_ckpt_path: ???
 module:
   _target_: il_lib.policies.BC_RNN
   eval:
-    model:
-      obs_window_size: 1  # At run time, we only use the latest observation
-      visual_obs_types: [rgb, depth_linear]
+    cfg:
+      model:
+        obs_window_size: 1  # At run time, we only use the latest observation
   prop_dim: 23
   prop_keys: [odom/base_velocity, qpos/torso, qpos/left_arm, qpos/left_gripper, qpos/right_arm, qpos/right_gripper]
   # ====== Feature Extractors ======
@@ -26,7 +26,7 @@ module:
       output_dim: 512
       hidden_depth: 2
       add_output_activation: true
-    rgbd:
+    rgb:
       _target_: il_lib.nn.features.MultiviewResNet18
       views: 
       - robot_r1::robot_r1:left_realsense_link:Camera:0
@@ -36,7 +36,7 @@ module:
       token_dim: 512
       load_pretrained: true
       pretrained_ckpt_path: ${resnet_pretrained_ckpt_path}
-      include_depth: true
+      include_depth: false
       enable_random_crop: true
       random_crop_size: 94
   # ====== Feature Fusion ======
@@ -59,6 +59,6 @@ module:
   gmm_low_noise_eval: true
   optimizer: adam
 
-data_module:
+data:
   use_action_chunks: false
-  visual_obs_types: [rgb, depth_linear]
+  visual_obs_types: [rgb]

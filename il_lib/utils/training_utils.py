@@ -65,52 +65,6 @@ def sequential_split_dataset(dataset: torch.utils.data.Dataset, split_portions: 
     ]
 
 
-def sequential_sum_balanced_partitioning(nums, M, i):
-    """
-    Split a list of numbers into M partitions, where the i-th partition is returned.
-    The i-th partition is balanced such that the sum of the numbers in each partition
-    is as equal as possible.
-    NOTE: if sum not divisible by M, the first `sum % M` partitions will have one more element.
-    Args:
-        nums: list of numbers to be partitioned
-        M: number of partitions
-        i: index of the partition to be returned (0-indexed)
-    Returns:
-        start_idx: starting index of the i-th partition
-        start_offset: offset of the first element in the i-th partition
-        end_idx: ending index of the i-th partition (not inclusive)
-        end_offset: offset of the last element in the i-th partition
-    Example:
-        nums = [1, 2, 3, 4, 5, 6]
-        M = 3
-        i = 1
-        sequential_sum_balanced_partitioning(nums, M, i)
-        Returns: (3, 1, 4, 4)
-    """
-    total = sum(nums)
-    target = total // M
-    num_offsets = total % M
-
-    acc = 0
-    start_idx = end_idx = -1
-    start_offset = end_offset = -1
-
-    # actual start / end indices of the i-th chunk
-    chunk_start_idx = target * i + min(num_offsets, i)
-    chunk_end_idx = target * (i + 1) + min(num_offsets, i + 1)
-    # find which number chunk_start_idx and chunk_end_idx fall into
-    for idx, num in enumerate(nums):
-        if start_idx == -1 and acc + num > chunk_start_idx:
-            start_idx = idx
-            start_offset = chunk_start_idx - acc
-        if end_idx == -1 and acc + num >= chunk_end_idx:
-            end_idx = idx
-            end_offset = chunk_end_idx - acc
-            break
-        acc += num
-    return start_idx, start_offset, end_idx, end_offset
-
-
 def load_torch(*fpath: str, map_location="cpu") -> dict:
     """
     Default maps to "cpu"

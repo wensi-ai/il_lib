@@ -425,8 +425,9 @@ class WBVIMA(BasePolicy):
                 "xyz": fused_pcd[..., 3:],
             },
             "qpos": data_batch["obs"]["qpos"],
-            "odom": data_batch["obs"]["odom"],
         }
+        if "odom" in data_batch["obs"]:
+            data["odom"] = data_batch["obs"]["odom"]
         if extract_action:
             # extract action from data_batch
             data.update({

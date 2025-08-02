@@ -119,6 +119,10 @@ class ACT(BasePolicy):
         self.action_dim = action_dim
 
         # ====== learning ======
+        self.prop_obs_keys = prop_obs_keys
+        self.goal_obs_keys = goal_obs_keys
+        self.action_prediction_horizon = action_prediction_horizon
+
         self.lr = lr
         self.use_cosine_lr = use_cosine_lr
         self.lr_warmup_steps = lr_warmup_steps
@@ -127,7 +131,6 @@ class ACT(BasePolicy):
         self.lr_layer_decay = lr_layer_decay
         self.weight_decay = weight_decay
 
-        self._action_steps_to_deploy = action_steps_to_deploy
         self._temporal_aggregate = temporal_aggregate
         if temporal_aggregate:
             assert temporal_aggregation_factor > 0
@@ -198,43 +201,43 @@ class ACT(BasePolicy):
     
     def policy_training_step(self, batch, batch_idx) -> Any:
         B = batch["actions"].shape[0]
-        # obs data is dict of (B, window_size, ...)
-        # action chunks is (B, window_size, action_prediction_horizon, A)
+        # obs data is dict of (B, obs_window_size, ...)
+        # action chunks is (B, obs_window_size, action_prediction_horizon, A)
         batch = self.process_data(batch, extract_action=True)
 
         # get padding mask
-        pad_mask = batch.pop("masks")  # (B, window_size, L_pred_horizon)
-        pad_mask = pad_mask.reshape(-1, pad_mask.shape[-1])  # (B * window_size, L_pred_horizon)
+        pad_mask = batch.pop("masks")  # (B, obs_window_size, L_pred_horizon)
+        pad_mask = pad_mask.reshape(-1, pad_mask.shape[-1])  # (B * obs_window_size, L_pred_horizon)
         # ACT assumes true for padding, false for not padding
         pad_mask = ~pad_mask
 
         prop_obs = any_concat(
             [
                 any_to_torch_tensor(
-                    main_data_chunk[k], device=self.device, dtype=self.dtype
+                    batch[k], device=self.device, dtype=self.dtype
                 )
                 for k in self.prop_obs_keys
             ],
             dim=-1,
-        )  # (B, window_size, D)
+        )  # (B, obs_window_size, D)
         # flatten first two dims
-        prop_obs = prop_obs.reshape(-1, prop_obs.shape[-1])  # (B * window_size, D)
+        prop_obs = prop_obs.reshape(-1, prop_obs.shape[-1])  # (B * obs_window_size, D)
 
         goal_obs = any_concat(
             [
                 any_to_torch_tensor(
-                    main_data_chunk[k], device=self.device, dtype=self.dtype
+                    batch[k], device=self.device, dtype=self.dtype
                 )
                 for k in self.goal_obs_keys
             ],
             dim=-1,
-        )  # (B, window_size, D)
+        )  # (B, obs_window_size, D)
         # flatten first two dims
-        goal_obs = goal_obs.reshape(-1, goal_obs.shape[-1])  # (B * window_size, D)
+        goal_obs = goal_obs.reshape(-1, goal_obs.shape[-1])  # (B * obs_window_size, D)
 
-        gt_actions = main_data_chunk[
+        gt_actions = batch[
             "action_chunks"
-        ]  # already normalized in [-1, 1], shape (B, window_size, L_pred_horizon, A)
+        ]  # already normalized in [-1, 1], shape (B, obs_window_size, L_pred_horizon, A)
         # reindex to get policy actions
         gt_actions = gt_actions[
             ..., self._policy_train_gt_action_reindex
@@ -242,7 +245,7 @@ class ACT(BasePolicy):
         # flatten first two dims
         gt_actions = gt_actions.reshape(
             -1, gt_actions.shape[-2], gt_actions.shape[-1]
-        )
+        )  # (B * obs_window_size, L_pred_horizon, A)
 
         loss_dict = self.policy._compute_loss(
             prop=prop_obs,
@@ -250,23 +253,22 @@ class ACT(BasePolicy):
             actions=gt_actions,
             is_pad=pad_mask,
         )
-        for k, v in loss_dict.items():
-            if k not in all_loss_dict:
-                all_loss_dict[k] = []
-            all_loss_dict[k].append(v)
 
-
-        avg_all_loss_dict = {}
-        for k, v in all_loss_dict.items():
-            avg_all_loss_dict[k] = torch.mean(torch.stack(v), dim=0)
-        loss = avg_all_loss_dict["loss"]
+        loss = loss_dict["loss"]
         log_dict = {
-            "l1": avg_all_loss_dict["l1"],
-            "kl": avg_all_loss_dict["kl"],
+            "l1": loss_dict["l1"],
+            "kl": loss_dict["kl"],
         }
         return loss, log_dict, B
 
     def policy_evaluation_step(self, batch, batch_idx) -> Any:
+        with torch.no_grad():
+            return self.policy_training_step(batch, batch_idx)
+
+    def policy_test_step(self, batch, batch_idx) -> Any:
+        """
+        TODO: Implement the test step for the ACT policy.
+        """
         # handle the case when rollout eval during training, where obs_statistics is still none
         if self._obs_statistics is None:
             print(
@@ -702,6 +704,9 @@ class ACT(BasePolicy):
         actions,
         is_pad,
     ):
+        """
+        Forward pass for computing the loss.
+        """
         actions = actions[:, : self.num_queries]
         is_pad = is_pad[:, : self.num_queries]
 

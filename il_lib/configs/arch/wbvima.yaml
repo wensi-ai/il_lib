@@ -1,6 +1,6 @@
 # @package _global_
 
-policy_name: wbvima
+arch_name: wbvima
 
 # ====== Eval Config ======
 eval:
@@ -18,9 +18,6 @@ bs: 128
 # ====== module ======
 module:
   _target_: il_lib.policies.WBVIMA
-  eval:
-    model:
-      visual_obs_types: [pcd]
   prop_dim: 23
   prop_keys: [odom/base_velocity, qpos/torso, qpos/left_arm, qpos/left_gripper, qpos/right_arm, qpos/right_gripper]
   num_latest_obs: ${num_latest_obs}
@@ -56,8 +53,8 @@ module:
   unet_kernel_size: 5
   unet_n_groups: 8
   unet_cond_predict_scale: true
-  action_keys: ${action_keys}
-  action_key_dims: ${action_key_dims}
+  action_keys: ${robot.action_keys}
+  action_key_dims: ${robot.action_key_dims}
   # ====== diffusion ======
   noise_scheduler:
     _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
@@ -75,7 +72,7 @@ module:
   num_denoise_steps_per_inference: 16
   loss_on_latest_obs_only: false
 
-data_module:
+data:
   use_action_chunks: true
   visual_obs_types: [pcd]
   action_prediction_horizon: ${deployed_action_steps}

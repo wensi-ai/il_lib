@@ -1,19 +1,16 @@
 # @package _global_
 
-policy_name: bcrnn_rgbd
+arch_name: diffusion_rgb_unet
 
 # ====== Policy specific ======
-horizon: 5
-num_latest_obs: ${horizon}
-deployed_action_steps: 1  # always deploy 1 action at a time
+horizon: 16
+num_latest_obs: 2
+deployed_action_steps: 8
 resnet_pretrained_ckpt_path: ???
 
-# ------ module ------
+# ====== Policy Module ======
 module:
-  _target_: il_lib.policies.BC_RNN
-  eval:
-    model:
-      obs_window_size: 1  # At run time, we only use the latest observation
+  _target_: il_lib.policies.DiffusionPolicy
   prop_dim: 23
   prop_keys: [odom/base_velocity, qpos/torso, qpos/left_arm, qpos/left_gripper, qpos/right_arm, qpos/right_gripper]
   # ====== Feature Extractors ======
@@ -42,22 +39,44 @@ module:
   feature_fusion_hidden_depth: 2
   feature_fusion_hidden_dim: 512
   feature_fusion_output_dim: 512
-  feature_fusion_activation: relu
+  feature_fusion_activation: "relu"
   feature_fusion_add_input_activation: false
   feature_fusion_add_output_activation: true
-  rnn_n_layers: 2
-  rnn_hidden_dim: 512
-  rnn_horizon: ${horizon}
   # ====== Action ======
   action_dim: 23
-  action_net_gmm_n_modes: 5
-  action_net_hidden_dim: 128
-  action_net_hidden_depth: 3
-  action_net_activation: relu
-  deterministic_inference: true
-  gmm_low_noise_eval: true
+  action_keys: ${robot.action_keys}
+  action_key_dims: ${robot.action_key_dims}
+  num_latest_obs: ${num_latest_obs}
+  # ====== Backbone ======
+  backbone:
+    _target_: il_lib.nn.diffusion.ConditionalUnet1D
+    input_dim: ${module.action_dim}
+    local_cond_dim: null
+    global_cond_dim: ${eval:'${module.feature_fusion_output_dim} * ${num_latest_obs}'}
+    diffusion_step_embed_dim: 128
+    down_dims: [64, 128]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: true
+  # ====== Diffusion ======
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    # beta_schedule is important
+    # this is the best we found
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: epsilon # or sample
+  noise_scheduler_step_kwargs: null
+  num_denoise_steps_per_inference: 16
+  horizon: ${horizon}
+  deployed_action_steps: ${deployed_action_steps}
   optimizer: adam
 
-data_module:
+data:
   use_action_chunks: false
   visual_obs_types: [rgb]

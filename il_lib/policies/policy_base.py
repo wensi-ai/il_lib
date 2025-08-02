@@ -3,13 +3,14 @@ import os
 import torch
 import torch.distributed as dist
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from omnigibson.learning.utils.obs_utils import create_video_writer
 from omnigibson.learning.utils.eval_utils import ACTION_QPOS_INDICES, JOINT_RANGE
 from omnigibson.macros import gm
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities.types import OptimizerLRScheduler
+from typing import Any, Optional
 
 
 logger = logging.getLogger("BasePolicy")
@@ -20,17 +21,23 @@ class BasePolicy(LightningModule, ABC):
     Base class for policies that is used for training and rollout
     """
 
-    def __init__(self, eval: Optional[DictConfig] = None, *args, **kwargs) -> None:
+    def __init__(
+        self, 
+        *args,
+        online_eval: Optional[DictConfig] = None, 
+        robot_type: str = "R1Pro",
+        **kwargs
+    ) -> None:
         super().__init__(*args, **kwargs)
         # require evaluator for online testing
-        self.eval_config = eval
-        if self.eval_config is not None:
-            OmegaConf.resolve(self.eval_config)
+        self.online_eval_config = online_eval
+        if self.online_eval_config is not None:
+            OmegaConf.resolve(self.online_eval_config)
         else:
             logger.warning("No evaluation config provided, online evaluation will not be performed during testing.")
         self.evaluator = None
         self.test_id = 0
-        self.robot_type = "R1Pro"
+        self.robot_type = robot_type
 
     @abstractmethod
     def forward(self, obs: dict, *args, **kwargs) -> torch.Tensor:
@@ -106,7 +113,7 @@ class BasePolicy(LightningModule, ABC):
     def on_validation_epoch_end(self):
         # only run test for global zero rank
         if self.trainer.is_global_zero:
-            if self.eval_config is not None and self.eval_config.online_eval:
+            if self.online_eval_config is not None:
                 # evaluator for online evaluation should only be created once
                 if self.evaluator is None:
                     self.evaluator = self.create_evaluator()
@@ -124,12 +131,11 @@ class BasePolicy(LightningModule, ABC):
         # For performance optimization
         gm.DEFAULT_VIEWER_WIDTH = 128
         gm.DEFAULT_VIEWER_HEIGHT = 128
-        gm.HEADLESS = self.eval_config.headless
+        gm.HEADLESS = self.online_eval_config.cfg.headless
 
         # update parameters with policy cfg file
-        assert self.eval_config is not None, "eval_config must be provided to create evaluator!"
-        from omnigibson.learning.eval import Evaluator
-        evaluator = Evaluator(self.eval_config)
+        assert self.online_eval_config is not None, "online_eval_config must be provided to create evaluator!"
+        evaluator = instantiate(self.online_eval_config, _recursive_=False)
         # set the policy for the evaluator
         evaluator.policy.policy = self
         evaluator.policy.device = self.device
@@ -142,7 +148,7 @@ class BasePolicy(LightningModule, ABC):
         assert self.evaluator is not None, "evaluator is not created!"
         self.evaluator.reset()
         self.evaluator.env._current_episode = 0
-        if self.eval_config.write_video:
+        if self.online_eval_config.cfg.write_video:
             video_name = f"videos/test_{self.test_id}.mp4"
             os.makedirs("videos", exist_ok=True)
             self.evaluator.video_writer = create_video_writer(
@@ -152,12 +158,12 @@ class BasePolicy(LightningModule, ABC):
         done = False
         while not done:
             terminated, truncated = self.evaluator.step()
-            if self.eval_config.write_video:
+            if self.online_eval_config.cfg.write_video:
                 self.evaluator._write_video()
             if terminated or truncated:
                 done = True
                 self.evaluator.env.reset()
-        if self.eval_config.write_video:
+        if self.online_eval_config.cfg.write_video:
             self.evaluator.video_writer = None
         self.test_id += 1
         results = {"eval/success_rate": self.evaluator.n_success_trials / self.evaluator.n_trials}

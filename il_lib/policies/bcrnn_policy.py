@@ -234,10 +234,9 @@ class BC_RNN(BasePolicy):
 
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
-        data = {
-            "qpos": data_batch["obs"]["qpos"],
-            "odom": data_batch["obs"]["odom"],
-        }
+        data = {"qpos": data_batch["obs"]["qpos"]}
+        if "odom" in data_batch["obs"]:
+            data["odom"] = data_batch["obs"]["odom"]
         if "rgb" in self._features:
             data["rgb"] = {k.rsplit("::", 1)[0]: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k}
         if "rgbd" in self._features:

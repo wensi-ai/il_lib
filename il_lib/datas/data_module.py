@@ -1,15 +1,15 @@
-from il_lib.datas.dataset import BehaviorDataset, DummyDataset
+import importlib
+from il_lib.datas.dataset import DummyDataset
 from pytorch_lightning import LightningDataModule
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from typing import Optional
 
-from omnigibson.learning.utils.eval_utils import TASK_NAMES_TO_INDICES
-
 
 class BehaviorDataModule(LightningDataModule):
     def __init__(
         self,
+        *args,
         data_path: str,
         task_name: str,
         batch_size: int,
@@ -18,7 +18,7 @@ class BehaviorDataModule(LightningDataModule):
         dataloader_num_workers: int,
         seed: int,
         max_num_demos: Optional[int] = None,
-        *args,
+        dataset_class: str,
         **kwargs,
     ):
         super().__init__()
@@ -30,6 +30,7 @@ class BehaviorDataModule(LightningDataModule):
         self._val_split_ratio = val_split_ratio
         self._max_num_demos = max_num_demos
         self._seed = seed
+        self._dataset_class = dataset_class
         # store args and kwargs for dataset initialization
         self._args = args
         self._kwargs = kwargs
@@ -38,8 +39,10 @@ class BehaviorDataModule(LightningDataModule):
 
     def setup(self, stage: str) -> None:
         if stage == "fit" or stage is None:
-            task_id = TASK_NAMES_TO_INDICES[self._task_name]
-            all_demo_keys = BehaviorDataset.get_all_demo_keys(self._data_path, task_id)
+            # get dataset class module
+            module_path, class_name = self._dataset_class.rsplit(".", 1)
+            DatasetClassModule = getattr(importlib.import_module(module_path), class_name)
+            all_demo_keys = DatasetClassModule.get_all_demo_keys(self._data_path, self._task_name)
             # limit number of demos
             if self._max_num_demos is not None:
                 all_demo_keys = all_demo_keys[: self._max_num_demos]
@@ -49,19 +52,19 @@ class BehaviorDataModule(LightningDataModule):
                 random_state=self._seed,
             )
             # initialize datasets
-            self._train_dataset = BehaviorDataset(
+            self._train_dataset = DatasetClassModule(
                 *self._args,
                 **self._kwargs,
                 data_path=self._data_path,
-                task_id=task_id,
+                task_name=self._task_name,
                 demo_keys=self._train_demo_keys,
                 seed=self._seed,
             )
-            self._val_dataset = BehaviorDataset(
+            self._val_dataset = DatasetClassModule(
                 *self._args,
                 **self._kwargs,
                 data_path=self._data_path,
-                task_id=task_id,
+                task_name=self._task_name,
                 demo_keys=self._val_demo_keys,
                 seed=self._seed,
             )

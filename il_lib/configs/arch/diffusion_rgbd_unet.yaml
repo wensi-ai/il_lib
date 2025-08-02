@@ -1,6 +1,6 @@
 # @package _global_
 
-policy_name: diffusion_rgb_transformer
+arch_name: diffusion_rgbd_unet
 
 # ====== Policy specific ======
 horizon: 16
@@ -22,7 +22,7 @@ module:
       output_dim: 512
       hidden_depth: 2
       add_output_activation: true
-    rgb:
+    rgbd:
       _target_: il_lib.nn.features.MultiviewResNet18
       views: 
       - robot_r1::robot_r1:left_realsense_link:Camera:0
@@ -32,34 +32,32 @@ module:
       token_dim: 512
       load_pretrained: true
       pretrained_ckpt_path: ${resnet_pretrained_ckpt_path}
+      include_depth: true
       enable_random_crop: true
       random_crop_size: 94
   # ====== Feature Fusion ======
   feature_fusion_hidden_depth: 2
   feature_fusion_hidden_dim: 512
   feature_fusion_output_dim: 512
-  feature_fusion_activation: relu
+  feature_fusion_activation: "relu"
   feature_fusion_add_input_activation: false
   feature_fusion_add_output_activation: true
   # ====== Action ======
   action_dim: 23
-  action_keys: ${action_keys}
-  action_key_dims: ${action_key_dims}
+  action_keys: ${robot.action_keys}
+  action_key_dims: ${robot.action_key_dims}
   num_latest_obs: ${num_latest_obs}
   # ====== Backbone ======
   backbone:
-    _target_: il_lib.nn.diffusion.TransformerForDiffusion
+    _target_: il_lib.nn.diffusion.ConditionalUnet1D
     input_dim: ${module.action_dim}
-    output_dim: ${module.action_dim}
-    horizon: ${horizon}
-    n_obs_steps: ${num_latest_obs}
-    cond_dim: ${module.feature_fusion_output_dim}
-    n_layer: 2
-    n_head: 8
-    n_emb: 256
-    p_drop_emb: 0.0
-    p_drop_attn: 0.01
-    n_cond_layers: 0
+    local_cond_dim: null
+    global_cond_dim: ${eval:'${module.feature_fusion_output_dim} * ${num_latest_obs}'}
+    diffusion_step_embed_dim: 128
+    down_dims: [64, 128]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: true
   # ====== Diffusion ======
   noise_scheduler:
     _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
@@ -79,6 +77,6 @@ module:
   deployed_action_steps: ${deployed_action_steps}
   optimizer: adam
 
-data_module:
+data:
   use_action_chunks: false
-  visual_obs_types: [rgb]
+  visual_obs_types: [rgb, depth_linear]
