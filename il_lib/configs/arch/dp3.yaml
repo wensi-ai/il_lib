@@ -6,7 +6,6 @@ arch_name: dp3
 horizon: 16
 num_latest_obs: 2
 deployed_action_steps: 8
-resnet_pretrained_ckpt_path: ???
 
 # ====== Policy Module ======
 module:

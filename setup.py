@@ -39,7 +39,10 @@ setup(
     include_package_data=True,
     zip_safe=False,
     entry_points={
-        "console_scripts": []
+        "console_scripts": [],
+        'hydra.plugins.search_path': [
+            'search_path_plugin = il_lib.hydra_plugins.search_path_plugin:SearchPathPlugin'
+        ]
     },
     install_requires=_read_install_requires(),
     extras_require=_fill_extras(EXTRAS),

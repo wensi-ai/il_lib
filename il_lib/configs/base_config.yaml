@@ -3,7 +3,6 @@ defaults:
   - arch: ???
   - task: ???
   - robot: ???
-  - eval: ???
 
 run_name: "${arch_name}_${task.name}"
 exp_root_dir: .
@@ -25,7 +24,7 @@ bs: 64
 vbs: ${bs}
 data_dir: ???
 eval_interval: 10
-online_eval: ???
+online_eval: null
 
 horizon: ???
 num_latest_obs: ???

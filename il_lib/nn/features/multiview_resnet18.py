@@ -1,15 +1,15 @@
 import os
-from typing import List, Optional, Union
-from functools import partial
-
+import torch
 import torch.nn as nn
-from torchvision.models import ResNet18_Weights
-from torchvision import transforms
+from einops import rearrange
+from functools import partial
 from il_lib.utils.array_tensor_utils import any_concat
 from il_lib.utils.training_utils import load_torch, load_state_dict
 from il_lib.nn.features.resnet import resnet18
-from einops import rearrange
 from il_lib.optim import default_optimizer_groups
+from torchvision import transforms
+from torchvision.models import ResNet18_Weights
+from typing import List, Optional, Union
 
 
 class MultiviewResNet18(nn.Module):
@@ -20,7 +20,6 @@ class MultiviewResNet18(nn.Module):
         resnet_output_dim: int,
         token_dim: int,
         load_pretrained: bool = True,
-        pretrained_ckpt_path: Optional[str] = None,
         include_depth: bool = False,
         enable_random_crop: bool = True,
         random_crop_size: Optional[Union[int, List[int]]] = None,
@@ -29,10 +28,7 @@ class MultiviewResNet18(nn.Module):
         self._views = views
         self._resnet = resnet18(output_dim=resnet_output_dim)
         if load_pretrained:
-            assert pretrained_ckpt_path is not None and os.path.exists(
-                pretrained_ckpt_path
-            )
-            ckpt = load_torch(pretrained_ckpt_path, map_location="cpu")
+            ckpt = torch.hub.load_state_dict_from_url(url=ResNet18_Weights.DEFAULT.url, map_location="cpu")
             del ckpt["fc.weight"]
             del ckpt["fc.bias"]
             load_state_dict(self._resnet, ckpt, strict=False)

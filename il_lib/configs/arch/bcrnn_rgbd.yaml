@@ -6,7 +6,6 @@ arch_name: bcrnn_rgbd
 horizon: 5
 num_latest_obs: ${horizon}
 deployed_action_steps: 1  # always deploy 1 action at a time
-resnet_pretrained_ckpt_path: ???
 
 # ------ module ------
 module:
@@ -35,7 +34,6 @@ module:
       resnet_output_dim: 512
       token_dim: 512
       load_pretrained: true
-      pretrained_ckpt_path: ${resnet_pretrained_ckpt_path}
       include_depth: true
       enable_random_crop: true
       random_crop_size: 94

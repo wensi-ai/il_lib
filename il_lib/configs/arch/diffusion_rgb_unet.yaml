@@ -6,7 +6,6 @@ arch_name: diffusion_rgb_unet
 horizon: 16
 num_latest_obs: 2
 deployed_action_steps: 8
-resnet_pretrained_ckpt_path: ???
 
 # ====== Policy Module ======
 module:
@@ -31,7 +30,6 @@ module:
       resnet_output_dim: 512
       token_dim: 512
       load_pretrained: true
-      pretrained_ckpt_path: ${resnet_pretrained_ckpt_path}
       include_depth: false
       enable_random_crop: true
       random_crop_size: 94
