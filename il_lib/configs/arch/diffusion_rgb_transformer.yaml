@@ -31,7 +31,7 @@ module:
       token_dim: 512
       load_pretrained: true
       enable_random_crop: true
-      random_crop_size: 94
+      random_crop_size: 224
   # ====== Feature Fusion ======
   feature_fusion_hidden_depth: 2
   feature_fusion_hidden_dim: 512

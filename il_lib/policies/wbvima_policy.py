@@ -6,7 +6,7 @@ from einops import rearrange
 from omegaconf import DictConfig
 from hydra.utils import instantiate
 from il_lib.nn.features import ObsTokenizer
-from il_lib.nn.gpt import GPT
+from il_lib.nn.transformers import GPT
 from il_lib.nn.diffusion import WholeBodyUNetDiffusionHead
 from il_lib.optim import CosineScheduleFunction, default_optimizer_groups, check_optimizer_groups
 from il_lib.policies.policy_base import BasePolicy

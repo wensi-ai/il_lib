@@ -23,7 +23,7 @@ wd: 0.0
 bs: 64
 vbs: ${bs}
 data_dir: ???
-eval_interval: 10
+eval_interval: 15
 online_eval: null
 
 horizon: ???
@@ -38,7 +38,7 @@ use_wandb: true
 wandb_project: B1K
 wandb_group: ${arch_name}
 wandb_run_name: ${run_name}
-progress_bar_refresh_rate: 100
+progress_bar_refresh_rate: 200
 
 # ====== Policy Module ======
 module:
