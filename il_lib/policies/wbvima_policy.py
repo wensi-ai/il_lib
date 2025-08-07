@@ -131,13 +131,13 @@ class WBVIMA(BasePolicy):
             else:
                 prop_obs.append(obs[prop_key])
         prop_obs = torch.cat(prop_obs, dim=-1)  # (B, L, Prop_dim)
-
-        obs_tokens = self.obs_tokenizer(
-            {
-                "proprioception": prop_obs,
-                "pcd": obs["pcd"],
-            }
-        )  # (B, L, E), where L is interleaved modalities tokens
+        obs_to_pass_in = {
+            "proprioception": prop_obs,
+            "pcd": obs["pcd"],
+        }  # (B, L, E), where L is interleaved modalities tokens
+        if "task" in self._features:
+            obs_to_pass_in["task"] = obs["task"]
+        obs_tokens = self.obs_tokenizer(obs_to_pass_in) 
         B, _, E = obs_tokens.shape
         action_readout_tokens = self.action_readout_token.view(1, 1, -1).expand(
             B, self.num_latest_obs, -1
