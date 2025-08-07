@@ -65,6 +65,7 @@ class WBVIMA(BasePolicy):
         super().__init__(*args, **kwargs)
 
         self._prop_keys = prop_keys
+        self._features = set(feature_extractors.keys())
         self.obs_tokenizer = ObsTokenizer(
             extractors={
                 k: instantiate(v) for k, v in feature_extractors.items()
@@ -425,9 +426,12 @@ class WBVIMA(BasePolicy):
                 "xyz": fused_pcd[..., 3:],
             },
             "qpos": data_batch["obs"]["qpos"],
+            "eef": data_batch["obs"]["eef"],
         }
         if "odom" in data_batch["obs"]:
             data["odom"] = data_batch["obs"]["odom"]
+        if "task" in self._features:
+            data["task"] = data_batch["obs"]["task"]
         if extract_action:
             # extract action from data_batch
             data.update({

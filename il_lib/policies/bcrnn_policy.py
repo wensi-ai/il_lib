@@ -234,7 +234,7 @@ class BC_RNN(BasePolicy):
 
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
-        data = {"qpos": data_batch["obs"]["qpos"]}
+        data = {"qpos": data_batch["obs"]["qpos"], "eef": data_batch["obs"]["eef"]}
         if "odom" in data_batch["obs"]:
             data["odom"] = data_batch["obs"]["odom"]
         if "rgb" in self._features:
@@ -243,6 +243,8 @@ class BC_RNN(BasePolicy):
             rgb = {k.rsplit("::", 1)[0]: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k}
             depth = {k.rsplit("::", 1)[0]: (data_batch["obs"][k].float() - MIN_DEPTH) / (MAX_DEPTH - MIN_DEPTH) for k in data_batch["obs"] if "depth" in k}
             data["rgbd"] = {k: torch.cat([rgb[k], depth[k].unsqueeze(-3)], dim=-3) for k in rgb}
+        if "task" in self._features:
+            data["task"] = data_batch["obs"]["task"]
         if extract_action:
             # extract action from data_batch
             data.update({

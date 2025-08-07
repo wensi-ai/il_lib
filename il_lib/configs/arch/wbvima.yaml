@@ -18,8 +18,18 @@ bs: 128
 # ====== module ======
 module:
   _target_: il_lib.policies.WBVIMA
-  prop_dim: 23
-  prop_keys: [odom/base_velocity, qpos/torso, qpos/left_arm, qpos/left_gripper, qpos/right_arm, qpos/right_gripper]
+  prop_dim: 37
+  prop_keys: 
+    - odom/base_velocity
+    - qpos/torso
+    - qpos/left_arm
+    - qpos/left_gripper
+    - qpos/right_arm
+    - qpos/right_gripper
+    - eef/left_pos
+    - eef/left_quat
+    - eef/right_pos
+    - eef/right_quat
   num_latest_obs: ${num_latest_obs}
   # ====== Feature Extractors ======
   feature_extractors:

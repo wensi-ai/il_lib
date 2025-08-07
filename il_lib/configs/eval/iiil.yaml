@@ -10,7 +10,7 @@ online_eval:
     headless: ${headless}
     write_video: true
     policy:
-      type: va
+      type: il
       use_websocket: false
       host: null
       port: null
@@ -20,6 +20,8 @@ online_eval:
         external: [120, 120]
         wrist: [120, 120]
       visual_obs_types: ${data.visual_obs_types}
+      use_task_info: ${data.use_task_info}
+      task_info_range: ${task.task_info_range}
       pcd_range: ${task.pcd_range}
       robot_type: ${robot.type}
     env: ${env}

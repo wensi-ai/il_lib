@@ -10,8 +10,18 @@ deployed_action_steps: 8
 # ====== Policy Module ======
 module:
   _target_: il_lib.policies.DiffusionPolicy
-  prop_dim: 23
-  prop_keys: [odom/base_velocity, qpos/torso, qpos/left_arm, qpos/left_gripper, qpos/right_arm, qpos/right_gripper]
+  prop_dim: 37
+  prop_keys: 
+    - odom/base_velocity
+    - qpos/torso
+    - qpos/left_arm
+    - qpos/left_gripper
+    - qpos/right_arm
+    - qpos/right_gripper
+    - eef/left_pos
+    - eef/left_quat
+    - eef/right_pos
+    - eef/right_quat
   # ====== Feature Extractors ======
   feature_extractors:
     proprioception:

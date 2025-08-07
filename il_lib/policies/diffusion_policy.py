@@ -306,7 +306,7 @@ class DiffusionPolicy(BasePolicy):
 
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
-        data = {"qpos": data_batch["obs"]["qpos"]}
+        data = {"qpos": data_batch["obs"]["qpos"], "eef": data_batch["obs"]["eef"]}
         if "odom" in data_batch["obs"]:
             data["odom"] = data_batch["obs"]["odom"]
         if "rgb" in self._features:
@@ -320,6 +320,8 @@ class DiffusionPolicy(BasePolicy):
                 "rgb": data_batch["obs"]["pcd"][..., :3],
                 "xyz": data_batch["obs"]["pcd"][..., 3:],
             }
+        if "task" in self._features:
+            data["task"] = data_batch["obs"]["task"]
         if extract_action:
             # extract action from data_batch
             data.update({

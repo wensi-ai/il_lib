@@ -21,4 +21,6 @@ online_eval:
         right_wrist: [120, 120]
         head: [180, 180]
       visual_obs_types: ${data.visual_obs_types}
+      use_task_info: ${data.use_task_info}
+      task_info_range: ${task.task_info_range}
       pcd_range: ${task.pcd_range}

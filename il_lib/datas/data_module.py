@@ -1,4 +1,5 @@
 import importlib
+import os
 from il_lib.datas.dataset import DummyDataset
 from pytorch_lightning import LightningDataModule
 from sklearn.model_selection import train_test_split
@@ -22,7 +23,7 @@ class BehaviorDataModule(LightningDataModule):
         **kwargs,
     ):
         super().__init__()
-        self._data_path = data_path
+        self._data_path = os.path.expanduser(data_path)
         self._task_name = task_name
         self._batch_size = batch_size
         self._val_batch_size = val_batch_size if val_batch_size is not None else batch_size
