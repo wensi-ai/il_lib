@@ -18,11 +18,12 @@ class MultiviewResNet18(nn.Module):
         views: List[str],
         *,
         resnet_output_dim: int,
-        token_dim: int,
+        token_dim: Optional[int] = None,
         load_pretrained: bool = True,
         include_depth: bool = False,
         enable_random_crop: bool = True,
         random_crop_size: Optional[Union[int, List[int]]] = None,
+        fuse_views: bool = True
     ):
         super().__init__()
         self._views = views
@@ -39,8 +40,11 @@ class MultiviewResNet18(nn.Module):
                 rgbd_conv1.weight.data[:, :3, :, :] = self._resnet.conv1.weight.data
                 rgbd_conv1.weight.data[:, 3, :, :] = 0.0
                 self._resnet.conv1 = rgbd_conv1
-        self._output_fc = nn.Linear(len(views) * resnet_output_dim, token_dim)
-        self.output_dim = token_dim
+        self.fuse_views = fuse_views
+        if fuse_views:
+            assert token_dim is not None, "token_dim must be specified when fuse_views is True"
+            self._output_fc = nn.Linear(len(views) * resnet_output_dim, token_dim)
+            self.output_dim = token_dim
 
         train_transforms, eval_transforms = [], []
         if enable_random_crop:
@@ -77,13 +81,16 @@ class MultiviewResNet18(nn.Module):
         resnet_output = {
             k: self._resnet(v) for k, v in x.items()
         }  # dict of (B * L, resnet_output_dim)
-        multiview_output = any_concat(
-            [resnet_output[k] for k in self._views],
-            dim=-1,
-        )  # (B * L, len(views) * resnet_output_dim)
-        flattened_output = self._output_fc(multiview_output)  # (B * L, token_dim)
-        output = rearrange(flattened_output, "(B L) E -> B L E", B=B, L=L).contiguous()
-        return output
+        if not self.fuse_views:
+            return resnet_output
+        else:
+            multiview_output = any_concat(
+                [resnet_output[k] for k in self._views],
+                dim=-1,
+            )  # (B * L, len(views) * resnet_output_dim)
+            flattened_output = self._output_fc(multiview_output)  # (B * L, token_dim)
+            output = rearrange(flattened_output, "(B L) E -> B L E", B=B, L=L).contiguous()
+            return output
 
     def get_optimizer_groups(self, weight_decay, lr_layer_decay, lr_scale=1.0):
         pg, pids = default_optimizer_groups(

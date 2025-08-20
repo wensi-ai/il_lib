@@ -1,16 +1,19 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from hydra.utils import instantiate
 from il_lib.optim import CosineScheduleFunction, default_optimizer_groups
-from il_lib.nn.transformers import Transformer, TransformerEncoderLayer, TransformerEncoder
+from il_lib.nn.transformers import (
+    build_position_encoding,
+    Transformer, TransformerEncoderLayer, TransformerEncoder
+)
+from il_lib.nn.features import MultiviewResNet18
 from il_lib.policies.policy_base import BasePolicy
-from il_lib.utils.array_tensor_utils import any_concat, any_stack
-from il_lib.utils.convert_utils import any_to_torch_tensor
-from il_lib.utils.print_utils import color_text
-from omegaconf import DictConfig
+from il_lib.utils.array_tensor_utils import any_concat
+from omegaconf import DictConfig, OmegaConf
+from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
 from torch.autograd import Variable
-from tqdm import tqdm
 from typing import Any, List, Optional
 
 __all__ = ["ACT"]
@@ -28,6 +31,7 @@ class ACT(BasePolicy):
         action_dim: int,
         action_keys: List[str],
         obs_backbone: DictConfig,
+        pos_encoding: DictConfig,
         # ====== policy ======
         num_queries: int,
         hidden_dim: int,
@@ -37,9 +41,7 @@ class ACT(BasePolicy):
         num_encoder_layers: int,
         num_decoder_layers: int,
         pre_norm: bool,
-
         kl_weight: float,
-        action_prediction_horizon: int,
         # ====== learning ======
         lr: float,
         use_cosine_lr: bool = False,
@@ -81,9 +83,11 @@ class ACT(BasePolicy):
             num_layers=num_encoder_layers,
             norm=nn.LayerNorm(hidden_dim) if pre_norm else None,
         )
+        self.position_embedding = build_position_encoding(OmegaConf.to_container(pos_encoding))
         self.num_queries = num_queries
         self.action_head = nn.Linear(hidden_dim, action_dim)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
         self.input_proj_robot_state = nn.Linear(prop_dim, hidden_dim)
         self.pos = torch.nn.Embedding(2, hidden_dim)
         # encoder extra parameters
@@ -92,11 +96,10 @@ class ACT(BasePolicy):
         self.encoder_action_proj = nn.Linear(action_dim, hidden_dim) # project action to embedding
         self.encoder_prop_proj = nn.Linear(prop_dim, hidden_dim) # project prop to embedding
         self.latent_proj = nn.Linear(hidden_dim, self.latent_dim * 2)  # project hidden state to latent std, var
-        self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], qpos, a_seq
+        self.register_buffer('pos_table', self._get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], qpos, a_seq
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
 
         # ====== learning ======
-        self.action_prediction_horizon = action_prediction_horizon
         self.kl_weight = kl_weight
 
         self.lr = lr
@@ -130,13 +133,11 @@ class ACT(BasePolicy):
         prop_obs = torch.cat(prop_obs, dim=-1)  # (B, L, Prop_dim)
         # flatten first two dims
         prop_obs = prop_obs.reshape(-1, prop_obs.shape[-1])  # (B * L, Prop_dim)
-        obs["proprioception"] = prop_obs
-        obs = {k: obs[k] for k in self._features}  # filter obs to only include features we have
 
         if is_training:
             # project action sequence to embedding dim, and concat with a CLS token
             action_embed = self.encoder_action_proj(actions)  # (B, seq, hidden_dim)
-            prop_embed = self.encoder_prop_proj(obs["proprioception"])  # (B, hidden_dim)
+            prop_embed = self.encoder_prop_proj(prop_obs)  # (B, hidden_dim)
             prop_embed = torch.unsqueeze(prop_embed, dim=1)  # (B, 1, hidden_dim)
             cls_embed = self.cls_embed.weight  # (1, hidden_dim)
             cls_embed = torch.unsqueeze(cls_embed, dim=0).repeat(
@@ -148,7 +149,7 @@ class ACT(BasePolicy):
             encoder_input = encoder_input.permute(1, 0, 2)  # (seq+1, B, hidden_dim)
             # do not mask cls token
             cls_joint_is_pad = torch.full((bs, 2), False).to(
-                prop.device
+                prop_obs.device
             )  # False: not a padding
             is_pad = torch.cat([cls_joint_is_pad, is_pad], dim=1)  # (B, seq+1)
             # obtain position embedding
@@ -170,14 +171,13 @@ class ACT(BasePolicy):
         latent_input = self.latent_out_proj(latent_sample)
         all_cam_features = []
         all_cam_pos = []
-        for cam_id, cam_name in enumerate(self.camera_names):
-            features, pos = self.backbones[0](image[:, cam_id]) # HARDCODED
-            features = features[0] # take the last layer feature
-            pos = pos[0]
+        resnet_output = self.obs_backbone(obs["rgb"])  # dict of (B, C, H, W)
+        for features in resnet_output.values():
+            pos = self.position_embedding(features)
             all_cam_features.append(self.input_proj(features))
             all_cam_pos.append(pos)
         # proprioception features
-        proprio_input = self.input_proj_robot_state(obs["proprioception"])
+        proprio_input = self.input_proj_robot_state(prop_obs)
         # fold camera dimension into width dimension
         src = torch.cat(all_cam_features, axis=3)
         pos = torch.cat(all_cam_pos, axis=3)
@@ -262,43 +262,6 @@ class ACT(BasePolicy):
 
         return optimizer
     
-    def _get_optimizer_groups(self, weight_decay, lr_layer_decay, lr_scale=1.0):
-        head_pg, _ = default_optimizer_groups(
-            self,
-            weight_decay=weight_decay,
-            lr_scale=lr_scale,
-        )
-        return head_pg
-
-    def _compute_loss(self, obs, actions, is_pad):
-        """
-        Forward pass for computing the loss.
-        """
-        actions = actions[:, : self.num_queries]
-        is_pad = is_pad[:, : self.num_queries]
-
-        a_hat, (mu, logvar) = self.forward(
-            obs=obs,
-            actions=actions,
-            is_pad=is_pad,
-        )
-        total_kld, dim_wise_kld, mean_kld = _kl_divergence(mu, logvar)
-        loss_dict = dict()
-        all_l1 = F.l1_loss(actions, a_hat, reduction="none")
-        l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
-        loss_dict["l1"] = l1
-        loss_dict["kl"] = total_kld[0]
-        loss_dict["loss"] = loss_dict["l1"] + loss_dict["kl"] * self.kl_weight
-        return loss_dict
-
-    def _reparametrize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """
-        Reparametrization trick to sample from a Gaussian distribution.
-        """
-        std = logvar.div(2).exp()
-        eps = Variable(std.data.new(std.size()).normal_())
-        return mu + std * eps
-    
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data
         data = {"qpos": data_batch["obs"]["qpos"], "eef": data_batch["obs"]["eef"]}
@@ -319,3 +282,70 @@ class ACT(BasePolicy):
                 "masks": data_batch["masks"],
             })
         return data
+    
+    def _get_optimizer_groups(self, weight_decay, lr_layer_decay, lr_scale=1.0):
+        head_pg, _ = default_optimizer_groups(
+            self,
+            weight_decay=weight_decay,
+            lr_scale=lr_scale,
+        )
+        return head_pg
+
+    def _compute_loss(self, obs, actions, is_pad):
+        """
+        Forward pass for computing the loss.
+        """
+        actions = actions[:, : self.num_queries]
+        is_pad = is_pad[:, : self.num_queries]
+
+        a_hat, (mu, logvar) = self.forward(
+            obs=obs,
+            actions=actions,
+            is_pad=is_pad,
+        )
+        total_kld = self._kl_divergence(mu, logvar)[0]
+        loss_dict = dict()
+        all_l1 = F.l1_loss(actions, a_hat, reduction="none")
+        l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
+        loss_dict["l1"] = l1
+        loss_dict["kl"] = total_kld[0]
+        loss_dict["loss"] = loss_dict["l1"] + loss_dict["kl"] * self.kl_weight
+        return loss_dict
+
+    def _reparametrize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """
+        Reparametrization trick to sample from a Gaussian distribution.
+        """
+        std = logvar.div(2).exp()
+        eps = Variable(std.data.new(std.size()).normal_())
+        return mu + std * eps
+    
+    def _get_sinusoid_encoding_table(self, n_position, d_hid):
+        def get_position_angle_vec(position):
+            return [
+                position / np.power(10000, 2 * (hid_j // 2) / d_hid)
+                for hid_j in range(d_hid)
+            ]
+
+        sinusoid_table = np.array(
+            [get_position_angle_vec(pos_i) for pos_i in range(n_position)]
+        )
+        sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
+        sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
+
+        return torch.FloatTensor(sinusoid_table).unsqueeze(0)
+
+    def _kl_divergence(self, mu, logvar):
+        batch_size = mu.size(0)
+        assert batch_size != 0
+        if mu.data.ndimension() == 4:
+            mu = mu.view(mu.size(0), mu.size(1))
+        if logvar.data.ndimension() == 4:
+            logvar = logvar.view(logvar.size(0), logvar.size(1))
+
+        klds = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+        total_kld = klds.sum(1).mean(0, True)
+        dimension_wise_kld = klds.mean(0)
+        mean_kld = klds.mean(1).mean(0, True)
+
+        return total_kld, dimension_wise_kld, mean_kld

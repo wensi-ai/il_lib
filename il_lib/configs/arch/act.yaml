@@ -3,33 +3,54 @@
 arch_name: act
 
 # ====== Policy specific ======
-num_latest_obs: 5
-horizon: 100
-deployed_action_steps: 100
-
-enable_goal_relabeling: true
+num_latest_obs: 1
+horizon: 20
+deployed_action_steps: 1
 wd: 0.1
 
 # ------ module ------
 module:
   _target_: il_lib.policies.ACT
+  prop_dim: 37
+  prop_keys: 
+    - odom/base_velocity
+    - qpos/torso
+    - qpos/left_arm
+    - qpos/left_gripper
+    - qpos/right_arm
+    - qpos/right_gripper
+    - eef/left_pos
+    - eef/left_quat
+    - eef/right_pos
+    - eef/right_quat
+  action_dim: 23
+  action_keys: ${robot.action_keys}
+  obs_backbone:
+    _target_: il_lib.nn.features.MultiviewResNet18
+    views: 
+    - robot_r1::robot_r1:left_realsense_link:Camera:0
+    - robot_r1::robot_r1:right_realsense_link:Camera:0
+    - robot_r1::robot_r1:zed_link:Camera:0
+    resnet_output_dim: 512
+    load_pretrained: true
+    include_depth: false
+    enable_random_crop: true
+    random_crop_size: 224
+    fuse_views: false
+  pos_encoding:
+    positional_embedding: sine
+    hidden_dim: ${module.hidden_dim}
+  # policy
+  num_queries: 100
   hidden_dim: 512
   dropout: 0.1
   n_heads: 8
+  dim_feedforward: 3200
   num_encoder_layers: 4
   num_decoder_layers: 7
   pre_norm: false
-  dim_feedforward: 3200
-  action_dim: 8
-  num_queries: 100
   kl_weight: 10
-  action_prediction_horizon: ${horizon}
-  action_steps_to_deploy: ${deployed_action_steps}
-  temporal_aggregate: true
-  temporal_aggregation_factor: 2
 
 data:
-  _target_: simple_wbc.learning.data.DistillationDataModule
-  obs_window_size: 2
-  action_prediction_horizon: ${horizon}
-  enable_goal_relabeling: ${enable_goal_relabeling}
+  use_action_chunks: false
+  visual_obs_types: [rgb]

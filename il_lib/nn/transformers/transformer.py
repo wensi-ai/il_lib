@@ -399,35 +399,3 @@ def _get_activation_fn(activation):
     if activation == "glu":
         return F.glu
     raise RuntimeError(f"activation should be relu/gelu, not {activation}.")
-
-
-def _get_sinusoid_encoding_table(n_position, d_hid):
-    def get_position_angle_vec(position):
-        return [
-            position / np.power(10000, 2 * (hid_j // 2) / d_hid)
-            for hid_j in range(d_hid)
-        ]
-
-    sinusoid_table = np.array(
-        [get_position_angle_vec(pos_i) for pos_i in range(n_position)]
-    )
-    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
-    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
-
-    return torch.FloatTensor(sinusoid_table).unsqueeze(0)
-
-
-def _kl_divergence(mu, logvar):
-    batch_size = mu.size(0)
-    assert batch_size != 0
-    if mu.data.ndimension() == 4:
-        mu = mu.view(mu.size(0), mu.size(1))
-    if logvar.data.ndimension() == 4:
-        logvar = logvar.view(logvar.size(0), logvar.size(1))
-
-    klds = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
-    total_kld = klds.sum(1).mean(0, True)
-    dimension_wise_kld = klds.mean(0)
-    mean_kld = klds.mean(1).mean(0, True)
-
-    return total_kld, dimension_wise_kld, mean_kld
