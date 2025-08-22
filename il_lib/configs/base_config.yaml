@@ -25,6 +25,7 @@ vbs: ${bs}
 data_dir: ???
 eval_interval: 15
 online_eval: null
+policy_wrapper: null
 
 horizon: ???
 num_latest_obs: ???
@@ -43,7 +44,8 @@ progress_bar_refresh_rate: 200
 # ====== Policy Module ======
 module:
   _target_: ???  # filled by arch
-  online_eval: ${online_eval}  # filled by arch
+  online_eval: ${online_eval}  # filled by eval
+  policy_wrapper: ${policy_wrapper}  # filled by eval
   robot_type: ${robot.type}
   lr: ${lr}
   use_cosine_lr: ${use_cosine_lr}
@@ -58,7 +60,8 @@ module:
 data:
   _target_: il_lib.datas.BehaviorDataModule
   data_path: ${data_dir}
-  task_name: ${task.name}
+  task_name: 
+    - ${task.name}
   batch_size: ${bs}
   val_batch_size: ${vbs}
   val_split_ratio: 0.1

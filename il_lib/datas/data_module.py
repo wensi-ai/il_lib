@@ -57,7 +57,6 @@ class BehaviorDataModule(LightningDataModule):
                 *self._args,
                 **self._kwargs,
                 data_path=self._data_path,
-                task_name=self._task_name,
                 demo_keys=self._train_demo_keys,
                 seed=self._seed,
             )
@@ -65,7 +64,6 @@ class BehaviorDataModule(LightningDataModule):
                 *self._args,
                 **self._kwargs,
                 data_path=self._data_path,
-                task_name=self._task_name,
                 demo_keys=self._val_demo_keys,
                 seed=self._seed,
             )

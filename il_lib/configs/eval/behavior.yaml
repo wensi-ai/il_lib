@@ -9,18 +9,21 @@ online_eval:
     env_type: ${env_type}
     task: ${task}
     robot: ${robot}
+    use_task_info: ${data.use_task_info}
     policy_name: ${arch_name}
     model:
-      _target_: omnigibson.learning.policies.VisionActionILPolicy
-      robot_type: ${robot.type}
-      use_websocket: false
-      deployed_action_steps: ${deployed_action_steps}
-      obs_window_size: ${num_latest_obs}
-      obs_output_size: 
-        left_wrist: [120, 120]
-        right_wrist: [120, 120]
-        head: [180, 180]
-      visual_obs_types: ${data.visual_obs_types}
-      use_task_info: ${data.use_task_info}
-      task_info_range: ${task.task_info_range}
-      pcd_range: ${task.pcd_range}
+      _target_: omnigibson.learning.policies.LocalPolicy
+
+policy_wrapper:
+  _target_: il_lib.policies.policy_base.PolicyWrapper
+  deployed_action_steps: ${deployed_action_steps}
+  obs_window_size: ${num_latest_obs}
+  obs_output_size: 
+    left_wrist: [240, 240]
+    right_wrist: [240, 240]
+    head: [240, 240]
+  visual_obs_types: ${data.visual_obs_types}
+  use_task_info: ${data.use_task_info}
+  task_info_range: ${task.task_info_range}
+  pcd_range: ${task.pcd_range}
+  robot_type: ${robot.type}

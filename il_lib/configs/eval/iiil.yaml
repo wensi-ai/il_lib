@@ -11,22 +11,22 @@ online_eval:
     write_video: true
     policy:
       type: il
-      use_websocket: false
-      host: null
-      port: null
-      deployed_action_steps: ${deployed_action_steps}
-      obs_window_size: ${num_latest_obs}
-      obs_output_size: 
-        external: [120, 120]
-        wrist: [120, 120]
-      visual_obs_types: ${data.visual_obs_types}
-      use_task_info: ${data.use_task_info}
-      task_info_range: ${task.task_info_range}
-      pcd_range: ${task.pcd_range}
-      robot_type: ${robot.type}
     env: ${env}
     task: ${task}
     hdf_path: ???
     overwrite: false
     log_only_success: true
     mode: null 
+
+policy_wrapper:
+  _target_: il_lib.policies.policy_base.PolicyWrapper
+  deployed_action_steps: ${deployed_action_steps}
+  obs_window_size: ${num_latest_obs}
+  obs_output_size: 
+    external: [240, 240]
+    wrist: [240, 240]
+  visual_obs_types: ${data.visual_obs_types}
+  use_task_info: ${data.use_task_info}
+  task_info_range: ${task.task_info_range}
+  pcd_range: ${task.pcd_range}
+  robot_type: ${robot.type}

@@ -1,10 +1,9 @@
-
 import hydra
 from hydra.utils import instantiate
-from omegaconf import OmegaConf
-from il_lib.utils.training_utils import load_state_dict, load_torch
-from omnigibson.learning.utils.network_utils import WebsocketPolicyServer
 from il_lib.utils.config_utils import register_omegaconf_resolvers
+from il_lib.utils.training_utils import load_state_dict, load_torch
+from omegaconf import OmegaConf
+from omnigibson.learning.utils.network_utils import WebsocketPolicyServer
 
 
 @hydra.main(config_name="base_config", config_path="il_lib/configs", version_base="1.1")
@@ -25,8 +24,11 @@ def main(cfg):
     )
     policy = policy.to("cuda")
     policy.eval()
+    # instantiate wrapper for policy
+    policy_wrapper = instantiate(cfg.policy_wrapper)
+    policy_wrapper.policy = policy
     server = WebsocketPolicyServer(
-        policy=policy,
+        policy=policy_wrapper,
         host="0.0.0.0",
         port=8000,
     )
