@@ -47,7 +47,7 @@ module:
       include_depth: true
       enable_random_crop: true
       random_crop_size: 224
-      fuse_views: true
+      return_last_spatial_map: false
   # ====== Feature Fusion ======
   feature_fusion_hidden_depth: 2
   feature_fusion_hidden_dim: 512

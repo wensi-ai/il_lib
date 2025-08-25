@@ -125,6 +125,9 @@ class BasePolicy(LightningModule, ABC):
         )
         return log_dict
 
+    def test_step(self, *args, **kwargs):
+        logger.info("Skipping test step.")
+
     def on_validation_epoch_end(self):
         # only run test for global zero rank
         if self.trainer.is_global_zero:
@@ -134,9 +137,9 @@ class BasePolicy(LightningModule, ABC):
                     self.evaluator = self.create_evaluator()
                 if not self.trainer.sanity_checking:
                     self.log_dict(self.run_online_evaluation())
-    # Synchronize all processes to prevent timeout
-    if dist.is_initialized():
-        dist.barrier()
+        # Synchronize all processes to prevent timeout
+        if dist.is_initialized():
+            dist.barrier()
 
     def create_evaluator(self):
         """
@@ -266,7 +269,7 @@ class PolicyWrapper:
 
         need_inference = self._action_idx % self.deployed_action_steps == 0
         if need_inference:
-            self._action_traj_pred = self.policy.act({"obs": obs}).squeeze(0).detach().cpu()  # (T_A, A)
+            self._action_traj_pred = self.policy.act({"obs": obs}).squeeze(0)  # (T_A, A)
             self._action_idx = 0
         action = self._action_traj_pred[self._action_idx]
         self._action_idx += 1
@@ -344,7 +347,7 @@ class PolicyWrapper:
                 ).unsqueeze(0)
                 if "pcd" in self.visual_obs_types:
                     # move rgb dim back
-                    pcd_obs[f"{camera}::rgb"] = rgb_obs.movedim(-3, -1).to(self.device)
+                    pcd_obs[f"{camera}::rgb"] = rgb_obs.movedim(-3, -1).to(self.policy.device)
                 else:
                     processed_obs[f"{camera}::rgb"] = self._post_processing_fn(rgb_obs)
             if "depth_linear" in self.visual_obs_types or "pcd" in self.visual_obs_types:
@@ -355,7 +358,7 @@ class PolicyWrapper:
                 )
                 if "pcd" in self.visual_obs_types:
                     # move depth_linear dim back
-                    pcd_obs[f"{camera}::depth_linear"] = depth_obs.to(self.device)
+                    pcd_obs[f"{camera}::depth_linear"] = depth_obs.to(self.policy.device)
                 else:
                     processed_obs[f"{camera}::depth_linear"] = self._post_processing_fn(depth_obs)
             if "seg_instance_id" in self.visual_obs_types:
@@ -368,7 +371,7 @@ class PolicyWrapper:
                 )
         if "pcd" in self.visual_obs_types:
             pcd_obs["cam_rel_poses"] = (
-                obs["robot_r1::cam_rel_poses"].unsqueeze(0).unsqueeze(0).to(torch.float32).to(self.device)
+                obs["robot_r1::cam_rel_poses"].unsqueeze(0).unsqueeze(0).to(torch.float32).to(self.policy.device)
             )
             processed_obs["pcd"] = self._post_processing_fn(
                 process_fused_point_cloud(

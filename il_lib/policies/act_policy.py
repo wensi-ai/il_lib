@@ -2,16 +2,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import deque
 from hydra.utils import instantiate
 from il_lib.optim import CosineScheduleFunction, default_optimizer_groups
 from il_lib.nn.transformers import (
     build_position_encoding,
     Transformer, TransformerEncoderLayer, TransformerEncoder
 )
-from il_lib.nn.features import MultiviewResNet18
 from il_lib.policies.policy_base import BasePolicy
-from il_lib.utils.array_tensor_utils import any_concat
-from omegaconf import DictConfig, OmegaConf
+from il_lib.utils.array_tensor_utils import any_concat, get_batch_size, any_slice
+from omegaconf import DictConfig
 from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
 from torch.autograd import Variable
 from typing import Any, List, Optional
@@ -30,6 +30,7 @@ class ACT(BasePolicy):
         prop_keys: List[str],
         action_dim: int,
         action_keys: List[str],
+        features: List[str],
         obs_backbone: DictConfig,
         pos_encoding: DictConfig,
         # ====== policy ======
@@ -42,6 +43,7 @@ class ACT(BasePolicy):
         num_decoder_layers: int,
         pre_norm: bool,
         kl_weight: float,
+        temporal_ensemble: bool,
         # ====== learning ======
         lr: float,
         use_cosine_lr: bool = False,
@@ -50,15 +52,13 @@ class ACT(BasePolicy):
         lr_cosine_min: Optional[float] = None,
         lr_layer_decay: float = 1.0,
         weight_decay: float = 0.0,
-        # ====== eval ======
-        temporal_aggregate: bool,
-        temporal_aggregation_factor: float,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._prop_keys = prop_keys
         self._action_keys = action_keys 
         self.action_dim = action_dim
+        self._features = features
         self.obs_backbone = instantiate(obs_backbone)
 
         self.transformer = Transformer(
@@ -83,22 +83,28 @@ class ACT(BasePolicy):
             num_layers=num_encoder_layers,
             norm=nn.LayerNorm(hidden_dim) if pre_norm else None,
         )
-        self.position_embedding = build_position_encoding(OmegaConf.to_container(pos_encoding))
+        self.position_embedding = build_position_encoding(pos_encoding)
         self.num_queries = num_queries
         self.action_head = nn.Linear(hidden_dim, action_dim)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
+        self.input_proj = nn.Conv2d(obs_backbone.resnet_output_dim, hidden_dim, kernel_size=1)
         self.input_proj_robot_state = nn.Linear(prop_dim, hidden_dim)
         self.pos = torch.nn.Embedding(2, hidden_dim)
         # encoder extra parameters
-        self.latent_dim = 32
+        self.latent_dim = 32 # final size of latent z
         self.cls_embed = nn.Embedding(1, hidden_dim) # extra cls token embedding
         self.encoder_action_proj = nn.Linear(action_dim, hidden_dim) # project action to embedding
         self.encoder_prop_proj = nn.Linear(prop_dim, hidden_dim) # project prop to embedding
         self.latent_proj = nn.Linear(hidden_dim, self.latent_dim * 2)  # project hidden state to latent std, var
         self.register_buffer('pos_table', self._get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], qpos, a_seq
+        self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
-
+        self.temporal_ensemble = temporal_ensemble
+        if temporal_ensemble:
+            self._horizon = num_queries
+            self._action_buffer = deque(maxlen=self._horizon)
+            for _ in range(self._horizon):
+                self._action_buffer.append(torch.zeros((self._horizon, self.action_dim), dtype=torch.float32).to(self.device))
         # ====== learning ======
         self.kl_weight = kl_weight
 
@@ -110,18 +116,13 @@ class ACT(BasePolicy):
         self.lr_layer_decay = lr_layer_decay
         self.weight_decay = weight_decay
 
-        self._temporal_aggregate = temporal_aggregate
-        if temporal_aggregate:
-            assert temporal_aggregation_factor > 0
-        self._temporal_aggregation_factor = temporal_aggregation_factor
-
         self._obs_statistics = None
         # Save hyperparameters
         self.save_hyperparameters()
 
-    def forward(self, obs: dict, actions: Optional[torch.Tensor]=None) -> torch.Tensor:
+    def forward(self, obs: dict, actions: Optional[torch.Tensor]=None, is_pad: Optional[torch.Tensor]=None) -> torch.Tensor:
         is_training = actions is not None
-        bs = obs["prop"].shape[0]
+        bs = get_batch_size(obs, strict=True)
         # construct prop obs
         prop_obs = []
         for prop_key in self._prop_keys:
@@ -171,7 +172,7 @@ class ACT(BasePolicy):
         latent_input = self.latent_out_proj(latent_sample)
         all_cam_features = []
         all_cam_pos = []
-        resnet_output = self.obs_backbone(obs["rgb"])  # dict of (B, C, H, W)
+        resnet_output = self.obs_backbone(obs["rgbd"])  # dict of (B, C, H, W)
         for features in resnet_output.values():
             pos = self.position_embedding(features)
             all_cam_features.append(self.input_proj(features))
@@ -187,11 +188,26 @@ class ACT(BasePolicy):
 
     @torch.no_grad()
     def act(self, obs: dict) -> torch.Tensor:
-        a_hat = self.forward(obs=obs)[0]
-        return a_hat
-    
+        obs = self.process_data(obs, extract_action=False)
+        a_hat = self.forward(obs=obs)[0]  # (1, T_A, A)
+        if self.temporal_ensemble:
+            self._action_buffer.append(a_hat[0]) # (T_A, T_A, A)
+            actions_for_curr_step = torch.stack(
+                [self._action_buffer[i][self._horizon - i - 1] for i in range(self._horizon)]
+            )
+            k = 0.01
+            exp_weights = np.exp(-k * np.arange(self._horizon))
+            exp_weights = exp_weights / exp_weights.sum()
+            exp_weights = torch.from_numpy(exp_weights).unsqueeze(dim=1).to(self.device)
+            a_hat = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True).unsqueeze(0) # (1, T_A, A)
+        a_hat = a_hat.cpu()
+        return self._denormalize_action(a_hat)
+
     def reset(self) -> None:
-        pass
+        if self.temporal_ensemble:
+            self._action_buffer = deque(maxlen=self._horizon)
+            for _ in range(self._horizon):
+                self._action_buffer.append(torch.zeros((self._horizon, self.action_dim), dtype=torch.float32).to(self.device))
     
     def policy_training_step(self, batch, batch_idx) -> Any:
         batch["actions"] = any_concat(
@@ -212,8 +228,8 @@ class ACT(BasePolicy):
             -1, gt_actions.shape[-2], gt_actions.shape[-1]
         )  # (B * obs_window_size, L_pred_horizon, A)
 
-        loss_dict = self.policy._compute_loss(
-            obs=obs,
+        loss_dict = self._compute_loss(
+            obs=batch,
             actions=gt_actions,
             is_pad=pad_mask,
         )

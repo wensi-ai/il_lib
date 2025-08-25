@@ -1,10 +1,9 @@
-import os
 import torch
 import torch.nn as nn
 from einops import rearrange
 from functools import partial
 from il_lib.utils.array_tensor_utils import any_concat
-from il_lib.utils.training_utils import load_torch, load_state_dict
+from il_lib.utils.training_utils import load_state_dict
 from il_lib.nn.features.resnet import resnet18
 from il_lib.optim import default_optimizer_groups
 from torchvision import transforms
@@ -23,11 +22,11 @@ class MultiviewResNet18(nn.Module):
         include_depth: bool = False,
         enable_random_crop: bool = True,
         random_crop_size: Optional[Union[int, List[int]]] = None,
-        fuse_views: bool = True
+        return_last_spatial_map: bool = False
     ):
         super().__init__()
         self._views = views
-        self._resnet = resnet18(output_dim=resnet_output_dim)
+        self._resnet = resnet18(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
         if load_pretrained:
             ckpt = torch.hub.load_state_dict_from_url(url=ResNet18_Weights.DEFAULT.url, map_location="cpu")
             del ckpt["fc.weight"]
@@ -40,9 +39,9 @@ class MultiviewResNet18(nn.Module):
                 rgbd_conv1.weight.data[:, :3, :, :] = self._resnet.conv1.weight.data
                 rgbd_conv1.weight.data[:, 3, :, :] = 0.0
                 self._resnet.conv1 = rgbd_conv1
-        self.fuse_views = fuse_views
-        if fuse_views:
-            assert token_dim is not None, "token_dim must be specified when fuse_views is True"
+        self.return_last_spatial_map = return_last_spatial_map
+        if not return_last_spatial_map:
+            assert token_dim is not None, "token_dim must be specified when return_last_spatial_map is False!"
             self._output_fc = nn.Linear(len(views) * resnet_output_dim, token_dim)
             self.output_dim = token_dim
 
@@ -80,8 +79,8 @@ class MultiviewResNet18(nn.Module):
         }
         resnet_output = {
             k: self._resnet(v) for k, v in x.items()
-        }  # dict of (B * L, resnet_output_dim)
-        if not self.fuse_views:
+        }  # dict of (B * L, **resnet_output_dim)
+        if self.return_last_spatial_map:
             return resnet_output
         else:
             multiview_output = any_concat(

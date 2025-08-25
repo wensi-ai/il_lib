@@ -5,8 +5,9 @@ arch_name: act
 # ====== Policy specific ======
 num_latest_obs: 1
 horizon: 20
-deployed_action_steps: 1
+deployed_action_steps: 1  # Note: change to ${horizon} if not using temporal ensemble
 wd: 0.1
+bs: 128
 
 # ------ module ------
 module:
@@ -25,6 +26,7 @@ module:
     - eef/right_quat
   action_dim: 23
   action_keys: ${robot.action_keys}
+  features: [proprioception, rgbd]
   obs_backbone:
     _target_: il_lib.nn.features.MultiviewResNet18
     views: 
@@ -33,15 +35,15 @@ module:
     - robot_r1::robot_r1:zed_link:Camera:0
     resnet_output_dim: 512
     load_pretrained: true
-    include_depth: false
+    include_depth: true
     enable_random_crop: true
     random_crop_size: 224
-    fuse_views: false
+    return_last_spatial_map: true
   pos_encoding:
-    positional_embedding: sine
+    position_embedding: sine
     hidden_dim: ${module.hidden_dim}
   # policy
-  num_queries: 100
+  num_queries: ${horizon}
   hidden_dim: 512
   dropout: 0.1
   n_heads: 8
@@ -50,7 +52,8 @@ module:
   num_decoder_layers: 7
   pre_norm: false
   kl_weight: 10
+  temporal_ensemble: true
 
 data:
   use_action_chunks: false
-  visual_obs_types: [rgb]
+  visual_obs_types: [rgb, depth_linear]

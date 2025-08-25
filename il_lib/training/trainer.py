@@ -15,7 +15,6 @@ from pytorch_lightning.utilities import rank_zero_only
 from pytorch_lightning.utilities.rank_zero import rank_zero_debug as rank_zero_debug_pl
 from pytorch_lightning.utilities.rank_zero import rank_zero_info as rank_zero_info_pl
 from pytorch_lightning.callbacks import ModelCheckpoint
-from tqdm.auto import tqdm
 
 
 __all__ = [
