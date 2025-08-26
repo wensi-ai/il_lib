@@ -25,7 +25,6 @@ vbs: ${bs}
 data_dir: ???
 eval_interval: 15
 online_eval: null
-policy_wrapper: null
 
 horizon: ???
 num_latest_obs: ???
@@ -114,6 +113,17 @@ trainer:
     - _target_: il_lib.training.trainer.CustomProgressBar
       refresh_rate: ${progress_bar_refresh_rate}
 
+# ====== Policy Wrapper ======
+policy_wrapper:
+  _target_: il_lib.policies.policy_base.PolicyWrapper
+  deployed_action_steps: ${deployed_action_steps}
+  obs_window_size: ${num_latest_obs}
+  multi_view_cameras: ${robot.multi_view_cameras}
+  visual_obs_types: ${data.visual_obs_types}
+  use_task_info: ${data.use_task_info}
+  task_info_range: ${task.task_info_range}
+  pcd_range: ${task.pcd_range}
+  robot_type: ${robot.type}
 
 # ====== Resume training ======
 resume:

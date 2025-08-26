@@ -76,8 +76,8 @@ module:
     # beta_schedule is important
     # this is the best we found
     beta_schedule: squaredcos_cap_v2
-    clip_sample: True
-    set_alpha_to_one: True
+    clip_sample: true
+    set_alpha_to_one: true
     steps_offset: 0
     prediction_type: epsilon # or sample
   noise_scheduler_step_kwargs: null

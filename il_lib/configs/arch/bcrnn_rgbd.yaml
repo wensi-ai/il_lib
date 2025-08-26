@@ -7,13 +7,12 @@ horizon: 5
 num_latest_obs: ${horizon}
 deployed_action_steps: 1  # always deploy 1 action at a time
 
+policy_wrapper:
+  obs_window_size: 1  # At run time, we only use the latest observation
+
 # ------ module ------
 module:
   _target_: il_lib.policies.BC_RNN
-  eval:
-    cfg:
-      model:
-        obs_window_size: 1  # At run time, we only use the latest observation
   prop_dim: 37
   prop_keys: 
     - odom/base_velocity
@@ -60,6 +59,7 @@ module:
   rnn_horizon: ${horizon}
   # ====== Action ======
   action_dim: 23
+  action_keys: ${robot.action_keys}
   action_net_gmm_n_modes: 5
   action_net_hidden_dim: 128
   action_net_hidden_depth: 3

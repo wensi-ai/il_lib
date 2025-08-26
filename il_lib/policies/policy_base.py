@@ -219,7 +219,7 @@ class PolicyWrapper:
         # ====== policy model ======
         deployed_action_steps: int,
         obs_window_size: int = 1,
-        obs_output_size: Dict[str, List[int]],
+        multi_view_cameras: Dict[str, Any],
         visual_obs_types: List[str],
         use_task_info: bool = False,
         task_info_range: Optional[ListConfig] = None,
@@ -251,7 +251,7 @@ class PolicyWrapper:
         # action steps for deployed policy
         self.deployed_action_steps = deployed_action_steps
         self.obs_window_size = obs_window_size
-        self.obs_output_size = {k: tuple(v) for k, v in obs_output_size.items()}
+        self.obs_output_size = {k: tuple(v["resolution"]) for k, v in multi_view_cameras.items()}
         self._obs_history = deque(maxlen=obs_window_size)
         self._action_traj_pred = None
         self._action_idx = 0
