@@ -1,16 +1,16 @@
 #!/bin/bash
-#SBATCH --job-name="train_policy"
+#SBATCH --job-name="train_behavior"
 #SBATCH --account=viscam
 #SBATCH --partition=svl,viscam
 #SBATCH --exclude=svl13,svl12
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:titanrtx:4
-#SBATCH --ntasks-per-node=4
-#SBATCH --mem=300G
+#SBATCH --gres=gpu:a5000:2
+#SBATCH --ntasks-per-node=2
+#SBATCH --mem=128G
 #SBATCH --cpus-per-task=14
 #SBATCH --time=2-00:00:00
-#SBATCH --output=outputs/sc/train_policy_%j.out
-#SBATCH --error=outputs/sc/train_policy_%j.err
+#SBATCH --output=outputs/sc/train_behavior_%j.out
+#SBATCH --error=outputs/sc/train_behavior_%j.err
 # notifications for job done & fail
 ##SBATCH --mail-type=END,FAIL
 ##SBATCH --mail-user=wsai@stanford.edu
@@ -27,7 +27,7 @@ source /vision/u/wsai/miniconda3/bin/activate behavior
 
 # slurm ready for OmniGibson
 /vision/u/$(whoami)/BEHAVIOR-1K/OmniGibson/scripts/slurm_ready.sh
-HYDRA_FULL_ERROR=1 srun python train.py data_dir=/vision/u/wsai/data/behavior hydra.searchpath=[file:///vision/u/wsai/BEHAVIOR-1K/OmniGibson/omnigibson/learning/configs] gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES "$@"
+srun python train.py data_dir=/vision/u/wsai/data/behavior robot=r1pro gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES "$@"
 
 echo "Job finished."
 exit 0
