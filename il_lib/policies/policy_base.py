@@ -17,7 +17,12 @@ from omnigibson.learning.utils.eval_utils import (
     CAMERA_INTRINSICS,
     EEF_POSITION_RANGE,
 )
-from omnigibson.learning.utils.obs_utils import create_video_writer, process_fused_point_cloud
+from omnigibson.learning.utils.obs_utils import (
+    create_video_writer, 
+    process_fused_point_cloud,
+    MIN_DEPTH,
+    MAX_DEPTH,
+)
 from omnigibson.macros import gm
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities.types import OptimizerLRScheduler
@@ -356,8 +361,9 @@ class PolicyWrapper:
                     self.obs_output_size[camera_id],
                     mode="nearest-exact",
                 )
+                # clamp depth to [MIN_DEPTH, MAX_DEPTH]
+                depth_obs = torch.clamp(depth_obs, MIN_DEPTH, MAX_DEPTH)
                 if "pcd" in self.visual_obs_types:
-                    # move depth_linear dim back
                     pcd_obs[f"{camera}::depth_linear"] = depth_obs.to(self.policy.device)
                 else:
                     processed_obs[f"{camera}::depth_linear"] = self._post_processing_fn(depth_obs)
