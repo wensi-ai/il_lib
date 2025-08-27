@@ -89,7 +89,6 @@ class ACT(BasePolicy):
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.input_proj = nn.Conv2d(obs_backbone.resnet_output_dim, hidden_dim, kernel_size=1)
         self.input_proj_robot_state = nn.Linear(prop_dim, hidden_dim)
-        self.pos = torch.nn.Embedding(2, hidden_dim)
         # encoder extra parameters
         self.latent_dim = 32 # final size of latent z
         self.cls_embed = nn.Embedding(1, hidden_dim) # extra cls token embedding
