@@ -96,8 +96,10 @@ class ACT(BasePolicy):
         self.encoder_prop_proj = nn.Linear(prop_dim, hidden_dim) # project prop to embedding
         self.latent_proj = nn.Linear(hidden_dim, self.latent_dim * 2)  # project hidden state to latent std, var
         self.register_buffer('pos_table', self._get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], qpos, a_seq
+        # decoder extra parameters
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
+        # ====== temporal ensemble ======
         self.temporal_ensemble = temporal_ensemble
         if temporal_ensemble:
             self._horizon = num_queries
@@ -106,7 +108,6 @@ class ACT(BasePolicy):
                 self._action_buffer.append(torch.zeros((self._horizon, self.action_dim), dtype=torch.float32).to(self.device))
         # ====== learning ======
         self.kl_weight = kl_weight
-
         self.lr = lr
         self.use_cosine_lr = use_cosine_lr
         self.lr_warmup_steps = lr_warmup_steps
@@ -114,8 +115,6 @@ class ACT(BasePolicy):
         self.lr_cosine_min = lr_cosine_min
         self.lr_layer_decay = lr_layer_decay
         self.weight_decay = weight_decay
-
-        self._obs_statistics = None
         # Save hyperparameters
         self.save_hyperparameters()
 
