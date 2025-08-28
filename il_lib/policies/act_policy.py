@@ -10,7 +10,7 @@ from il_lib.nn.transformers import (
     Transformer, TransformerEncoderLayer, TransformerEncoder
 )
 from il_lib.policies.policy_base import BasePolicy
-from il_lib.utils.array_tensor_utils import any_concat, get_batch_size, any_slice
+from il_lib.utils.array_tensor_utils import any_concat, get_batch_size
 from omegaconf import DictConfig
 from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
 from torch.autograd import Variable
@@ -194,8 +194,10 @@ class ACT(BasePolicy):
             actions_for_curr_step = torch.stack(
                 [self._action_buffer[i][self._horizon - i - 1] for i in range(self._horizon)]
             )
+            actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
+            actions_for_curr_step = actions_for_curr_step[actions_populated]
             k = 0.01
-            exp_weights = np.exp(-k * np.arange(self._horizon))
+            exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
             exp_weights = exp_weights / exp_weights.sum()
             exp_weights = torch.from_numpy(exp_weights).unsqueeze(dim=1).to(self.device)
             a_hat = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True).unsqueeze(0) # (1, T_A, A)
