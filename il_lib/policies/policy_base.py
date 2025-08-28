@@ -54,7 +54,7 @@ class BasePolicy(LightningModule, ABC):
             assert self.policy_wrapper_config is not None, "policy_wrapper config must be provided for online evaluation!"
             OmegaConf.resolve(self.policy_wrapper_config)
         else:
-            logger.warning("No evaluation config provided, online evaluation will not be performed during testing.")
+            logger.info("No evaluation config provided, online evaluation will not be performed during training.")
         self.evaluator = None
         self.test_id = 0
         self.robot_type = robot_type

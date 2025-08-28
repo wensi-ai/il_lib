@@ -13,7 +13,7 @@ def main(cfg):
     OmegaConf.set_struct(cfg, False)
     policy = instantiate(cfg.module, _recursive_=False)
     ckpt = load_torch(
-        "/home/svl/Documents/Files/behavior/ckpt/wbvima_radio/last_2.pth",
+        "/home/svl/Downloads/last.pth",
         # "/home/svl/Research/il_lib/outputs/2025-08-01/20-54-51/diffusion_rgb_unet_PickPlaceTask_20250801-205451/ckpt/last.pth",
         map_location="cpu",
     )
