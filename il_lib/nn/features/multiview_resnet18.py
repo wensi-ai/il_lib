@@ -18,6 +18,7 @@ class MultiviewResNet18(nn.Module):
         *,
         resnet_output_dim: int,
         token_dim: Optional[int] = None,
+        use_shared_backbone: bool = True,
         load_pretrained: bool = True,
         include_depth: bool = False,
         enable_random_crop: bool = True,
@@ -26,19 +27,28 @@ class MultiviewResNet18(nn.Module):
     ):
         super().__init__()
         self._views = views
-        self._resnet = resnet18(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
+        self._use_shared_backbone = use_shared_backbone
+        if use_shared_backbone:
+            self._resnet = resnet18(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
+        else:
+            self._resnet = nn.ModuleDict({
+                view: resnet18(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
+                for view in views
+            })
         if load_pretrained:
             ckpt = torch.hub.load_state_dict_from_url(url=ResNet18_Weights.DEFAULT.url, map_location="cpu")
             del ckpt["fc.weight"]
             del ckpt["fc.bias"]
-            load_state_dict(self._resnet, ckpt, strict=False)
-            if include_depth:
-                rgbd_conv1 = nn.Conv2d(
-                    4, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
-                )
-                rgbd_conv1.weight.data[:, :3, :, :] = self._resnet.conv1.weight.data
-                rgbd_conv1.weight.data[:, 3, :, :] = 0.0
-                self._resnet.conv1 = rgbd_conv1
+            resnet_to_load = [self._resnet] if use_shared_backbone else list(self._resnet.values())
+            for resnet in resnet_to_load:
+                load_state_dict(resnet, ckpt, strict=False)
+                if include_depth:
+                    rgbd_conv1 = nn.Conv2d(
+                        4, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+                    )
+                    rgbd_conv1.weight.data[:, :3, :, :] = resnet.conv1.weight.data
+                    rgbd_conv1.weight.data[:, 3, :, :] = 0.0
+                    resnet.conv1 = rgbd_conv1
         self.return_last_spatial_map = return_last_spatial_map
         if not return_last_spatial_map:
             assert token_dim is not None, "token_dim must be specified when return_last_spatial_map is False!"
@@ -77,9 +87,14 @@ class MultiviewResNet18(nn.Module):
             k: self._train_transforms(v) if self.training else self._eval_transforms(v)
             for k, v in x.items()
         }
-        resnet_output = {
-            k: self._resnet(v) for k, v in x.items()
-        }  # dict of (B * L, **resnet_output_dim)
+        if self._use_shared_backbone:
+            resnet_output = {
+                k: self._resnet(v) for k, v in x.items()
+            }  # dict of (B * L, **resnet_output_dim)
+        else:
+            resnet_output = {
+                k: self._resnet[k](v) for k, v in x.items()
+            }  # dict of (B * L, **resnet_output_dim)
         if self.return_last_spatial_map:
             return resnet_output
         else:

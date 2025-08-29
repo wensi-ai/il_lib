@@ -39,6 +39,7 @@ module:
       - robot_r1::robot_r1:zed_link:Camera:0
       resnet_output_dim: 512
       token_dim: 512
+      use_shared_backbone: true
       load_pretrained: true
       enable_random_crop: true
       random_crop_size: 224

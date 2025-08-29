@@ -13,6 +13,7 @@ online_eval:
       type: il
       control_type: joint
       robot_type: ${robot.type}
+      use_websocket: false
     env: ${env}
     task: ${task}
     hdf_path: ???

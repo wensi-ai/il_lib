@@ -34,6 +34,7 @@ module:
     - robot_r1::robot_r1:right_realsense_link:Camera:0
     - robot_r1::robot_r1:zed_link:Camera:0
     resnet_output_dim: 512
+    use_shared_backbone: true
     load_pretrained: true
     include_depth: true
     enable_random_crop: true
