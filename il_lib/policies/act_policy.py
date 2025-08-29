@@ -180,7 +180,7 @@ class ACT(BasePolicy):
         # fold camera dimension into width dimension
         src = torch.cat(all_cam_features, axis=3)
         pos = torch.cat(all_cam_pos, axis=3)
-        hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+        hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[-1]
         a_hat = self.action_head(hs)
         return a_hat, [mu, logvar]
 
@@ -212,21 +212,17 @@ class ACT(BasePolicy):
     def policy_training_step(self, batch, batch_idx) -> Any:
         batch["actions"] = any_concat(
             [batch["actions"][k] for k in self._action_keys], dim=-1
-        )  # (B, ctx_len, A)
+        )  # (B, T, A)
         B = batch["actions"].shape[0]
         batch = self.process_data(batch, extract_action=True)
 
         # get padding mask
-        pad_mask = batch.pop("masks")  # (B, obs_window_size, L_pred_horizon)
-        pad_mask = pad_mask.reshape(-1, pad_mask.shape[-1])  # (B * obs_window_size, L_pred_horizon)
+        pad_mask = batch.pop("masks")  # (B, T)
+        pad_mask = pad_mask.reshape(-1, pad_mask.shape[-1])  # (B * T)
         # ACT assumes true for padding, false for not padding
         pad_mask = ~pad_mask
 
-        gt_actions = batch.pop("actions")  # already normalized in [-1, 1], (B, T, L_pred_horizon, A)
-        # flatten first two dims
-        gt_actions = gt_actions.reshape(
-            -1, gt_actions.shape[-2], gt_actions.shape[-1]
-        )  # (B * obs_window_size, L_pred_horizon, A)
+        gt_actions = batch.pop("actions")  # already normalized in [-1, 1], (B, T, A)
 
         loss_dict = self._compute_loss(
             obs=batch,
