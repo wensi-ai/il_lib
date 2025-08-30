@@ -59,6 +59,7 @@ class ACT(BasePolicy):
         self._action_keys = action_keys 
         self.action_dim = action_dim
         self._features = features
+        self._use_depth = obs_backbone.include_depth
         self.obs_backbone = instantiate(obs_backbone)
 
         self.transformer = Transformer(
@@ -170,7 +171,8 @@ class ACT(BasePolicy):
         latent_input = self.latent_out_proj(latent_sample)
         all_cam_features = []
         all_cam_pos = []
-        resnet_output = self.obs_backbone(obs["rgbd"])  # dict of (B, C, H, W)
+        vs = obs["rgbd"] if self._use_depth else obs["rgb"]
+        resnet_output = self.obs_backbone(vs)  # dict of (B, C, H, W)
         for features in resnet_output.values():
             pos = self.position_embedding(features)
             all_cam_features.append(self.input_proj(features))
