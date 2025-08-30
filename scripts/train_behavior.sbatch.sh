@@ -25,8 +25,6 @@ echo "working directory="$SLURM_SUBMIT_DIR
 
 source /vision/u/wsai/miniconda3/bin/activate behavior
 
-# slurm ready for OmniGibson
-/vision/u/$(whoami)/BEHAVIOR-1K/OmniGibson/scripts/slurm_ready.sh
 srun python train.py data_dir=/vision/u/wsai/data/behavior robot=r1pro gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES "$@"
 
 echo "Job finished."
