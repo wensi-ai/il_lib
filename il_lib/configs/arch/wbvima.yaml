@@ -2,12 +2,6 @@
 
 arch_name: wbvima
 
-# ====== Eval Config ======
-eval:
-  _target_: omnigibson.learning.policies.WBVIMA.load
-  ckpt_path: null  
-  stict: False
-
 # ====== Policy specific ======
 horizon: 2
 num_latest_obs: 2
@@ -94,4 +88,3 @@ data:
   visual_obs_types: [pcd]
   action_prediction_horizon: ${deployed_action_steps}
   use_task_info: true
-  use_gt_pcd: false

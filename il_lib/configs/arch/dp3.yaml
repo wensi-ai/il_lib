@@ -90,4 +90,3 @@ data:
   use_action_chunks: false
   visual_obs_types: [pcd]
   use_task_info: true
-  use_gt_pcd: false
