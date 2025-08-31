@@ -389,7 +389,6 @@ class PolicyWrapper:
                 )[0]
             )
         if self._use_task_info:
-            processed_obs["task"] = dict()
             for key in obs:
                 if key.startswith("task::"):
                     if self._task_info_range is not None:
