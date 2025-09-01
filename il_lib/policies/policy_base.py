@@ -143,9 +143,6 @@ class BasePolicy(LightningModule, ABC):
                     self.evaluator = self.create_evaluator()
                 if not self.trainer.sanity_checking:
                     self.log_dict(self.run_online_evaluation())
-        # Synchronize all processes to prevent timeout
-        if dist.is_initialized():
-            dist.barrier()
 
     def create_evaluator(self):
         """

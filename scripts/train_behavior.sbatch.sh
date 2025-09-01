@@ -2,12 +2,12 @@
 #SBATCH --job-name="train_behavior"
 #SBATCH --account=viscam
 #SBATCH --partition=svl,viscam
-#SBATCH --exclude=svl13,svl12
-#SBATCH --nodes=1
-#SBATCH --gres=gpu:a5000:2
-#SBATCH --ntasks-per-node=2
-#SBATCH --mem=128G
-#SBATCH --cpus-per-task=14
+#SBATCH --exclude=svl12,svl13
+#SBATCH --nodes=2
+#SBATCH --gres=gpu:titanrtx:8
+#SBATCH --ntasks-per-node=8
+#SBATCH --mem=490G
+#SBATCH --cpus-per-task=8
 #SBATCH --time=2-00:00:00
 #SBATCH --output=outputs/sc/train_behavior_%j.out
 #SBATCH --error=outputs/sc/train_behavior_%j.err
@@ -25,7 +25,7 @@ echo "working directory="$SLURM_SUBMIT_DIR
 
 source /vision/u/wsai/miniconda3/bin/activate behavior
 
-srun python train.py data_dir=/vision/u/wsai/data/behavior robot=r1pro gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES "$@"
+HYDRA_FULL_ERROR=1 srun python train.py data_dir=/vision/group/behavior robot=r1pro task=behavior +eval=behavior gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES "$@"
 
 echo "Job finished."
 exit 0

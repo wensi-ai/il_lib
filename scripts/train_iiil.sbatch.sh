@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:titanrtx:4
 #SBATCH --ntasks-per-node=4
 #SBATCH --mem=250G
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=8
 #SBATCH --time=2-00:00:00
 #SBATCH --output=outputs/sc/train_iiil_%j.out
 #SBATCH --error=outputs/sc/train_iiil_%j.err
@@ -25,7 +25,7 @@ echo "working directory="$SLURM_SUBMIT_DIR
 
 source /vision/u/wsai/miniconda3/bin/activate behavior
 
-srun python train.py data_dir=/vision/u/wsai/data/iiil gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES "$@"
+srun python train.py data_dir=/vision/u/wsai/data/iiil +eval=iiil gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES "$@"
 
 echo "Job finished."
 exit 0
