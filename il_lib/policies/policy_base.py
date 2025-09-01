@@ -6,8 +6,9 @@ import torch.nn.functional as F
 from abc import ABC, abstractmethod
 from collections import deque
 from hydra.utils import instantiate
+from il_lib.utils.array_tensor_utils import any_concat
+from il_lib.utils.convert_utils import any_to_torch
 from omegaconf import DictConfig, ListConfig, OmegaConf
-from omnigibson.learning.utils.array_tensor_utils import any_concat
 from omnigibson.learning.utils.eval_utils import (
     ACTION_QPOS_INDICES,
     PROPRIOCEPTION_INDICES,
@@ -264,6 +265,7 @@ class PolicyWrapper:
         self.joint_range = JOINT_RANGE[self.robot_type]
 
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
+        obs = any_to_torch(obs, device="cpu")
         obs = self.process_obs(obs=obs)
         if len(self._obs_history) == 0:
             for _ in range(self.obs_window_size):

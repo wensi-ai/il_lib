@@ -1,6 +1,8 @@
 import numpy as np
 import os.path
 import torch
+import tree
+from il_lib.utils.array_tensor_utils import make_recursive_func
 from PIL import Image
 from typing import Union
 
@@ -86,6 +88,14 @@ def _convert_then_transfer(x, dtype, device, copy, non_blocking):
 def _transfer_then_convert(x, dtype, device, copy, non_blocking):
     x = x.to(device=device, copy=copy, non_blocking=non_blocking)
     return x.to(dtype=dtype, copy=False, non_blocking=non_blocking)
+
+
+@make_recursive_func
+def any_to_torch(tensor_struct, device: str = "cuda"):
+    """
+    Converts all arrays/tensors in a nested structure to PyTorch tensors.
+    """
+    return tree.map_structure(lambda x: torch.tensor(x, dtype=torch.float32).to(device), tensor_struct)
 
 
 def any_to_torch_tensor(
