@@ -31,19 +31,13 @@ module:
       output_dim: 512
       hidden_depth: 2
       add_output_activation: true
-    rgb:
-      _target_: il_lib.nn.features.MultiviewResNet18
-      views: 
-      - robot_r1::robot_r1:left_realsense_link:Camera:0
-      - robot_r1::robot_r1:right_realsense_link:Camera:0
-      - robot_r1::robot_r1:zed_link:Camera:0
-      resnet_output_dim: 512
-      token_dim: 512
-      use_shared_backbone: true
-      load_pretrained: true
-      enable_random_crop: true
-      random_crop_size: 224
-      return_last_spatial_map: false
+    task:
+      _target_: il_lib.nn.common.MLP
+      input_dim: 46
+      hidden_dim: 512
+      output_dim: 512
+      hidden_depth: 2
+      add_output_activation: true
   # ====== Feature Fusion ======
   feature_fusion_hidden_depth: 2
   feature_fusion_hidden_dim: 512
@@ -92,3 +86,4 @@ module:
 data:
   use_action_chunks: false
   visual_obs_types: [rgb]
+  use_task_info: true

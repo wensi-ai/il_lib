@@ -58,3 +58,4 @@ module:
 data:
   use_action_chunks: false
   visual_obs_types: [rgb, depth_linear]
+  use_task_info: false
