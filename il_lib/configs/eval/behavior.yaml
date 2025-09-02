@@ -5,7 +5,8 @@ online_eval:
   cfg:
     write_video: true
     headless: ${headless}
-    env_type: sim
+    env_wrapper: 
+      _target_: omnigibson.envs.EnvironmentWrapper
     task: ${task}
     robot: ${robot}
     use_task_info: ${data.use_task_info}
