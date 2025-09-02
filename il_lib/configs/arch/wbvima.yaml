@@ -41,6 +41,13 @@ module:
       output_dim: ${module.xf_n_embd}
       hidden_dim: 256
       hidden_depth: 2
+    task:
+      _target_: il_lib.nn.common.MLP
+      input_dim: 46
+      hidden_dim: 256
+      output_dim: 256
+      hidden_depth: 2
+      add_output_activation: true
   use_modality_type_tokens: false
   # ====== Transformer ======
   xf_n_embd: 256
@@ -80,4 +87,4 @@ data:
   use_action_chunks: true
   visual_obs_types: [pcd]
   action_prediction_horizon: ${deployed_action_steps}
-  use_task_info: false
+  use_task_info: true
