@@ -31,13 +31,13 @@ module:
       output_dim: 512
       hidden_depth: 2
       add_output_activation: true
-
     rgbd:
       _target_: il_lib.nn.features.MultiviewResNet18
+      backbone: resnet18_gn
       views: 
-      - robot_r1::robot_r1:left_realsense_link:Camera:0
-      - robot_r1::robot_r1:right_realsense_link:Camera:0
-      - robot_r1::robot_r1:zed_link:Camera:0
+        - robot_r1::robot_r1:left_realsense_link:Camera:0
+        - robot_r1::robot_r1:right_realsense_link:Camera:0
+        - robot_r1::robot_r1:zed_link:Camera:0
       resnet_output_dim: 512
       token_dim: 512
       use_shared_backbone: true

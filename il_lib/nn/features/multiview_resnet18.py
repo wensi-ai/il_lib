@@ -2,18 +2,19 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from functools import partial
+from hydra.utils import instantiate
 from il_lib.utils.array_tensor_utils import any_concat
 from il_lib.utils.training_utils import load_state_dict
-from il_lib.nn.features.resnet import resnet18
 from il_lib.optim import default_optimizer_groups
+import il_lib.nn.features.resnet as resnet_lib
 from torchvision import transforms
 from torchvision.models import ResNet18_Weights
 from typing import List, Optional, Union
 
-
 class MultiviewResNet18(nn.Module):
     def __init__(
         self,
+        backbone: str,
         views: List[str],
         *,
         resnet_output_dim: int,
@@ -29,10 +30,10 @@ class MultiviewResNet18(nn.Module):
         self._views = views
         self._use_shared_backbone = use_shared_backbone
         if use_shared_backbone:
-            self._resnet = resnet18(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
+            self._resnet = getattr(resnet_lib, backbone)(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
         else:
             self._resnet = nn.ModuleDict({
-                view: resnet18(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
+                view: getattr(resnet_lib, backbone)(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
                 for view in views
             })
         if load_pretrained:
