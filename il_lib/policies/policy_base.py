@@ -385,7 +385,7 @@ class PolicyWrapper:
                     pcd_range=self._pcd_range,
                     pcd_num_points=4096,
                     use_fps=True,
-                )[0]
+                )
             )
         if self._use_task_info:
             for key in obs:
