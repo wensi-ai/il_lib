@@ -12,5 +12,6 @@ online_eval:
     task: ${task}
     robot: ${robot}
     policy_name: ${arch_name}
+    max_steps: 1000
     model:
       _target_: omnigibson.learning.policies.LocalPolicy
