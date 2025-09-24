@@ -4,9 +4,11 @@ online_eval:
   _target_: omnigibson.learning.eval.Evaluator
   cfg:
     write_video: true
+    partial_scene_load: false
+    eval_on_train_instances: false
     headless: ${headless}
     env_wrapper: 
-      _target_: omnigibson.envs.EnvironmentWrapper
+      _target_: omnigibson.learning.wrappers.wbvima_wrapper.WBVIMAWrapper
     task: ${task}
     robot: ${robot}
     use_task_info: ${data.use_task_info}
