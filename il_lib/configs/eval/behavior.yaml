@@ -11,8 +11,6 @@ online_eval:
       _target_: omnigibson.learning.wrappers.wbvima_wrapper.WBVIMAWrapper
     task: ${task}
     robot: ${robot}
-    use_task_info: ${data.use_task_info}
     policy_name: ${arch_name}
-    max_steps: 1000
     model:
       _target_: omnigibson.learning.policies.LocalPolicy

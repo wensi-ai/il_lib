@@ -95,7 +95,7 @@ def any_to_torch(tensor_struct, device: str = "cuda"):
     """
     Converts all arrays/tensors in a nested structure to PyTorch tensors.
     """
-    return tree.map_structure(lambda x: torch.tensor(x, dtype=torch.float32).to(device), tensor_struct)
+    return tree.map_structure(lambda x: torch.tensor(x, dtype=torch.float32).to(device) if not isinstance(x, torch.Tensor) else x.to(device), tensor_struct)
 
 
 def any_to_torch_tensor(
