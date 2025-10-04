@@ -3,3 +3,6 @@ outputs
 *.egg-info
 *.ipynb
 .vscode
+# run artifacts
+outputs/
+core
