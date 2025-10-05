@@ -69,4 +69,4 @@ python "${REPLAY_SCRIPT}" \
   --pcd_vid \
   "$@"
 
-echo "[DONE] pcd_gt => ${DATA_DIR}/pcd_gt/task-${TASK_ID}/episode_$(printf "%08d" ${DEMO_ID}).hdf5"
+echo "[DONE] pcd_vid => ${DATA_DIR}/pcd_vid/task-${TASK_ID}/episode_$(printf "%08d" ${DEMO_ID}).hdf5"
