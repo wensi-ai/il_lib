@@ -4,9 +4,9 @@
 #SBATCH --partition=svl
 #SBATCH --exclude=svl12,svl13
 #SBATCH --nodes=2
-#SBATCH --gres=gpu:titanrtx:8
-#SBATCH --ntasks-per-node=8
-#SBATCH --mem=490G
+#SBATCH --gres=gpu:titanrtx:4
+#SBATCH --ntasks-per-node=4
+#SBATCH --mem=240G
 #SBATCH --cpus-per-task=8
 #SBATCH --time=2-00:00:00
 #SBATCH --output=outputs/sc/train_behavior_%j.out
