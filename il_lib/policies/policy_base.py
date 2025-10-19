@@ -229,7 +229,7 @@ class PolicyWrapper:
         visual_obs_types: List[str],
         use_task_info: bool = False,
         task_info_range: Optional[ListConfig] = None,
-        pcd_range: List[float],
+        pcd_range: Optional[List[float]] = None,
         robot_type: str = "R1Pro",
         # ====== other args for base class ======
         **kwargs,
@@ -253,7 +253,7 @@ class PolicyWrapper:
             camera_intrinsics = torch.from_numpy(CAMERA_INTRINSICS[self.robot_type][camera_id]) / scale_factor
             camera_intrinsics[-1, -1] = 1.0  # make it homogeneous
             self.camera_intrinsics[camera_name] = camera_intrinsics
-        self._pcd_range = tuple(pcd_range)
+        self._pcd_range = tuple(pcd_range) if pcd_range is not None else None
         # action steps for deployed policy
         self.deployed_action_steps = deployed_action_steps
         self.obs_window_size = obs_window_size
