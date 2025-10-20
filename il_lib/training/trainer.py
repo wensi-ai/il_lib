@@ -162,9 +162,23 @@ class Trainer:
             callbacks.extend(extra_callbacks)
         rank_zero_print("Lightning callbacks:", [c.__class__.__name__ for c in callbacks])
         return callbacks
+    
+    def create_strategy(self, cfg):
+        # Instantiate strategy if it's a DictConfig
+        if "strategy" in cfg.trainer:
+            if isinstance(cfg.trainer["strategy"], DictConfig):
+                return instantiate(cfg.trainer.pop("strategy"))
+            else:
+                return cfg.trainer.pop("strategy")
+        return None
 
     def create_trainer(self, cfg) -> pl.Trainer:
-        return pl.Trainer(logger=self.create_loggers(cfg), callbacks=self.create_callbacks(cfg), **cfg.trainer)
+        return pl.Trainer(
+            logger=self.create_loggers(cfg),
+            callbacks=self.create_callbacks(cfg),
+            strategy=self.create_strategy(cfg),
+            **cfg.trainer,
+        )
 
     def fit(self):
         return self.trainer.fit(

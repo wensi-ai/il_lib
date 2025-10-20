@@ -83,7 +83,11 @@ trainer:
   devices: ${gpus}
   num_nodes: ${num_nodes}
   precision: 32
-  strategy: ddp
+  strategy: 
+    _target_: pytorch_lightning.strategies.DDPStrategy
+    timeout:
+      _target_: datetime.timedelta
+      seconds: 3600
   benchmark: true  # enables cudnn.benchmark
   accumulate_grad_batches: 1
   num_sanity_val_steps: 1
