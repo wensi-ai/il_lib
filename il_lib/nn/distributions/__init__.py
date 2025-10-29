@@ -1,4 +1,4 @@
-from .distributions import GMMHead, MixtureOfGaussian
+from .distributions import CategoricalNet, GMMHead, MixtureOfGaussian
 
 
-__all__ = ["GMMHead", "MixtureOfGaussian"]
+__all__ = ["CategoricalNet", "GMMHead", "MixtureOfGaussian"]
