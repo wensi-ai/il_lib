@@ -14,48 +14,75 @@
 ##SBATCH --mail-type=END,FAIL
 ##SBATCH --mail-user=wsai@stanford.edu
 
-echo "SLURM_JOBID="$SLURM_JOBID
-echo "SLURM_JOB_NAME="$SLURM_JOB_NAME
-echo "SLURM_JOB_NODELIST"=$SLURM_JOB_NODELIST
-echo "SLURM_NNODES"=$SLURM_NNODES
-echo "SLURM_NTASKS_PER_NODE"=$SLURM_NTASKS_PER_NODE
-echo "working directory="$SLURM_SUBMIT_DIR
+set -euo pipefail
 
-# 1) 激活 conda env
+echo "SLURM_JOBID=${SLURM_JOBID:-}"
+echo "SLURM_JOB_NAME=${SLURM_JOB_NAME:-}"
+echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST:-}"
+echo "SLURM_NNODES=${SLURM_NNODES:-}"
+echo "SLURM_NTASKS_PER_NODE=${SLURM_NTASKS_PER_NODE:-}"
+echo "working directory=${SLURM_SUBMIT_DIR:-$PWD}"
+
+############################
+# 0) 先在提交节点做一次环境准备（避免并发 pip）
+############################
+# 激活 conda env
 source /vision/u/yinhang/miniconda3/bin/activate behavior
 
-# 2) 关闭 Isaac 的 pip 预打包，确保用到你环境里的 fastapi/pydantic
+# 禁用 Isaac 的 pip 预打包，确保使用你 env 里的 fastapi/pydantic
 export KIT_DISABLE_PIP_PREBUNDLE=1
 export OMNI_KIT_DISABLE_PIP_PREBUNDLE=1
 
-# 3) 设定 headless 渲染（GLFW 警告就当噪音，不阻塞）
+# Headless 渲染
 export PYOPENGL_PLATFORM=egl
 export EGL_PLATFORM=surfaceless
 export __GLX_VENDOR_LIBRARY_NAME=nvidia
 
-# 4) DDP/NCCL 出错时尽快报错（别卡 30min）
+# NCCL 稳定性
 export TORCH_NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_DEBUG=INFO
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 
-# 5) 统一 FastAPI / Pydantic 到互相兼容的版本（路线A：Pydantic v2）
+# 统一 FastAPI / Pydantic / Starlette 到兼容版本（Pydantic v2 路线）
 python - <<'PY'
 import sys, subprocess
 def pipi(*args): subprocess.check_call([sys.executable,"-m","pip","install","--upgrade","--no-cache-dir",*args])
 pipi("fastapi>=0.110,<1.0", "pydantic>=2.4,<3", "starlette>=0.36,<1.0")
-print("Pinned:", __import__("fastapi").__version__, __import__("pydantic").__version__)
+import fastapi, pydantic, starlette
+print("[VERIFY] fastapi:", fastapi.__version__, fastapi.__file__)
+print("[VERIFY] pydantic:", pydantic.__version__, pydantic.__file__)
+print("[VERIFY] starlette:", starlette.__version__, starlette.__file__)
 PY
 
-# 6) 运行。关键：关闭 sanity-check 避免在 sanity 阶段就起 evaluator（会触发 Isaac 启动）
+############################
+# 1) 用 srun 在每个任务上启动训练
+############################
 HYDRA_FULL_ERROR=1 \
-srun python train.py \
-  data_dir=/vision/group/behavior \
-  robot=r1pro task=behavior task.name=make_microwave_popcorn \
-  arch=wbvima +eval=behavior \
-  headless=true \
-  gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES bs=32 \
-  trainer.num_sanity_val_steps=0 \
-  "$@"
+srun --export=ALL bash -lc '
+  set -euo pipefail
+  source /vision/u/yinhang/miniconda3/bin/activate behavior
+
+  export KIT_DISABLE_PIP_PREBUNDLE=1
+  export OMNI_KIT_DISABLE_PIP_PREBUNDLE=1
+  export PYOPENGL_PLATFORM=egl
+  export EGL_PLATFORM=surfaceless
+  export __GLX_VENDOR_LIBRARY_NAME=nvidia
+  export TORCH_NCCL_BLOCKING_WAIT=1
+  export NCCL_ASYNC_ERROR_HANDLING=1
+  export NCCL_DEBUG=INFO
+  export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+
+  echo "[Node $(hostname)] launching train.py ..."
+  exec python train.py \
+    data_dir=/vision/group/behavior \
+    robot=r1pro task=behavior task.name=make_microwave_popcorn \
+    arch=wbvima +eval=behavior \
+    headless=true \
+    gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES bs=32 \
+    trainer.num_sanity_val_steps=0 \
+    '"$@"'
+'
 
 echo "Job finished."
 exit 0
