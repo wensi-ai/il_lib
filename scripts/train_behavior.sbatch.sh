@@ -42,7 +42,6 @@ export NCCL_DEBUG=INFO
 python - <<'PY'
 import sys, subprocess
 def pipi(*args): subprocess.check_call([sys.executable,"-m","pip","install","--upgrade","--no-cache-dir",*args])
-# 兼容组合：FastAPI>=0.110,<1.0 + Pydantic>=2.4,<3 + Starlette>=0.36
 pipi("fastapi>=0.110,<1.0", "pydantic>=2.4,<3", "starlette>=0.36,<1.0")
 print("Pinned:", __import__("fastapi").__version__, __import__("pydantic").__version__)
 PY
