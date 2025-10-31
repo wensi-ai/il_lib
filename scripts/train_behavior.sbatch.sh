@@ -33,51 +33,40 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_DEBUG=INFO
 
-# ========== W&B 基础 ==========
+# ========== W&B 变量（不写你的 ~/.netrc）==========
 export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.wandb.ai}"
 export WANDB_MODE=online
-export WANDB_NO_NETRC_WRITES=1  # 不改你的 ~/.netrc
-# 可选：固定 entity / project（无需要可注释掉）
+export WANDB_NO_NETRC=1
+export WANDB_NO_NETRC_WRITES=1
+export WANDB_NETRC_PATH=/dev/null
+export WANDB_CONFIG_DIR="$PWD/.wandb_cfg_${SLURM_JOB_ID}"
+mkdir -p "$WANDB_CONFIG_DIR"
+
+# 可选：固定 entity / project（不需要可注释）
 # export WANDB_ENTITY="tonyliu12345"
 # export WANDB_PROJECT="behavior-il"
 
-# 优先用环境变量，其次从 ~/.netrc 读
+# 必须有 API KEY
 if [[ -z "${WANDB_API_KEY:-}" ]]; then
-  WANDB_API_KEY="$(python - <<'PY'
-import os,re
-p=os.path.expanduser("~/.netrc")
-try:
-    t=open(p).read()
-    m=re.search(r'machine\s+api\.wandb\.ai\s+login\s+\S+\s+password\s+(\S+)',t,re.I|re.M)
-    print(m.group(1) if m else "", end="")
-except FileNotFoundError:
-    pass
-PY
-)"
-fi
-if [[ -z "${WANDB_API_KEY:-}" ]]; then
-  echo "[W&B] ERROR: 没有拿到 API Key（环境变量和 ~/.netrc 都空）。"
-  exit 1
+  echo "[W&B] ERROR: WANDB_API_KEY 为空（请在提交端 export 再 sbatch）"; exit 1
 fi
 
-# 明确打印前4后6位（不中间加 xxxx，那串星号只是遮位长度）
+# 打印 key 前4后6位
 _key_fmt="$(python - <<'PY'
 import os
-k=os.environ.get("WANDB_API_KEY","")
+k=os.environ.get("WANDB_API_KEY","").strip()
 print(k[:4] + ("*"*max(len(k)-10,0)) + k[-6:])
 PY
 )"
 echo "[W&B] Using WANDB_API_KEY=${_key_fmt}"
+echo "[W&B] BASE_URL=${WANDB_BASE_URL}"
 
 export WANDB_DIR="$PWD/wandb_${SLURM_JOB_ID}"
 mkdir -p "$WANDB_DIR"
 echo "[W&B] WANDB_DIR=${WANDB_DIR}"
-echo "[W&B] BASE_URL=${WANDB_BASE_URL}"
 
-# 主节点升级 wandb（子节点也会再升级一次，保证版本一致）
-python -m pip install --upgrade --no-cache-dir wandb >/dev/null
-
-# 依赖版本钉住
+# 依赖版本
+python -m pip install --upgrade --no-cache-dir wandb requests >/dev/null
 python - <<'PY'
 import sys,subprocess
 def pipi(*a): subprocess.check_call([sys.executable,"-m","pip","install","--upgrade","--no-cache-dir",*a])
@@ -86,52 +75,79 @@ import fastapi,pydantic,starlette
 print(f"[VERIFY] fastapi={fastapi.__version__}  pydantic={pydantic.__version__}  starlette={starlette.__version__}")
 PY
 
-# ========== 在每个 rank 本地强制登录 + 验身 ==========
+# ========== 每个 rank：网络连通 + 原生 HTTP 验证 token ==========
 HYDRA_FULL_ERROR=1 \
 srun --export=ALL bash -lc '
   set -euo pipefail
   source /vision/u/yinhang/miniconda3/bin/activate behavior
+  python -m pip install --upgrade --no-cache-dir wandb requests >/dev/null
 
-  export KIT_DISABLE_PIP_PREBUNDLE=1
-  export OMNI_KIT_DISABLE_PIP_PREBUNDLE=1
-  export PYOPENGL_PLATFORM=egl
-  export EGL_PLATFORM=surfaceless
-  export __GLX_VENDOR_LIBRARY_NAME=nvidia
-  export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
-  export TORCH_NCCL_BLOCKING_WAIT=1
-  export NCCL_ASYNC_ERROR_HANDLING=1
-  export NCCL_DEBUG=INFO
+  _host="${WANDB_BASE_URL:-https://api.wandb.ai}"
+  _key="${WANDB_API_KEY:-}"
 
-  # 子进程也升级一次 wandb，避免版本不一致
-  python -m pip install --upgrade --no-cache-dir wandb >/dev/null
-
-  # 打印 key 片段，确保每个 rank 都拿到同一个 key
+  # 打印 key 片段
   _key_fmt=$(python - <<'"PY"'
 import os
-k=os.environ.get("WANDB_API_KEY","")
+k=os.environ.get("WANDB_API_KEY","").strip()
 print(k[:4] + ("*"*max(len(k)-10,0)) + k[-6:])
 PY
 )
-  echo "[W&B][child $(hostname)] API_KEY=${_key_fmt}; MODE=${WANDB_MODE:-}; DIR=${WANDB_DIR:-}"
+  echo "[W&B][child $(hostname)] KEY=${_key_fmt} HOST=${_host} DIR=${WANDB_DIR:-}"
 
-  # **关键**：用 SDK 在本机内强制登录 + 获取 viewer，失败就立刻退出
-  python - <<'"PY"'
-import os, sys
-import wandb
-from wandb.apis.public import Api
-key=os.environ.get("WANDB_API_KEY","").strip()
-if not key:
-    print("[W&B][child] ERROR: WANDB_API_KEY missing"); sys.exit(2)
-ok=wandb.login(key=key, relogin=True)
-print("[W&B][child] wandb.login ->", ok)
+  # 1) 基础连通性：DNS + TLS + HTTP
+  python - <<PY
+import os, sys, socket, ssl, requests
+host=os.environ.get("WANDB_BASE_URL","https://api.wandb.ai")
+host_name=host.split("://",1)[1].split("/",1)[0]
 try:
-    u=Api().viewer()
-    # u 是 GQL 对象，取常见字段
-    ent=getattr(u, "entity", None) or getattr(u, "username", None)
-    mail=getattr(u, "email", None)
-    print(f"[W&B][child] Logged in as entity={ent} email={mail}")
+    ip=socket.gethostbyname(host_name)
+    print(f"[NET] DNS {host_name} -> {ip}")
 except Exception as e:
-    print("[W&B][child] viewer() failed:", e); sys.exit(3)
+    print("[NET] DNS failed:", e); sys.exit(10)
+try:
+    ctx=ssl.create_default_context(); s=socket.create_connection((host_name,443),timeout=5)
+    with ctx.wrap_socket(s, server_hostname=host_name) as ss:
+        print("[NET] TLS ok:", ss.version())
+except Exception as e:
+    print("[NET] TLS failed:", e); sys.exit(11)
+try:
+    r=requests.get(host+"/status", timeout=10)
+    print("[NET] GET /status ->", r.status_code, r.text[:80].replace("\n"," "))
+except Exception as e:
+    print("[NET] HTTP failed:", e); sys.exit(12)
+PY
+
+  # 2) 原生 GraphQL 验证 token
+  python - <<PY
+import os, sys, requests, json
+host=os.environ.get("WANDB_BASE_URL","https://api.wandb.ai").rstrip("/")
+key=os.environ.get("WANDB_API_KEY","").strip()
+q={"query":"{ viewer { entity username email } }"}
+try:
+    resp=requests.post(host+"/graphql", json=q, timeout=15,
+                       headers={"Authorization": f"Bearer {key}"})
+    print("[W&B][HTTP] POST /graphql ->", resp.status_code)
+    if resp.status_code!=200:
+        print("[W&B][HTTP] body:", resp.text[:200])
+        sys.exit(20)
+    data=resp.json()
+    if "errors" in data:
+        print("[W&B][HTTP] GraphQL errors:", data["errors"])
+        sys.exit(21)
+    v=data["data"]["viewer"]
+    print(f"[W&B][HTTP] Viewer ok: entity={v.get("entity") or v.get("username")} email={v.get("email")}")
+except Exception as e:
+    print("[W&B][HTTP] request failed:", e); sys.exit(22)
+PY
+
+  # 3) SDK 登录（指定 host，避免走默认/写 netrc）
+  python - <<PY
+import os, sys, wandb
+key=os.environ.get("WANDB_API_KEY","").strip()
+host=os.environ.get("WANDB_BASE_URL","https://api.wandb.ai").strip()
+ok=wandb.login(key=key, relogin=True, host=host)
+print("[W&B][SDK] wandb.login ->", ok)
+if not ok: sys.exit(30)
 PY
 
   echo "[Node $(hostname)] launching train.py ..."
