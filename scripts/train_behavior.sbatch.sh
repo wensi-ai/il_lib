@@ -35,6 +35,26 @@ export WANDB_MODE=disabled
 export WANDB_DISABLE_NETRC=true
 export WANDB_DISABLE_CODE=true
 
+# ===== 分布式与无头环境 =====
+export NCCL_DEBUG=INFO
+export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export NCCL_IB_DISABLE=1             # 先走 TCP，稳定优先
+export NCCL_P2P_DISABLE=1
+export PL_TORCH_DISTRIBUTED_TIMEOUT=600
+export PYTHONFAULTHANDLER=1
+
+# 纯无头渲染（Isaac/Omni）
+export OMNI_KIT_HEADLESS=1
+export PYOPENGL_PLATFORM=egl
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+unset DISPLAY
+
+# （可选）CPU 绑定更稳
+export OMP_NUM_THREADS=8
+
+
 # --- 精准 pin FastAPI / Pydantic / Starlette 以修复不兼容 ---
 python - <<'PY'
 import subprocess, sys
