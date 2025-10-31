@@ -24,36 +24,37 @@ echo "SLURM_NTASKS_PER_NODE=${SLURM_NTASKS_PER_NODE:-}"
 echo "working directory=${SLURM_SUBMIT_DIR:-$PWD}"
 
 ############################
-# 0) 先在提交节点做一次环境准备（避免并发 pip）
+# 0) 准备环境（提交节点上执行一次，避免并发 pip）
 ############################
-# 激活 conda env
 source /vision/u/yinhang/miniconda3/bin/activate behavior
 
-# 禁用 Isaac 的 pip 预打包，确保使用你 env 里的 fastapi/pydantic
 export KIT_DISABLE_PIP_PREBUNDLE=1
 export OMNI_KIT_DISABLE_PIP_PREBUNDLE=1
 
-# Headless 渲染
 export PYOPENGL_PLATFORM=egl
 export EGL_PLATFORM=surfaceless
 export __GLX_VENDOR_LIBRARY_NAME=nvidia
 
-# NCCL 稳定性
 export TORCH_NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_DEBUG=INFO
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 
-# 统一 FastAPI / Pydantic / Starlette 到兼容版本（Pydantic v2 路线）
+# 固钉 FastAPI / Pydantic / Starlette
 python - <<'PY'
 import sys, subprocess
-def pipi(*args): subprocess.check_call([sys.executable,"-m","pip","install","--upgrade","--no-cache-dir",*args])
-pipi("fastapi>=0.110,<1.0", "pydantic>=2.4,<3", "starlette>=0.36,<1.0")
+def pipi(*a): subprocess.check_call([sys.executable,"-m","pip","install","--upgrade","--no-cache-dir",*a])
+pipi("fastapi>=0.110,<1.0","pydantic>=2.4,<3","starlette>=0.36,<1.0")
 import fastapi, pydantic, starlette
 print("[VERIFY] fastapi:", fastapi.__version__, fastapi.__file__)
 print("[VERIFY] pydantic:", pydantic.__version__, pydantic.__file__)
 print("[VERIFY] starlette:", starlette.__version__, starlette.__file__)
 PY
+
+# ==== 关键补丁 A：显式设置主节点地址/端口 ====
+MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n1)
+export MASTER_ADDR
+export MASTER_PORT=${MASTER_PORT:-29501}
 
 ############################
 # 1) 用 srun 在每个任务上启动训练
@@ -72,6 +73,29 @@ srun --export=ALL bash -lc '
   export NCCL_ASYNC_ERROR_HANDLING=1
   export NCCL_DEBUG=INFO
   export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+
+  # ==== 关键补丁 B：W&B 只在 rank0 在线，其它离线 ====
+  export WANDB_START_METHOD=thread
+  if [[ "${SLURM_PROCID:-0}" == "0" ]]; then
+    if [[ -z "${WANDB_API_KEY:-}" ]]; then
+      echo "[W&B] ERROR: WANDB_API_KEY missing on rank0. Submit with --export=ALL,WANDB_API_KEY=XXXX" >&2
+      exit 1
+    fi
+    export WANDB_MODE=online
+    export WANDB_DIR="${PWD}/wandb_${SLURM_JOB_ID}"
+    python - <<PYW
+import os, wandb
+key=os.environ.get("WANDB_API_KEY")
+assert key, "WANDB_API_KEY missing"
+wandb.login(key=key, relogin=True)
+print("[W&B] login ok on rank0.")
+PYW
+  else
+    export WANDB_MODE=offline
+    unset WANDB_API_KEY WANDB_BASE_URL
+    export WANDB_DIR="${PWD}/wandb_offline_${SLURM_JOB_ID}_${SLURM_PROCID}"
+    echo "[W&B] rank ${SLURM_PROCID} offline."
+  fi
 
   echo "[Node $(hostname)] launching train.py ..."
   exec python train.py \
