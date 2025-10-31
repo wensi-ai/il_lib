@@ -22,8 +22,12 @@ echo "SLURM_NTASKS_PER_NODE=$SLURM_NTASKS_PER_NODE"
 echo "working directory=${SLURM_SUBMIT_DIR:-$PWD}"
 
 # --- Conda env ---
-source /vision/u/yinhang/miniconda3/bin/activate behavior
+source /vision/u/yinhang/miniconda3/etc/profile.d/conda.sh
+conda activate behavior_train
 python -V
+python -c "import sys; print(sys.executable)"
+python -c "import fastapi, pydantic; print('fastapi=', fastapi.__version__, 'pydantic=', pydantic.__version__)"
+
 
 # --- 禁用 W&B（完全离线）---
 export WANDB_DISABLED=true
