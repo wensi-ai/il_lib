@@ -77,8 +77,9 @@ PY
 HYDRA_FULL_ERROR=1 srun python train.py \
   data_dir=/vision/group/behavior \
   robot=r1pro \
-  task=behavior task.name=make_microwave_popcorn \
-  arch=wbvima +eval=null \
+  task=behavior \
+  task.name=make_microwave_popcorn \
+  arch=wbvima \
   headless=true \
   gpus=$SLURM_NTASKS_PER_NODE \
   num_nodes=$SLURM_NNODES \
@@ -87,5 +88,6 @@ HYDRA_FULL_ERROR=1 srun python train.py \
   limit_val_batches=0 \
   trainer.num_sanity_val_steps=0 \
   "$@"
+
 
 echo "Job finished."
