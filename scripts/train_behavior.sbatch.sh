@@ -39,7 +39,7 @@ export WANDB_DISABLE_CODE=true
 # ==== 分布式 / NCCL / 网卡 ====
 export PL_TORCH_DISTRIBUTED_BACKEND=nccl
 export NCCL_DEBUG=INFO
-export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_SHM_DISABLE=0
 export NCCL_P2P_DISABLE=0
 export NCCL_SOCKET_IFNAME=eno1     # 你的内网网卡（已验证）
@@ -84,7 +84,7 @@ HYDRA_FULL_ERROR=1 srun python train.py \
   gpus=$SLURM_NTASKS_PER_NODE \
   num_nodes=$SLURM_NNODES \
   bs=32 \
-  trainer.check_val_every_n_epoch=0 \
+  +trainer.limit_val_batches=0 \
   trainer.num_sanity_val_steps=0 \
   "$@"
 
