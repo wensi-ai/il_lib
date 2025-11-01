@@ -85,7 +85,7 @@ HYDRA_FULL_ERROR=1 srun python train.py \
   num_nodes=$SLURM_NNODES \
   bs=32 \
   trainer.check_val_every_n_epoch=0 \
-  limit_val_batches=0 \
+  trainer.limit_val_batches=0 \
   trainer.num_sanity_val_steps=0 \
   "$@"
 
