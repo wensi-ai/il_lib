@@ -3,10 +3,10 @@
 #SBATCH --account=vision
 #SBATCH --partition=svl
 #SBATCH --exclude=svl12,svl13
-#SBATCH --nodes=2
-#SBATCH --gres=gpu:titanrtx:4
-#SBATCH --ntasks-per-node=4
-#SBATCH --mem=240G
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:titanrtx:8
+#SBATCH --ntasks-per-node=8
+#SBATCH --mem=490G
 #SBATCH --cpus-per-task=8
 #SBATCH --time=2-00:00:00
 #SBATCH --output=outputs/sc/train_behavior_%j.out
@@ -28,22 +28,22 @@ python -V
 python -c "import sys; print(sys.executable)"
 python -c "import fastapi, pydantic; print('fastapi=', fastapi.__version__, 'pydantic=', pydantic.__version__)"
 
-
 # --- 禁用 W&B（完全离线）---
 export WANDB_DISABLED=true
 export WANDB_MODE=disabled
 export WANDB_DISABLE_NETRC=true
 export WANDB_DISABLE_CODE=true
 
-# ===== 分布式与无头环境 =====
+# ===== 分布式与无头环境（单节点优化） =====
 export NCCL_DEBUG=INFO
 export NCCL_ASYNC_ERROR_HANDLING=1
-export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
-export NCCL_IB_DISABLE=1             # 先走 TCP，稳定优先
-export NCCL_P2P_DISABLE=1
 export PL_TORCH_DISTRIBUTED_TIMEOUT=600
 export PYTHONFAULTHANDLER=1
+
+# 单节点建议开启 P2P / 关闭 IB（没有 IB 也无所谓）
+export NCCL_IB_DISABLE=1
+export NCCL_P2P_DISABLE=0
 
 # 纯无头渲染（Isaac/Omni）
 export OMNI_KIT_HEADLESS=1
@@ -53,7 +53,6 @@ unset DISPLAY
 
 # （可选）CPU 绑定更稳
 export OMP_NUM_THREADS=8
-
 
 # --- 精准 pin FastAPI / Pydantic / Starlette 以修复不兼容 ---
 python - <<'PY'
@@ -73,7 +72,11 @@ print("[VERIFY] pydantic =", pydantic.__version__)
 print("[VERIFY] starlette =", version("starlette"))
 PY
 
-# --- 启动训练（保持你的原参数）---
+# --- 启动训练（单节点）---
+# 说明：
+# - gpus 使用本节点任务数（= 卡数）
+# - num_nodes 固定为 1（关键）
+# - 若从 2 节点*4卡 切到 1 节点*8卡，等效全局 batch 差不多；不够就用 grad_acc 叠上去
 HYDRA_FULL_ERROR=1 srun python train.py \
   data_dir=/vision/group/behavior \
   robot=r1pro \
@@ -81,7 +84,7 @@ HYDRA_FULL_ERROR=1 srun python train.py \
   arch=wbvima +eval=behavior \
   headless=true \
   gpus=$SLURM_NTASKS_PER_NODE \
-  num_nodes=$SLURM_NNODES \
+  num_nodes=1 \
   bs=32 \
   trainer.num_sanity_val_steps=0 \
   "$@"
