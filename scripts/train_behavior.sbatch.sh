@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name="train_behavior_8g_noeval"
+#SBATCH --job-name="train_behavior"
 #SBATCH --account=vision
 #SBATCH --partition=svl
 #SBATCH --exclude=svl12,svl13
