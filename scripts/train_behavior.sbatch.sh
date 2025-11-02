@@ -25,7 +25,7 @@ echo "working directory="$SLURM_SUBMIT_DIR
 
 source /vision/u/yinhang/miniconda3/bin/activate behavior
 
-HYDRA_FULL_ERROR=1 srun python train.py data_dir=/vision/group/behavior robot=r1pro task=behavior task.name=make_microwave_popcorn arch=wbvima +eval=behavior headless=true gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES bs=32 "$@"
+HYDRA_FULL_ERROR=1 srun python train.py data_dir=/vision/group/behavior robot=r1pro task=behavior task.name=attach_a_camera_to_a_tripod arch=wbvima +eval=behavior headless=true gpus=$SLURM_NTASKS_PER_NODE num_nodes=$SLURM_NNODES bs=32 "$@"
 
 echo "Job finished."
 exit 0
