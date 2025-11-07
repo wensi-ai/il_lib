@@ -8,8 +8,8 @@ online_eval:
     eval_on_train_instances: false
     headless: ${headless}
     env_wrapper:
-      _target_: omnigibson.learning.wrappers.wbvima_wrapper.WBVIMAWrapper
-      # _target_: omnigibson.learning.wrappers.rgb_low_res_wrapper.RGBLowResWrapper
+      # _target_: omnigibson.learning.wrappers.wbvima_wrapper.WBVIMAWrapper
+      _target_: omnigibson.learning.wrappers.rgb_low_res_wrapper.RGBLowResWrapper
     task: ${task}
     robot: ${robot}
     policy_name: ${arch_name}
