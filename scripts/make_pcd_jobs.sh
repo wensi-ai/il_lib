@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DATA_DIR="/vision/group/behavior/"
-TASK_NAME="make_microwave_popcorn"          # 想跑哪个 task 就改这里（turning_on_radio = task-0000）
+TASK_NAME="picking_up_trash"          # 想跑哪个 task 就改这里（turning_on_radio = task-0000）
 OUT_TSV="configs/pcd_jobs.tsv"
 mkdir -p "$(dirname "$OUT_TSV")"
 
@@ -10,7 +10,7 @@ mkdir -p "$(dirname "$OUT_TSV")"
 TASK_ID=$(python - <<'PY'
 import os
 from omnigibson.learning.utils.eval_utils import TASK_NAMES_TO_INDICES
-name = os.environ.get("TASK_NAME", "make_microwave_popcorn")
+name = os.environ.get("TASK_NAME", "picking_up_trash")
 print(f"{TASK_NAMES_TO_INDICES[name]:04d}")
 PY
 )
