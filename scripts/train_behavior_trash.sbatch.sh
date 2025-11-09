@@ -24,13 +24,13 @@ source /vision/u/yinhang/miniconda3/etc/profile.d/conda.sh
 conda activate behavior_train
 python -V
 
-# ---------- Disable W&B ----------
+# ---------- Quiet W&B ----------
 export WANDB_DISABLED=true
 export WANDB_MODE=disabled
 export WANDB_DISABLE_NETRC=true
 export WANDB_DISABLE_CODE=true
 
-# ---------- Headless rendering ----------
+# ---------- Headless / EGL ----------
 export CARB_APP_HEADLESS=1
 export OMNI_KIT_HEADLESS=1
 export KIT_DISABLE_WINDOWING=1
@@ -39,38 +39,29 @@ unset DISPLAY
 export PYOPENGL_PLATFORM=egl
 export __GLX_VENDOR_LIBRARY_NAME=nvidia
 
-# ---------- NCCL/DDP (single-node safe defaults) ----------
+# ---------- NCCL/DDP (single node) ----------
 export PL_TORCH_DISTRIBUTED_BACKEND=nccl
 export NCCL_DEBUG=INFO
 export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_IB_DISABLE=1          # no IB on svl boxes
+export NCCL_IB_DISABLE=1
 export NCCL_SHM_DISABLE=1
-export NCCL_P2P_DISABLE=0
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
-export NCCL_BLOCKING_WAIT=1
 export PYTHONFAULTHANDLER=1
-export PL_TORCH_DISTRIBUTED_TIMEOUT=600
 
-# ---------- (Optional) pin FastAPI/Pydantic once ----------
+# ---------- (Optional) pin these once ----------
 python - <<'PY'
 import subprocess, sys
-def pip(*args): subprocess.check_call([sys.executable, "-m", "pip"]+list(args))
-pins = [
-  "fastapi==0.120.3",
-  "starlette==0.49.1",
-  "pydantic==2.12.3",
-  "pydantic-core==2.41.4",
-]
-pip("install","--upgrade","--no-cache-dir", *pins)
-from importlib.metadata import version
-import pydantic
+def pip(*a): subprocess.check_call([sys.executable,"-m","pip",*a])
+pins = ["fastapi==0.120.3","starlette==0.49.1","pydantic==2.12.3","pydantic-core==2.41.4"]
+pip("install","--upgrade","--no-cache-dir",*pins)
+from importlib.metadata import version; import pydantic
 print("[VERIFY] fastapi =", version("fastapi"))
 print("[VERIFY] pydantic =", pydantic.__version__)
 print("[VERIFY] starlette =", version("starlette"))
 PY
 
-# ---------- Launch (torchrun standalone, no port conflicts) ----------
+# ---------- Launch (NO unsupported overrides) ----------
 HYDRA_FULL_ERROR=1 torchrun --standalone --nproc_per_node=8 train.py \
   data_dir=/vision/group/behavior \
   robot=r1pro \
@@ -83,10 +74,6 @@ HYDRA_FULL_ERROR=1 torchrun --standalone --nproc_per_node=8 train.py \
   trainer.strategy=ddp \
   +trainer.limit_val_batches=0 \
   trainer.num_sanity_val_steps=0 \
-  dataloader.train.drop_last=true \
-  dataloader.train.num_workers=0 \
-  dataloader.train.persistent_workers=false \
-  dataloader.train.pin_memory=false \
   bs=32 \
   "$@"
 
