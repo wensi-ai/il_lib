@@ -8,6 +8,7 @@ run_name: "${arch_name}_${task.name}"
 exp_root_dir: .
 arch_name: ???  # filled by arch
 headless: true
+ckpt_path: null
 
 # ====== Main Config ======
 seed: 42
@@ -129,7 +130,12 @@ policy_wrapper:
   pcd_range: ${task.pcd_range}
   robot_type: ${robot.type}
 
-ckpt_path: null
+resume:
+  ckpt_path: ${ckpt_path}
+  # whether to load optimizer and trainer state
+  full_state: false  
+  # whether to strictly enforce that the keys in state_dict match the keys returned by the model
+  strict: true  
 
 hydra:
   job:
