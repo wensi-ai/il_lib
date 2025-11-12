@@ -1,15 +1,15 @@
+import il_lib.nn.features.resnet as resnet_lib
 import torch
 import torch.nn as nn
 from einops import rearrange
 from functools import partial
-from hydra.utils import instantiate
 from il_lib.utils.array_tensor_utils import any_concat
 from il_lib.utils.training_utils import load_state_dict
 from il_lib.optim import default_optimizer_groups
-import il_lib.nn.features.resnet as resnet_lib
 from torchvision import transforms
 from torchvision.models import ResNet18_Weights
 from typing import List, Optional, Union
+
 
 class MultiviewResNet18(nn.Module):
     def __init__(

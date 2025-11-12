@@ -3,3 +3,4 @@ outputs
 *.egg-info
 *.ipynb
 .vscode
+test.py

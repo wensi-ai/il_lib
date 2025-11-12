@@ -23,7 +23,7 @@ wd: 0.0
 bs: 64
 vbs: ${bs}
 data_dir: ???
-eval_interval: 15
+eval_interval: 30
 online_eval: null
 
 horizon: ???
@@ -64,7 +64,7 @@ data:
   batch_size: ${bs}
   val_batch_size: ${vbs}
   val_split_ratio: 0.1
-  dataloader_num_workers: 4
+  dataloader_num_workers: 8
   max_num_demos: null 
   seed: ${seed}
   dataset_class: omnigibson.learning.datas.BehaviorIterableDataset
@@ -130,3 +130,7 @@ policy_wrapper:
   robot_type: ${robot.type}
 
 ckpt_path: null
+
+hydra:
+  job:
+    chdir: true
