@@ -29,13 +29,30 @@ class MultiviewResNet18(nn.Module):
         super().__init__()
         self._views = views
         self._use_shared_backbone = use_shared_backbone
+        self._include_depth = include_depth
         if use_shared_backbone:
             self._resnet = getattr(resnet_lib, backbone)(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
+            if include_depth:
+                self._depth_resnet = getattr(resnet_lib, backbone)(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
+                depth_conv1 = nn.Conv2d(
+                    1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+                )
+                self._depth_resnet.conv1 = depth_conv1
         else:
             self._resnet = nn.ModuleDict({
                 view: getattr(resnet_lib, backbone)(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
                 for view in views
             })
+            if include_depth:
+                self._depth_resnet = nn.ModuleDict({
+                    view: getattr(resnet_lib, backbone)(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
+                    for view in views
+                })
+                for view in views:
+                    depth_conv1 = nn.Conv2d(
+                        1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+                    )
+                    self._depth_resnet[view].conv1 = depth_conv1
         if load_pretrained:
             ckpt = torch.hub.load_state_dict_from_url(url=ResNet18_Weights.DEFAULT.url, map_location="cpu")
             del ckpt["fc.weight"]
@@ -43,59 +60,77 @@ class MultiviewResNet18(nn.Module):
             resnet_to_load = [self._resnet] if use_shared_backbone else list(self._resnet.values())
             for resnet in resnet_to_load:
                 load_state_dict(resnet, ckpt, strict=False)
-                if include_depth:
-                    rgbd_conv1 = nn.Conv2d(
-                        4, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
-                    )
-                    rgbd_conv1.weight.data[:, :3, :, :] = resnet.conv1.weight.data
-                    rgbd_conv1.weight.data[:, 3, :, :] = 0.0
-                    resnet.conv1 = rgbd_conv1
         self.return_last_spatial_map = return_last_spatial_map
         if not return_last_spatial_map:
             assert token_dim is not None, "token_dim must be specified when return_last_spatial_map is False!"
-            self._output_fc = nn.Linear(len(views) * resnet_output_dim, token_dim)
+            n_resnet_output = len(views) if not include_depth else len(views) * 2
+            self._output_fc = nn.Linear(n_resnet_output * resnet_output_dim, token_dim)
             self.output_dim = token_dim
 
-        train_transforms, eval_transforms = [], []
+        rgb_train_transforms, rgb_eval_transforms = [], []
+        depth_train_transforms, depth_eval_transforms = [], []
         if enable_random_crop:
-            train_transforms.append(transforms.RandomCrop(random_crop_size))
-            eval_transforms.append(transforms.CenterCrop(random_crop_size))
-        if include_depth:
-            # We do not normalize depth
-            train_transforms.append(
-                partial(ResNet18_Weights.DEFAULT.transforms, mean=(0.485, 0.456, 0.406, 0.0), std=(0.229, 0.224, 0.225, 1.0))()
-            )
-            eval_transforms.append(
-                partial(ResNet18_Weights.DEFAULT.transforms, mean=(0.485, 0.456, 0.406, 0.0), std=(0.229, 0.224, 0.225, 1.0))()
-            )
-        else:
-            train_transforms.append(ResNet18_Weights.DEFAULT.transforms())
-            eval_transforms.append(ResNet18_Weights.DEFAULT.transforms())
-        self._train_transforms = transforms.Compose(train_transforms)
-        self._eval_transforms = transforms.Compose(eval_transforms)
+            rgb_train_transforms.append(transforms.RandomCrop(random_crop_size))
+            depth_train_transforms.append(transforms.RandomCrop(random_crop_size))
+            rgb_eval_transforms.append(transforms.CenterCrop(random_crop_size))
+            depth_eval_transforms.append(transforms.CenterCrop(random_crop_size))
+        rgb_train_transforms.append(ResNet18_Weights.DEFAULT.transforms())
+        rgb_eval_transforms.append(ResNet18_Weights.DEFAULT.transforms())
+        depth_train_transforms.append(
+            partial(ResNet18_Weights.DEFAULT.transforms, mean=(0.0,), std=(1.0,))()
+        )
+        depth_eval_transforms.append(
+            partial(ResNet18_Weights.DEFAULT.transforms, mean=(0.0,), std=(1.0,))()
+        )
+        self._train_transforms = {
+            "rgb": transforms.Compose(rgb_train_transforms),
+            "depth": transforms.Compose(depth_train_transforms),
+        }
+        self._eval_transforms = {
+            "rgb": transforms.Compose(rgb_eval_transforms),
+            "depth": transforms.Compose(depth_eval_transforms),
+        }
 
     def forward(self, x):
         """
         x: a dict with keys in self._views and values of shape (B, L, C, H, W)
-        """
+        """ 
         assert set(x.keys()) == set(self._views)
-        B, L = x[self._views[0]].shape[:2]
+        B, L = x[self._views[0]]["rgb"].shape[:2]
         x = {
-            k: rearrange(v, "B L C H W -> (B L) C H W").contiguous()
+            k: {
+                kk: rearrange(vv, "B L C H W -> (B L) C H W").contiguous()
+                for kk, vv in v.items()
+            }
             for k, v in x.items()
         }
         x = {
-            k: self._train_transforms(v) if self.training else self._eval_transforms(v)
+            k: {
+                kk: self._train_transforms[kk](v) if self.training else self._eval_transforms[kk](v)
+                for kk, v in v.items()
+            }
             for k, v in x.items()
         }
         if self._use_shared_backbone:
             resnet_output = {
-                k: self._resnet(v) for k, v in x.items()
+                k: self._resnet(v["rgb"]) for k, v in x.items()
             }  # dict of (B * L, **resnet_output_dim)
+            if self._include_depth:
+                depth_resnet_output = {
+                    k: self._depth_resnet(v["depth"]) for k, v in x.items()
+                }  # dict of (B * L, **resnet_output_dim)
+                for k in resnet_output.keys():
+                    resnet_output[k] = torch.cat([resnet_output[k], depth_resnet_output[k]], dim=-1)
         else:
             resnet_output = {
-                k: self._resnet[k](v) for k, v in x.items()
+                k: self._resnet[k](v["rgb"]) for k, v in x.items()
             }  # dict of (B * L, **resnet_output_dim)
+            if self._include_depth:
+                depth_resnet_output = {
+                    k: self._depth_resnet[k](v["depth"]) for k, v in x.items()
+                }  # dict of (B * L, **resnet_output_dim)
+                for k in resnet_output.keys():
+                    resnet_output[k] = torch.cat([resnet_output[k], depth_resnet_output[k]], dim=-1)
         if self.return_last_spatial_map:
             return resnet_output
         else:
