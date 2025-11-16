@@ -14,6 +14,7 @@ online_eval:
       control_type: joint
       robot_type: ${robot.type}
       use_websocket: false
+      ema_alpha: null
     env: ${env}
     task: ${task}
     hdf_path: ???
