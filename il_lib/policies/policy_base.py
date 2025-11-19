@@ -316,7 +316,7 @@ class PolicyWrapper:
                 processed_obs["qpos"][key] = self._post_processing_fn(
                     torch.where(
                         processed_obs["qpos"][key]
-                        > (JOINT_RANGE[self.robot_type][key][0] + JOINT_RANGE[self.robot_type][key][1]) / 2,
+                        > (JOINT_RANGE[self.robot_type][key][0] + JOINT_RANGE[self.robot_type][key][1]) * 0.8,
                         1.0,
                         -1.0,
                     )
