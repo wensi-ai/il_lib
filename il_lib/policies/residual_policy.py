@@ -1,17 +1,13 @@
 import os
 import torch
-from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
-from hydra.core.global_hydra import GlobalHydra
-from hydra.core.hydra_config import HydraConfig
 from il_lib.nn.distributions import GMMHead, CategoricalNet
 from il_lib.policies.policy_base import BasePolicy
 from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.optim import CosineScheduleFunction
-from il_lib.utils.training_utils import freeze_params, load_state_dict, load_torch
-from il_lib.utils.config_utils import register_omegaconf_resolvers
+from il_lib.utils.training_utils import freeze_params, load_state_dict
 from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from typing import Any, Dict, List, Optional
 
 
@@ -46,10 +42,6 @@ class ResidualPolicy(BasePolicy):
         update_intervention_head_only: bool = False,
         ckpt_path_if_update_intervention_head_only: Optional[str] = None,
         intervention_loss_weight: float = 1.0,
-        # ====== Base Policy ======
-        base_policy: BasePolicy,
-        base_policy_ckpt_path: str,
-        base_policy_overrides: Optional[List[str]] = None,
         # ====== Learning ======
         lr: float,
         use_cosine_lr: bool = True,
@@ -131,49 +123,6 @@ class ResidualPolicy(BasePolicy):
         self._intervention_loss_weight = intervention_loss_weight
         self._learn_gripper_action = learn_gripper_action
         self._include_robot_gripper_action_input = include_robot_gripper_action_input
-        
-        self._base_policy = None
-        if base_policy_ckpt_path is not None:
-            assert base_policy is not None, "Must provide base_policy config name when base_policy_ckpt_path is provided!"
-            
-            overrides = [f"arch={base_policy}"]
-            
-            if GlobalHydra.instance().is_initialized():
-                try:
-                    hydra_cfg = HydraConfig.get()
-                    cli_overrides = [o for o in hydra_cfg.overrides.task if not o.startswith("arch=")]
-                    overrides.extend(cli_overrides)
-                except:
-                    pass
-            
-            if base_policy_overrides is not None:
-                overrides.extend(base_policy_overrides)
-            
-            if GlobalHydra.instance().is_initialized():
-                base_policy_cfg = compose(config_name="base_config", overrides=overrides)
-                base_policy_cfg = base_policy_cfg.module
-            else:
-                config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs")
-                config_dir = os.path.abspath(config_dir)
-                with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
-                    base_policy_cfg = compose(config_name="base_config", overrides=overrides)
-                    base_policy_cfg = base_policy_cfg.module
-            register_omegaconf_resolvers()
-            OmegaConf.resolve(base_policy_cfg)
-            self._base_policy = instantiate(base_policy_cfg, _recursive_=False)
-            
-            ckpt = load_torch(
-                base_policy_ckpt_path,
-                map_location="cpu",
-            )
-            load_state_dict(
-                self._base_policy,
-                ckpt["state_dict"],
-                strict=True
-            )
-            self._base_policy = self._base_policy.to("cuda")
-            self._base_policy.eval()
-            freeze_params(self._base_policy)
 
         # ====== Learning ======
         self.lr = lr
@@ -214,12 +163,8 @@ class ResidualPolicy(BasePolicy):
         else:
             residual_action = residual_action_dist.sample()
             intervention = intervention_dist.sample()
-        
-        assert self._base_policy is not None, "base_policy_ckpt_path must be provided for inference!"
-        base_action = self._base_policy.act(obs, deterministic=deterministic)
-        final_action = base_action + residual_action
-        
-        return final_action, intervention
+
+        return residual_action, intervention
 
     def reset(self) -> None:
         pass

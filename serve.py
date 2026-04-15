@@ -1,4 +1,5 @@
 import hydra
+import torch
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from il_lib.policies import ResidualPolicy
@@ -33,20 +34,38 @@ def main():
             cfg.ckpt_path,
             map_location="cpu",
         )
-        load_state_dict(
-            policy,
-            ckpt["state_dict"],
-            strict=True
-        )
-        policy = policy.to("cuda")
+        if isinstance(policy, ResidualPolicy):
+            incompatible_keys = policy.load_state_dict(ckpt["state_dict"], strict=False)
+            missing_keys = [
+                key for key in incompatible_keys.missing_keys
+                if not key.startswith("_base_policy.")
+            ]
+            unexpected_keys = [
+                key for key in incompatible_keys.unexpected_keys
+                if not key.startswith("_base_policy.")
+            ]
+            if missing_keys or unexpected_keys:
+                raise RuntimeError(
+                    "Residual checkpoint load mismatch.\n"
+                    f"Missing keys: {missing_keys}\n"
+                    f"Unexpected keys: {unexpected_keys}"
+                )
+        else:
+            load_state_dict(
+                policy,
+                ckpt["state_dict"],
+                strict=True
+            )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        policy = policy.to(device)
         policy.eval()
         # instantiate wrapper for policy
         policy_wrapper = instantiate(cfg.policy_wrapper)
         policy_wrapper.policy = policy
         server = WebsocketPolicyServer(
             policy=policy_wrapper,
-            host="0.0.0.0",
-            port=8000,
+            host=cfg.get("host", "0.0.0.0"),
+            port=cfg.get("port", 8001),
         )
         server.serve_forever()
 

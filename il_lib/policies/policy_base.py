@@ -1,13 +1,19 @@
 import logging
 import os
+import sys
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from abc import ABC, abstractmethod
 from collections import deque
+from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
+from hydra.core.global_hydra import GlobalHydra
+from hydra.core.hydra_config import HydraConfig
 from il_lib.utils.array_tensor_utils import any_concat
 from il_lib.utils.convert_utils import any_to_torch
+from il_lib.utils.config_utils import register_omegaconf_resolvers
+from il_lib.utils.training_utils import load_state_dict, load_torch
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from omnigibson.learning.utils.eval_utils import (
     ACTION_QPOS_INDICES,
@@ -31,6 +37,48 @@ from typing import Any, Dict, List, Optional
 
 
 logger = logging.getLogger("BasePolicy")
+
+
+def _collect_base_policy_overrides() -> List[str]:
+    """
+    Recover top-level CLI overrides that should also apply to the nested base policy config.
+    """
+    if GlobalHydra.instance().is_initialized():
+        try:
+            hydra_cfg = HydraConfig.get()
+            return [
+                override
+                for override in hydra_cfg.overrides.task
+                if not override.startswith(("arch=", "+arch=", "++arch="))
+            ]
+        except Exception:
+            pass
+
+    passthrough_overrides = []
+    excluded_prefixes = (
+        "arch=",
+        "+arch=",
+        "++arch=",
+        "ckpt_path=",
+        "+ckpt_path=",
+        "++ckpt_path=",
+        "module.",
+        "+module.",
+        "++module.",
+        "resume.",
+        "+resume.",
+        "++resume.",
+        "hydra.",
+        "+hydra.",
+        "++hydra.",
+    )
+    for override in sys.argv[1:]:
+        if override.startswith("-"):
+            continue
+        if override.startswith(excluded_prefixes):
+            continue
+        passthrough_overrides.append(override)
+    return passthrough_overrides
 
 
 class BasePolicy(LightningModule, ABC):
@@ -269,12 +317,7 @@ class PolicyWrapper:
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
         obs = any_to_torch(obs, device="cpu")
         obs = self.process_obs(obs=obs)
-        if len(self._obs_history) == 0:
-            for _ in range(self.obs_window_size):
-                self._obs_history.append(obs)
-        else:
-            self._obs_history.append(obs)
-        obs = any_concat(self._obs_history, dim=1)
+        obs = self._stack_obs_history(obs)
 
         need_inference = self._action_idx % self.deployed_action_steps == 0
         if need_inference:
@@ -290,6 +333,15 @@ class PolicyWrapper:
         self._obs_history = deque(maxlen=self.obs_window_size)
         self._action_traj_pred = None
         self._action_idx = 0
+
+    def _stack_obs_history(self, obs: dict, history: Optional[deque] = None) -> torch.Tensor:
+        history = self._obs_history if history is None else history
+        if len(history) == 0:
+            for _ in range(history.maxlen):
+                history.append(obs)
+        else:
+            history.append(obs)
+        return any_concat(history, dim=1)
 
     def process_obs(self, obs: dict) -> dict:
         # Expand twice to get B and T_A dimensions
@@ -432,6 +484,9 @@ class ResidualPolicyWrapper(PolicyWrapper):
         self,
         *args,
         base_deployed_action_steps: int,  # Base policy's action chunk size
+        base_policy: str,
+        base_policy_ckpt_path: str,
+        base_policy_overrides: Optional[List[str]] = None,
         residual_deployed_action_steps: int = 1,  # Residual policy's action step (usually 1)
         **kwargs,
     ) -> None:
@@ -443,6 +498,47 @@ class ResidualPolicyWrapper(PolicyWrapper):
         self._base_action_buffer = None  # Will store (T_A, A) from base policy
         self._base_action_idx = 0
         self.base_policy = None  # Will be set to the base policy from residual_policy.base_policy
+        self._base_obs_history = None  # Created lazily once the base policy is attached
+        self._base_policy_name = base_policy
+        self._base_policy_ckpt_path = base_policy_ckpt_path
+        self._base_policy_overrides = base_policy_overrides
+        self._base_policy_device = None
+
+    def _get_base_policy(self):
+        if self.base_policy is None:
+            assert self._base_policy_ckpt_path is not None, "base_policy_ckpt_path must be provided for residual inference!"
+            overrides = [f"arch={self._base_policy_name}"]
+            overrides.extend(_collect_base_policy_overrides())
+            if self._base_policy_overrides is not None:
+                overrides.extend(self._base_policy_overrides)
+
+            if GlobalHydra.instance().is_initialized():
+                base_policy_cfg = compose(config_name="base_config", overrides=overrides).module
+            else:
+                config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs")
+                config_dir = os.path.abspath(config_dir)
+                with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
+                    base_policy_cfg = compose(config_name="base_config", overrides=overrides).module
+
+            register_omegaconf_resolvers()
+            OmegaConf.resolve(base_policy_cfg)
+            self.base_policy = instantiate(base_policy_cfg, _recursive_=False)
+
+            ckpt = load_torch(self._base_policy_ckpt_path, map_location="cpu")
+            load_state_dict(self.base_policy, ckpt["state_dict"], strict=True)
+            self._base_policy_device = self.policy.device
+            self.base_policy = self.base_policy.to(self._base_policy_device)
+            self.base_policy.eval()
+        return self.base_policy
+
+    def _get_base_obs_history(self) -> deque:
+        base_policy = self._get_base_policy()
+        if base_policy is None:
+            raise ValueError("base_policy not found in residual policy!")
+        if self._base_obs_history is None:
+            base_obs_window_size = getattr(base_policy, "num_latest_obs", self.obs_window_size)
+            self._base_obs_history = deque(maxlen=base_obs_window_size)
+        return self._base_obs_history
     
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
         """
@@ -453,41 +549,33 @@ class ResidualPolicyWrapper(PolicyWrapper):
         """
         obs = any_to_torch(obs, device="cpu")
         obs = self.process_obs(obs=obs)
-        
-        # Maintain observation history
-        if len(self._obs_history) == 0:
-            for _ in range(self.obs_window_size):
-                self._obs_history.append(obs)
-        else:
-            self._obs_history.append(obs)
-        obs_stacked = any_concat(self._obs_history, dim=1)  # (B=1, T_obs, ...)
+        residual_obs = {"obs": self._stack_obs_history(obs)}
 
         # ===== Base Policy: Action Chunking =====
         need_base_inference = self._base_action_idx % self.base_deployed_action_steps == 0
         if need_base_inference:
-            # Get base policy from residual policy
-            if self.base_policy is None and hasattr(self.policy, 'base_policy'):
-                self.base_policy = self.policy.base_policy
-            
-            if self.base_policy is not None:
-                # Base policy predicts action chunk
-                self._base_action_buffer = self.base_policy.act(obs_stacked).squeeze(0)  # (T_A, A)
-                self._base_action_idx = 0
-            else:
-                raise ValueError("base_policy not found in residual policy!")
+            base_policy = self._get_base_policy()
+            base_obs = {"obs": self._stack_obs_history(obs, history=self._get_base_obs_history())}
+            self._base_action_buffer = base_policy.act(base_obs).squeeze(0)  # (T_A, A)
+            self._base_action_idx = 0
+        elif self._base_obs_history is not None:
+            self._stack_obs_history(obs, history=self._base_obs_history)
         
         # Get current base action from buffer (raw radians, denormalized by base policy)
         base_action = self._base_action_buffer[self._base_action_idx]  # (A,)
         self._base_action_idx += 1
+        base_action = self._post_processing_fn(base_action)
 
         # Normalize base action back to [-1, 1] so it matches the residual's training space
         base_action_normalized = self._normalize_action(base_action.clone())
+        if "base_action" in getattr(self.policy, "_features", set()):
+            residual_obs["obs"]["base_action"] = self._post_processing_fn(
+                base_action_normalized.view(1, 1, -1)
+            )
 
         # ===== Residual Policy: Per-step Correction =====
-        obs_for_residual = {"obs": obs_stacked}
-
         # Get residual correction (intervention decision + action correction)
-        residual_action, intervention = self.policy.act(obs_for_residual)
+        residual_action, intervention = self.policy.act(residual_obs["obs"])
         residual_action = residual_action.squeeze()  # (A,)
         intervention = intervention.squeeze()  # scalar
 
@@ -506,9 +594,19 @@ class ResidualPolicyWrapper(PolicyWrapper):
         """Normalize action from raw joint space to [-1, 1]."""
         for k, v in ACTION_QPOS_INDICES[self.robot_type].items():
             if "gripper" not in k:
+                joint_min = torch.as_tensor(
+                    JOINT_RANGE[self.robot_type][k][0],
+                    device=action.device,
+                    dtype=action.dtype,
+                )
+                joint_max = torch.as_tensor(
+                    JOINT_RANGE[self.robot_type][k][1],
+                    device=action.device,
+                    dtype=action.dtype,
+                )
                 action[..., v] = (
-                    2 * (action[..., v] - JOINT_RANGE[self.robot_type][k][0])
-                    / (JOINT_RANGE[self.robot_type][k][1] - JOINT_RANGE[self.robot_type][k][0])
+                    2 * (action[..., v] - joint_min)
+                    / (joint_max - joint_min)
                     - 1.0
                 )
         return action
@@ -519,9 +617,19 @@ class ResidualPolicyWrapper(PolicyWrapper):
             if "gripper" in k:
                 action[..., v] = torch.where(action[..., v] > 0, 1.0, -1.0)
             else:
+                joint_min = torch.as_tensor(
+                    JOINT_RANGE[self.robot_type][k][0],
+                    device=action.device,
+                    dtype=action.dtype,
+                )
+                joint_max = torch.as_tensor(
+                    JOINT_RANGE[self.robot_type][k][1],
+                    device=action.device,
+                    dtype=action.dtype,
+                )
                 action[..., v] = (action[..., v] + 1) / 2 * (
-                    JOINT_RANGE[self.robot_type][k][1] - JOINT_RANGE[self.robot_type][k][0]
-                ) + JOINT_RANGE[self.robot_type][k][0]
+                    joint_max - joint_min
+                ) + joint_min
         return action
 
     def reset(self) -> None:
@@ -529,5 +637,6 @@ class ResidualPolicyWrapper(PolicyWrapper):
         super().reset()
         self._base_action_buffer = None
         self._base_action_idx = 0
+        self._base_obs_history = None
         if self.base_policy is not None:
             self.base_policy.reset()
