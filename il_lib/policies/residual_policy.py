@@ -11,6 +11,23 @@ from omegaconf import DictConfig
 from typing import Any, Dict, List, Optional
 
 
+class _AlwaysInterveneDistribution:
+    """Minimal distribution interface for the no-intervention head residual mode."""
+
+    def __init__(self, reference: torch.Tensor):
+        self._reference = reference
+
+    def mode(self) -> torch.Tensor:
+        return torch.ones(
+            self._reference.shape[:-1],
+            device=self._reference.device,
+            dtype=torch.long,
+        )
+
+    def sample(self) -> torch.Tensor:
+        return self.mode()
+
+
 class ResidualPolicy(BasePolicy):
     def __init__(
         self,
@@ -35,6 +52,7 @@ class ResidualPolicy(BasePolicy):
         # ====== Intervention ======
         learn_gripper_action: bool = True,
         include_robot_gripper_action_input: bool = True,
+        use_intervention_head: bool = True,
         intervention_head_hidden_dim: int,
         intervention_head_hidden_depth: int,
         intervention_head_activation: str = "relu",
@@ -80,13 +98,20 @@ class ResidualPolicy(BasePolicy):
             activation=action_net_activation,
             low_noise_eval=gmm_low_noise_eval,
         )
-        self.intervention_head = CategoricalNet(
-            feature_fusion_output_dim,
-            action_dim=2,  # intervention or not
-            hidden_dim=intervention_head_hidden_dim,
-            hidden_depth=intervention_head_hidden_depth,
-            activation=intervention_head_activation,
-        )
+        self._use_intervention_head = use_intervention_head
+        self.intervention_head = None
+        if self._use_intervention_head:
+            self.intervention_head = CategoricalNet(
+                feature_fusion_output_dim,
+                action_dim=2,  # intervention or not
+                hidden_dim=intervention_head_hidden_dim,
+                hidden_depth=intervention_head_hidden_depth,
+                activation=intervention_head_activation,
+            )
+        elif update_intervention_head_only:
+            raise ValueError(
+                "update_intervention_head_only requires use_intervention_head=True."
+            )
         if update_intervention_head_only:
             assert os.path.exists(ckpt_path_if_update_intervention_head_only)
             ckpt = torch.load(
@@ -148,7 +173,10 @@ class ResidualPolicy(BasePolicy):
         obs = {k: obs[k] for k in self._features}  # filter obs to only include features we have
         obs_feature = self.feature_extractor(obs)  # (B, T_O, D)
         action_dist = self.action_net(obs_feature)
-        intervention_dist = self.intervention_head(obs_feature)
+        if self._use_intervention_head:
+            intervention_dist = self.intervention_head(obs_feature)
+        else:
+            intervention_dist = _AlwaysInterveneDistribution(obs_feature)
         return action_dist, intervention_dist
 
     @torch.no_grad()
@@ -219,8 +247,11 @@ class ResidualPolicy(BasePolicy):
 
         pad_mask = batch.pop("masks")
         intervention_mask = batch.pop("int_state") == 2  # intervention happened
-        # only valid when both intervention and pad mask are True
-        action_valid_mask = intervention_mask & pad_mask
+        if self._use_intervention_head:
+            action_valid_mask = intervention_mask & pad_mask
+        else:
+            action_valid_mask = pad_mask
+        
         # get residual action target
         robot_policy_action = batch["base_action"]
         oracle_action = batch["oracle_action"]
@@ -250,6 +281,10 @@ class ResidualPolicy(BasePolicy):
             target_action = torch.cat([residual_q, residual_gripper], dim=-1)
         else:
             target_action = residual_q
+        if not self._use_intervention_head:
+            target_action = target_action * intervention_mask.unsqueeze(-1).to(
+                target_action.dtype
+            )
         if self._include_robot_gripper_action_input:
             batch["robot_policy_gripper_action"] = robot_policy_gripper_action
         # forward pass
@@ -258,18 +293,26 @@ class ResidualPolicy(BasePolicy):
             target_action, reduction="none"
         ).reshape(action_valid_mask.shape)
         action_loss = raw_action_loss * action_valid_mask
-        raw_intervention_loss = intervention_dist.imitation_loss(
-            intervention_mask.long(), reduction="none"
-        ).reshape(pad_mask.shape)
-        intervention_loss = raw_intervention_loss * pad_mask
-        intervention_acc = intervention_dist.imitation_accuracy(
-            intervention_mask.long(),
-            mask=pad_mask,
-        )
         real_batch_size = action_valid_mask.sum()
         action_loss = torch.sum(action_loss) / real_batch_size
-        intervention_loss = (torch.sum(intervention_loss) / pad_mask.sum())
-        loss = action_loss + self._intervention_loss_weight * intervention_loss
+
+        # Using an intervention head or not?
+        if self._use_intervention_head:
+            raw_intervention_loss = intervention_dist.imitation_loss(
+                intervention_mask.long(), reduction="none"
+            ).reshape(pad_mask.shape)
+            intervention_loss = raw_intervention_loss * pad_mask
+            intervention_acc = intervention_dist.imitation_accuracy(
+                intervention_mask.long(),
+                mask=pad_mask,
+            )
+            intervention_loss = torch.sum(intervention_loss) / pad_mask.sum()
+            loss = action_loss + self._intervention_loss_weight * intervention_loss
+        else:
+            intervention_loss = action_loss.new_zeros(())
+            intervention_acc = action_loss.new_ones(())
+            loss = action_loss
+
         log_dict = {
             "action_loss": action_loss,
             "intervention_loss": intervention_loss,
@@ -278,7 +321,7 @@ class ResidualPolicy(BasePolicy):
         if not is_train:
             # use the combined loss as a proxy for evaluation
             log_dict.update({
-                "l1": action_loss + intervention_loss,
+                "l1": loss,
             })
         return loss, log_dict, real_batch_size
     
