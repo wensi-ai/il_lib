@@ -1,19 +1,51 @@
-from .act_policy import ACT
-from .base_chunk_diffusion_policy import BaseChunkDiffusionPolicy
-from .base_chunk_policy import BaseChunkPolicy
-from .bcrnn_policy import BC_RNN
-from .diffusion_policy import DiffusionPolicy
-from .residual_policy import ResidualPolicy
-from .simple_residual_policy import SimpleResidualPolicy
-from .wbvima_policy import WBVIMA
-
 __all__ = [
     "ACT",
     "BaseChunkDiffusionPolicy",
     "BaseChunkPolicy",
     "BC_RNN",
     "DiffusionPolicy",
+    "InterventionClassifier",
     "ResidualPolicy",
     "SimpleResidualPolicy",
     "WBVIMA",
 ]
+
+
+def __getattr__(name):
+    if name == "ACT":
+        from .act_policy import ACT
+
+        return ACT
+    if name == "BaseChunkDiffusionPolicy":
+        from .base_chunk_diffusion_policy import BaseChunkDiffusionPolicy
+
+        return BaseChunkDiffusionPolicy
+    if name == "BaseChunkPolicy":
+        from .base_chunk_policy import BaseChunkPolicy
+
+        return BaseChunkPolicy
+    if name == "BC_RNN":
+        from .bcrnn_policy import BC_RNN
+
+        return BC_RNN
+    if name == "DiffusionPolicy":
+        from .diffusion_policy import DiffusionPolicy
+
+        return DiffusionPolicy
+    if name == "InterventionClassifier":
+        from .intervention_classifier import InterventionClassifier
+
+        return InterventionClassifier
+    if name == "ResidualPolicy":
+        from .residual_policy import ResidualPolicy
+
+        return ResidualPolicy
+    if name == "SimpleResidualPolicy":
+        from .simple_residual_policy import SimpleResidualPolicy
+
+        return SimpleResidualPolicy
+    if name == "WBVIMA":
+        from .wbvima_policy import WBVIMA
+
+        return WBVIMA
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
