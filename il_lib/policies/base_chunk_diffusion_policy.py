@@ -218,7 +218,7 @@ class BaseChunkDiffusionPolicy(BasePolicy):
         chunk_mask = pad_mask[:, -1]
         current_intervention = self._current_intervention(intervention_mask)
         target_int_state = int_state[:, -1]
-        if self._use_intervention_head and self._action_loss_on_intervention_only:
+        if self._action_loss_on_intervention_only:
             chunk_mask = chunk_mask & current_intervention[:, -1:].expand_as(chunk_mask)
         elif self._exclude_pre_intervention_from_action_loss:
             chunk_mask = chunk_mask & (target_int_state != 1)
@@ -272,7 +272,7 @@ class BaseChunkDiffusionPolicy(BasePolicy):
             pred_action = self._sample_action(batch)
             target_action_for_metrics = target_action
             full_future_mask = pad_mask[:, -1]
-            if self._use_intervention_head and self._action_loss_on_intervention_only:
+            if self._action_loss_on_intervention_only:
                 full_future_mask = full_future_mask & current_intervention[:, -1:].expand_as(full_future_mask)
             elif self._exclude_pre_intervention_from_action_loss:
                 full_future_mask = full_future_mask & (target_int_state != 1)
