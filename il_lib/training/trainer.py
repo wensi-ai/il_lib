@@ -1,9 +1,12 @@
 from typing import List
 import logging
+import os
+import socket
 import time
 from copy import deepcopy
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf, ListConfig
+import torch
 import il_lib.utils.file_utils as FU
 import il_lib.utils.config_utils as CU
 import il_lib.utils.print_utils as PU
@@ -133,7 +136,7 @@ class Trainer:
             loggers = [
                 pl_loggers.CSVLogger(self.run_dir, name="logs", version=""),
             ]
-        if cfg.use_wandb:
+        if cfg.use_wandb and self._wandb_supported_in_runtime():
             wandb_kwargs = {
                 "name": cfg.wandb_run_name,
                 "project": cfg.wandb_project,
@@ -145,6 +148,19 @@ class Trainer:
                 wandb_kwargs["entity"] = cfg.wandb_entity
             loggers.append(pl_loggers.WandbLogger(**wandb_kwargs))
         return loggers
+
+    def _wandb_supported_in_runtime(self) -> bool:
+        cache_dir = os.path.expanduser("~/.cache")
+        if not os.access(cache_dir, os.W_OK):
+            rank_zero_warn(f"W&B disabled because cache directory is not writable: {cache_dir}")
+            return False
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 0))
+        except OSError as exc:
+            rank_zero_warn(f"W&B disabled because local sockets are unavailable: {exc}")
+            return False
+        return True
 
     def create_callbacks(self, cfg) -> List[Callback]:
         ModelCheckpoint.FILE_EXTENSION = ".pth"
@@ -173,7 +189,19 @@ class Trainer:
                 return cfg.trainer.pop("strategy")
         return None
 
+    def _normalize_trainer_cfg_for_runtime(self, cfg):
+        trainer_cfg = cfg.trainer
+        accelerator = trainer_cfg.get("accelerator", "auto")
+        if accelerator == "gpu" and not torch.cuda.is_available():
+            rank_zero_warn("GPU requested but CUDA is unavailable. Falling back to CPU training.")
+            trainer_cfg.accelerator = "cpu"
+            trainer_cfg.devices = 1
+            trainer_cfg.benchmark = False
+            trainer_cfg.strategy = "auto"
+        return cfg
+
     def create_trainer(self, cfg) -> pl.Trainer:
+        cfg = self._normalize_trainer_cfg_for_runtime(cfg)
         return pl.Trainer(
             logger=self.create_loggers(cfg),
             callbacks=self.create_callbacks(cfg),

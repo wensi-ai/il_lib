@@ -1,6 +1,11 @@
+import atexit
 import logging
 import os
 import sys
+from pathlib import Path
+from time import perf_counter
+
+import h5py
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -477,7 +482,7 @@ class ResidualPolicyWrapper(PolicyWrapper):
     with different action execution frequencies.
     
     Base policy: Predicts action chunks (e.g., 16 actions every 16 steps)
-    Residual policy: Predicts per-step corrections (1 correction every step)
+    Residual policy: Predicts correction chunks at its deployment frequency
     """
 
     def __init__(
@@ -488,8 +493,14 @@ class ResidualPolicyWrapper(PolicyWrapper):
         base_policy_ckpt_path: str,
         base_policy_overrides: Optional[List[str]] = None,
         residual_deployed_action_steps: int = 1,  # Residual policy's action step (usually 1)
+        trace_hdf5_path: Optional[str] = None,
+        trace_overwrite: bool = False,
         **kwargs,
     ) -> None:
+        compat_deployed_action_steps = kwargs.pop("deployed_action_steps", None)
+        if compat_deployed_action_steps is not None:
+            residual_deployed_action_steps = compat_deployed_action_steps
+
         # Initialize parent with residual policy's deployment frequency
         super().__init__(*args, deployed_action_steps=residual_deployed_action_steps, **kwargs)
         
@@ -497,12 +508,152 @@ class ResidualPolicyWrapper(PolicyWrapper):
         self.base_deployed_action_steps = base_deployed_action_steps
         self._base_action_buffer = None  # Will store (T_A, A) from base policy
         self._base_action_idx = 0
+        self._residual_action_buffer = None
+        self._residual_intervention_buffer = None
+        self._residual_action_idx = 0
+        self._intervention_steps_remaining = 0
         self.base_policy = None  # Will be set to the base policy from residual_policy.base_policy
         self._base_obs_history = None  # Created lazily once the base policy is attached
         self._base_policy_name = base_policy
         self._base_policy_ckpt_path = base_policy_ckpt_path
         self._base_policy_overrides = base_policy_overrides
         self._base_policy_device = None
+
+        self._trace_hdf5_path = (
+            Path(trace_hdf5_path).expanduser().resolve()
+            if trace_hdf5_path is not None
+            else None
+        )
+        self._trace_overwrite = trace_overwrite
+        self._trace_file = None
+        self._trace_demo_idx = 0
+        self._trace_step_idx = 0
+        self._trace_episode_start_time = None
+        self._trace_steps: List[Dict[str, torch.Tensor]] = []
+        self._trace_closed = False
+        if self._trace_hdf5_path is not None:
+            self._init_trace_writer()
+            atexit.register(self.close)
+
+    def _init_trace_writer(self) -> None:
+        assert self._trace_hdf5_path is not None
+        self._trace_hdf5_path.parent.mkdir(parents=True, exist_ok=True)
+        file_mode = "w" if self._trace_overwrite else "a"
+        self._trace_file = h5py.File(self._trace_hdf5_path, file_mode)
+        if "data" not in self._trace_file:
+            self._trace_file.create_group("data")
+        existing_demo_ids = []
+        for key in self._trace_file["data"].keys():
+            if key.startswith("demo_"):
+                try:
+                    existing_demo_ids.append(int(key.split("_")[-1]))
+                except ValueError:
+                    continue
+        self._trace_demo_idx = max(existing_demo_ids, default=-1) + 1
+        logger.info("Residual trace logging enabled: %s", self._trace_hdf5_path)
+
+    def _to_trace_tensor(self, value: torch.Tensor) -> torch.Tensor:
+        return value.detach().to("cpu", copy=True).reshape(-1).to(torch.float32)
+
+    def _record_trace_step(
+        self,
+        *,
+        base_action: torch.Tensor,
+        residual_action: torch.Tensor,
+        combined_action: torch.Tensor,
+        applied_action: torch.Tensor,
+        intervention: torch.Tensor,
+    ) -> None:
+        if self._trace_hdf5_path is None:
+            return
+        if self._trace_episode_start_time is None:
+            self._trace_episode_start_time = perf_counter()
+            self._trace_step_idx = 0
+
+        self._trace_steps.append(
+            {
+                "base_action": self._to_trace_tensor(base_action),
+                "residual_action": self._to_trace_tensor(residual_action),
+                "combined_action": self._to_trace_tensor(combined_action),
+                "applied_action": self._to_trace_tensor(applied_action),
+                # Keep this alias so the existing correction visualizer can render
+                # residual traces without requiring a new dataset schema.
+                "oracle_action": self._to_trace_tensor(combined_action),
+                "intervention": self._to_trace_tensor(intervention),
+                "is_oracle_active": self._to_trace_tensor(intervention >= 0.5),
+                "int_state": self._to_trace_tensor(
+                    torch.where(intervention >= 0.5, 2.0, 1.0)
+                ),
+                "timestamp_ms": torch.tensor(
+                    [1000.0 * (perf_counter() - self._trace_episode_start_time)],
+                    dtype=torch.float32,
+                ),
+            }
+        )
+        self._trace_step_idx += 1
+
+    def _flush_trace_demo(self) -> None:
+        if self._trace_file is None or not self._trace_steps:
+            self._trace_steps = []
+            self._trace_episode_start_time = None
+            self._trace_step_idx = 0
+            return
+
+        data_group = self._trace_file["data"]
+        demo_key = f"demo_{self._trace_demo_idx}"
+        if demo_key in data_group:
+            del data_group[demo_key]
+        demo_group = data_group.create_group(demo_key)
+        policy_group = demo_group.create_group("policy")
+        time_group = demo_group.create_group("time")
+
+        def _stack(name: str) -> torch.Tensor:
+            return torch.stack([step[name] for step in self._trace_steps], dim=0)
+
+        base_action = _stack("base_action").numpy()
+        residual_action = _stack("residual_action").numpy()
+        combined_action = _stack("combined_action").numpy()
+        applied_action = _stack("applied_action").numpy()
+        oracle_action = _stack("oracle_action").numpy()
+        intervention = _stack("intervention").numpy()
+        is_oracle_active = _stack("is_oracle_active").numpy()
+        int_state = _stack("int_state").numpy()
+        timestamp_ms = _stack("timestamp_ms").numpy()
+
+        demo_group.create_dataset("action", data=applied_action)
+        policy_group.create_dataset("base_action", data=base_action)
+        policy_group.create_dataset("residual_action", data=residual_action)
+        policy_group.create_dataset("combined_action", data=combined_action)
+        policy_group.create_dataset("applied_action", data=applied_action)
+        policy_group.create_dataset("oracle_action", data=oracle_action)
+        policy_group.create_dataset("intervention", data=intervention)
+        policy_group.create_dataset("is_oracle_active", data=is_oracle_active)
+        policy_group.create_dataset("int_state", data=int_state)
+        time_group.create_dataset("timestamp_ms", data=timestamp_ms)
+        demo_group.attrs["source"] = "ResidualPolicyWrapper"
+
+        self._trace_file.flush()
+        logger.info(
+            "Saved residual trace %s with %d steps to %s",
+            demo_key,
+            len(self._trace_steps),
+            self._trace_hdf5_path,
+        )
+        self._trace_demo_idx += 1
+        self._trace_steps = []
+        self._trace_episode_start_time = None
+        self._trace_step_idx = 0
+
+    def close(self) -> None:
+        if self._trace_closed:
+            return
+        self._trace_closed = True
+        try:
+            self._flush_trace_demo()
+        finally:
+            if self._trace_file is not None:
+                self._trace_file.close()
+                self._trace_file = None
 
     def _get_base_policy(self):
         if self.base_policy is None:
@@ -544,7 +695,7 @@ class ResidualPolicyWrapper(PolicyWrapper):
         """
         Coordinated action generation:
         1. Get base action from buffer (refresh every base_deployed_action_steps)
-        2. Get residual correction from residual policy (every step)
+        2. Get residual correction from residual policy
         3. Combine: final_action = base_action + residual_correction
         """
         obs = any_to_torch(obs, device="cpu")
@@ -562,31 +713,96 @@ class ResidualPolicyWrapper(PolicyWrapper):
             self._stack_obs_history(obs, history=self._base_obs_history)
         
         # Get current base action from buffer (raw radians, denormalized by base policy)
-        base_action = self._base_action_buffer[self._base_action_idx]  # (A,)
+        base_action_idx = self._base_action_idx
+        base_action = self._base_action_buffer[base_action_idx]  # (A,)
         self._base_action_idx += 1
         base_action = self._post_processing_fn(base_action)
 
         # Normalize base action back to [-1, 1] so it matches the residual's training space
         base_action_normalized = self._normalize_action(base_action.clone())
         if "base_action" in getattr(self.policy, "_features", set()):
-            residual_obs["obs"]["base_action"] = self._post_processing_fn(
-                base_action_normalized.view(1, 1, -1)
-            )
+            residual_horizon = getattr(self.policy, "action_prediction_horizon", 1)
+            if residual_horizon > 1:
+                base_action_chunk = self._base_action_buffer[
+                    base_action_idx : base_action_idx + residual_horizon
+                ]
+                if base_action_chunk.shape[0] < residual_horizon:
+                    pad = base_action_chunk[-1:].repeat(
+                        residual_horizon - base_action_chunk.shape[0], 1
+                    )
+                    base_action_chunk = torch.cat([base_action_chunk, pad], dim=0)
+                base_action_chunk = self._post_processing_fn(base_action_chunk)
+                base_action_chunk = self._normalize_action(base_action_chunk.clone())
+                residual_obs["obs"]["base_action"] = base_action_chunk.view(
+                    1, 1, residual_horizon, -1
+                )
+            else:
+                residual_obs["obs"]["base_action"] = self._post_processing_fn(
+                    base_action_normalized.view(1, 1, -1)
+                )
 
-        # ===== Residual Policy: Per-step Correction =====
-        # Get residual correction (intervention decision + action correction)
-        residual_action, intervention = self.policy.act(residual_obs["obs"])
-        residual_action = residual_action.squeeze()  # (A,)
-        intervention = intervention.squeeze()  # scalar
+        # ===== Residual Policy: Correction Chunk =====
+        need_residual_inference = (
+            self._residual_action_buffer is None
+            or self._residual_action_idx >= self._residual_action_buffer.shape[0]
+            or self._residual_action_idx % self.deployed_action_steps == 0
+        )
+        if need_residual_inference:
+            residual_action, intervention = self.policy.act(residual_obs["obs"])
+            residual_action = residual_action.squeeze(0)
+            if residual_action.dim() == 3:
+                residual_action = residual_action[-1]  # (T_A, A)
+            elif residual_action.dim() == 2:
+                residual_action = residual_action[-1:].clone()  # (1, A)
+            self._residual_action_buffer = residual_action
+
+            intervention = intervention.squeeze(0)
+            if intervention.dim() > 0:
+                intervention = intervention[-1]
+            self._residual_intervention_buffer = intervention.reshape(1).repeat(
+                self._residual_action_buffer.shape[0]
+            )
+            self._residual_action_idx = 0
+
+        residual_action = self._residual_action_buffer[self._residual_action_idx]
+        intervention = self._residual_intervention_buffer[self._residual_action_idx]
+        self._residual_action_idx += 1
+
+        min_intervention_steps = max(
+            1,
+            int(getattr(self.policy, "intervention_min_duration_steps", 1)),
+        )
+        intervention_active = bool(float(intervention) >= 0.5)
+        if intervention_active:
+            self._intervention_steps_remaining = max(
+                self._intervention_steps_remaining,
+                min_intervention_steps,
+            )
+        if self._intervention_steps_remaining > 0:
+            intervention = intervention.new_ones(intervention.shape)
+            self._intervention_steps_remaining -= 1
 
         # ===== Combine Actions =====
+        combined_normalized = base_action_normalized + residual_action
+        combined_action = self._denormalize_action(combined_normalized.clone())
         if intervention >= 0.5:  # Intervention needed
-            # Add residual in normalized space, then denormalize
-            combined_normalized = base_action_normalized + residual_action
-            final_action = self._denormalize_action(combined_normalized)
+            final_action = combined_action.clone()
+            residual_magnitude = residual_action.norm().item()
+            print(
+                f"Intervention active: applying combined action "
+                f"(residual_action_norm={residual_magnitude:.4f})"
+            )
         else:
             # No intervention, use base action as-is (already denormalized)
-            final_action = base_action
+            final_action = base_action.clone()
+
+        self._record_trace_step(
+            base_action=base_action,
+            residual_action=residual_action,
+            combined_action=combined_action,
+            applied_action=final_action,
+            intervention=intervention.reshape(1),
+        )
 
         return final_action
 
@@ -634,9 +850,119 @@ class ResidualPolicyWrapper(PolicyWrapper):
 
     def reset(self) -> None:
         """Reset both policies and their states"""
+        self._flush_trace_demo()
         super().reset()
         self._base_action_buffer = None
         self._base_action_idx = 0
+        self._residual_action_buffer = None
+        self._residual_intervention_buffer = None
+        self._residual_action_idx = 0
+        self._intervention_steps_remaining = 0
         self._base_obs_history = None
         if self.base_policy is not None:
             self.base_policy.reset()
+
+
+class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
+    """
+    A wrapper for policies that condition on a base policy chunk and directly predict
+    the final action chunk in the normalized action space.
+    """
+
+    def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
+        obs = any_to_torch(obs, device="cpu")
+        obs = self.process_obs(obs=obs)
+        policy_obs = {"obs": self._stack_obs_history(obs)}
+
+        need_base_inference = self._base_action_idx % self.base_deployed_action_steps == 0
+        if need_base_inference:
+            base_policy = self._get_base_policy()
+            base_obs = {"obs": self._stack_obs_history(obs, history=self._get_base_obs_history())}
+            self._base_action_buffer = base_policy.act(base_obs).squeeze(0)
+            self._base_action_idx = 0
+        elif self._base_obs_history is not None:
+            self._stack_obs_history(obs, history=self._base_obs_history)
+
+        base_action_idx = self._base_action_idx
+        base_action = self._post_processing_fn(self._base_action_buffer[base_action_idx])
+        self._base_action_idx += 1
+
+        residual_horizon = getattr(self.policy, "action_prediction_horizon", 1)
+        base_action_horizon = getattr(self.policy, "base_action_horizon", residual_horizon)
+        base_action_chunk = self._base_action_buffer[
+            base_action_idx : base_action_idx + base_action_horizon
+        ]
+        if base_action_chunk.shape[0] < base_action_horizon:
+            pad = base_action_chunk[-1:].repeat(base_action_horizon - base_action_chunk.shape[0], 1)
+            base_action_chunk = torch.cat([base_action_chunk, pad], dim=0)
+        base_action_chunk = self._post_processing_fn(base_action_chunk)
+        base_action_chunk = self._normalize_action(base_action_chunk.clone())
+        policy_obs["obs"]["base_action"] = base_action_chunk.view(1, 1, base_action_horizon, -1)
+
+        need_policy_inference = (
+            self._residual_action_buffer is None
+            or self._residual_action_idx >= self._residual_action_buffer.shape[0]
+            or self._residual_action_idx % self.deployed_action_steps == 0
+        )
+        if need_policy_inference:
+            pred_action, intervention = self.policy.act(policy_obs["obs"])
+            pred_action = pred_action.squeeze(0)
+            if pred_action.dim() == 3:
+                pred_action = pred_action[-1]
+            elif pred_action.dim() == 2:
+                pred_action = pred_action.clone()
+            self._residual_action_buffer = pred_action
+
+            intervention = intervention.squeeze(0)
+            if intervention.dim() > 0:
+                intervention = intervention[-1]
+            self._residual_intervention_buffer = intervention.reshape(1).repeat(
+                self._residual_action_buffer.shape[0]
+            )
+            self._residual_action_idx = 0
+
+        pred_action = self._residual_action_buffer[self._residual_action_idx]
+        intervention = self._residual_intervention_buffer[self._residual_action_idx]
+        self._residual_action_idx += 1
+
+        min_intervention_steps = max(
+            1,
+            int(getattr(self.policy, "intervention_min_duration_steps", 1)),
+        )
+        intervention_active = bool(float(intervention) >= 0.5)
+        if intervention_active:
+            self._intervention_steps_remaining = max(
+                self._intervention_steps_remaining,
+                min_intervention_steps,
+            )
+        if self._intervention_steps_remaining > 0:
+            intervention = intervention.new_ones(intervention.shape)
+            self._intervention_steps_remaining -= 1
+
+        pred_action = pred_action.clamp(-1.0, 1.0)
+        pred_action_denormalized = self._denormalize_action(pred_action.clone())
+        if intervention >= 0.5:
+            final_action = pred_action_denormalized
+            source_label = "\033[1m\033[92mBASE-CHUNK\033[0m"
+        else:
+            final_action = base_action.clone()
+            source_label = "\033[1m\033[94mBASE\033[0m"
+
+        print(
+            "\033[1m\033[96m[BaseChunkPolicyWrapper]\033[0m "
+            f"executing={source_label} "
+            f"intervention={float(intervention):.3f} "
+            f"chunk_step={self._residual_action_idx}/{self._residual_action_buffer.shape[0]} "
+            f"base_step={self._base_action_idx}/{self._base_action_buffer.shape[0]}",
+            flush=True,
+        )
+
+        self._record_trace_step(
+            base_action=base_action,
+            residual_action=pred_action - self._normalize_action(base_action.clone()),
+            combined_action=pred_action_denormalized,
+            applied_action=final_action,
+            intervention=intervention.reshape(1),
+        )
+
+        return final_action

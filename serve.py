@@ -67,7 +67,11 @@ def main():
             host=cfg.get("host", "0.0.0.0"),
             port=cfg.get("port", 8001),
         )
-        server.serve_forever()
+        try:
+            server.serve_forever()
+        finally:
+            if hasattr(policy_wrapper, "close"):
+                policy_wrapper.close()
 
 
 if __name__ == "__main__":

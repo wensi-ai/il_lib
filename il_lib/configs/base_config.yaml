@@ -67,6 +67,8 @@ data:
   dataloader_num_workers: 8
   shuffle: ${eval:'not ${trainer.use_distributed_sampler}'}
   max_num_demos: ${max_num_demos}
+  per_file_train_demo_limits: null
+  use_limit_overflow_as_val: false
   seed: ${seed}
   dataset_class: omnigibson.learning.datas.BehaviorIterableDataset
   # ====== Dataset ======

@@ -4,7 +4,52 @@ from il_lib.datas.dataset import DummyDataset
 from pytorch_lightning import LightningDataModule
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
+from pathlib import Path
 from typing import Optional
+
+
+def _parse_per_file_limits(value) -> dict[str, int]:
+    if value in (None, "", {}):
+        return {}
+    if isinstance(value, str):
+        limits = {}
+        for item in value.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" not in item:
+                raise ValueError(
+                    "per_file_train_demo_limits entries must look like filename.hdf5:count"
+                )
+            key, raw_count = item.rsplit(":", 1)
+            limits[key.strip()] = int(raw_count)
+        return limits
+    if isinstance(value, dict):
+        return {str(key): int(limit) for key, limit in value.items()}
+    limits = {}
+    for item in value:
+        if isinstance(item, str):
+            key, raw_count = item.rsplit(":", 1)
+            limits[key.strip()] = int(raw_count)
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            limits[str(item[0])] = int(item[1])
+        else:
+            raise ValueError(f"Unsupported per-file limit entry: {item!r}")
+    return limits
+
+
+def _demo_source_name(demo_key) -> str:
+    filename = getattr(getattr(demo_key, "file", None), "filename", "")
+    return Path(filename).name
+
+
+def _limit_for_source(source_name: str, limits: dict[str, int]) -> Optional[int]:
+    if source_name in limits:
+        return limits[source_name]
+    source_stem = Path(source_name).stem
+    if source_stem in limits:
+        return limits[source_stem]
+    return None
 
 
 class BehaviorDataModule(LightningDataModule):
@@ -20,6 +65,8 @@ class BehaviorDataModule(LightningDataModule):
         seed: int,
         shuffle: bool,
         max_num_demos: Optional[int] = None,
+        per_file_train_demo_limits=None,
+        use_limit_overflow_as_val: bool = False,
         dataset_class: str,
         **kwargs,
     ):
@@ -34,11 +81,48 @@ class BehaviorDataModule(LightningDataModule):
         self._seed = seed
         self._shuffle = shuffle
         self._dataset_class = dataset_class
+        self._per_file_train_demo_limits = _parse_per_file_limits(per_file_train_demo_limits)
+        self._use_limit_overflow_as_val = use_limit_overflow_as_val
         # store args and kwargs for dataset initialization
         self._args = args
         self._kwargs = kwargs
 
         self._train_dataset, self._val_dataset = None, None
+
+    def _split_demo_keys(self, all_demo_keys):
+        if not self._per_file_train_demo_limits:
+            if self._max_num_demos is not None:
+                all_demo_keys = all_demo_keys[: self._max_num_demos]
+            return train_test_split(
+                all_demo_keys,
+                test_size=self._val_split_ratio,
+                shuffle=False,
+            )
+
+        source_counts = {}
+        train_demo_keys, val_demo_keys = [], []
+        for demo_key in all_demo_keys:
+            source_name = _demo_source_name(demo_key)
+            limit = _limit_for_source(source_name, self._per_file_train_demo_limits)
+            if limit is None:
+                train_demo_keys.append(demo_key)
+                continue
+            count = source_counts.get(source_name, 0)
+            source_counts[source_name] = count + 1
+            if count < limit:
+                train_demo_keys.append(demo_key)
+            elif self._use_limit_overflow_as_val:
+                val_demo_keys.append(demo_key)
+
+        if self._max_num_demos is not None:
+            train_demo_keys = train_demo_keys[: self._max_num_demos]
+        if val_demo_keys:
+            return train_demo_keys, val_demo_keys
+        return train_test_split(
+            train_demo_keys,
+            test_size=self._val_split_ratio,
+            shuffle=False,
+        )
 
     def setup(self, stage: str) -> None:
         if stage == "fit" or stage is None:
@@ -46,14 +130,7 @@ class BehaviorDataModule(LightningDataModule):
             module_path, class_name = self._dataset_class.rsplit(".", 1)
             DatasetClassModule = getattr(importlib.import_module(module_path), class_name)
             all_demo_keys = DatasetClassModule.get_all_demo_keys(self._data_path, self._task_name)
-            # limit number of demos
-            if self._max_num_demos is not None:
-                all_demo_keys = all_demo_keys[: self._max_num_demos]
-            self._train_demo_keys, self._val_demo_keys = train_test_split(
-                all_demo_keys,
-                test_size=self._val_split_ratio,
-                shuffle=False,
-            )
+            self._train_demo_keys, self._val_demo_keys = self._split_demo_keys(all_demo_keys)
             # initialize datasets
             self._train_dataset = DatasetClassModule(
                 *self._args,
