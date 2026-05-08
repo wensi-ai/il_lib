@@ -5,6 +5,7 @@ __all__ = [
     "BC_RNN",
     "DiffusionPolicy",
     "InterventionClassifier",
+    "ResidualDiffusionPolicy",
     "ResidualPolicy",
     "SimpleResidualPolicy",
     "WBVIMA",
@@ -36,6 +37,10 @@ def __getattr__(name):
         from .intervention_classifier import InterventionClassifier
 
         return InterventionClassifier
+    if name == "ResidualDiffusionPolicy":
+        from .residual_diffusion_policy import ResidualDiffusionPolicy
+
+        return ResidualDiffusionPolicy
     if name == "ResidualPolicy":
         from .residual_policy import ResidualPolicy
 

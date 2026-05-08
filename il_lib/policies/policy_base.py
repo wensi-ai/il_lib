@@ -493,6 +493,12 @@ class ResidualPolicyWrapper(PolicyWrapper):
         base_policy_ckpt_path: str,
         base_policy_overrides: Optional[List[str]] = None,
         residual_deployed_action_steps: int = 1,  # Residual policy's action step (usually 1)
+        intervention_policy: Optional[str] = None,
+        intervention_policy_ckpt_path: Optional[str] = None,
+        intervention_policy_overrides: Optional[List[str]] = None,
+        intervention_policy_threshold: Optional[float] = None,
+        intervention_include_current_action_in_history: bool = False,
+        intervention_prop_keys: Optional[List[str]] = None,
         trace_hdf5_path: Optional[str] = None,
         trace_overwrite: bool = False,
         **kwargs,
@@ -518,6 +524,20 @@ class ResidualPolicyWrapper(PolicyWrapper):
         self._base_policy_ckpt_path = base_policy_ckpt_path
         self._base_policy_overrides = base_policy_overrides
         self._base_policy_device = None
+        self.intervention_policy = None
+        self._intervention_policy_name = intervention_policy
+        self._intervention_policy_ckpt_path = intervention_policy_ckpt_path
+        self._intervention_policy_overrides = intervention_policy_overrides
+        self._intervention_policy_threshold = intervention_policy_threshold
+        self._intervention_include_current_action_in_history = (
+            intervention_include_current_action_in_history
+        )
+        self._intervention_prop_keys = intervention_prop_keys or [
+            "qpos/arm",
+            "qpos/gripper",
+        ]
+        self._intervention_obs_history = None
+        self._executed_action_history = None
 
         self._trace_hdf5_path = (
             Path(trace_hdf5_path).expanduser().resolve()
@@ -702,6 +722,17 @@ class ResidualPolicyWrapper(PolicyWrapper):
             self._base_policy_device = self.policy.device
         return self.base_policy
 
+    def _get_intervention_policy(self):
+        if self._intervention_policy_name is None:
+            return None
+        if self.intervention_policy is None:
+            self.intervention_policy = self._instantiate_arch_module(
+                arch_name=self._intervention_policy_name,
+                ckpt_path=self._intervention_policy_ckpt_path,
+                extra_overrides=self._intervention_policy_overrides,
+            )
+        return self.intervention_policy
+
     def _get_base_obs_history(self) -> deque:
         base_policy = self._get_base_policy()
         if base_policy is None:
@@ -710,6 +741,123 @@ class ResidualPolicyWrapper(PolicyWrapper):
             base_obs_window_size = getattr(base_policy, "num_latest_obs", self.obs_window_size)
             self._base_obs_history = deque(maxlen=base_obs_window_size)
         return self._base_obs_history
+
+    def _get_intervention_input_steps(self, key: str, default: int = 1) -> int:
+        intervention_policy = self._get_intervention_policy()
+        if intervention_policy is None:
+            return default
+        cfg = getattr(intervention_policy, "input_configs", {})
+        if key not in cfg:
+            return default
+        return int(cfg[key]["steps"])
+
+    def _get_intervention_obs_history(self) -> deque:
+        intervention_policy = self._get_intervention_policy()
+        if intervention_policy is None:
+            raise ValueError("intervention_policy not found for residual inference.")
+        if self._intervention_obs_history is None:
+            obs_steps = max(
+                self._get_intervention_input_steps("proprioception", default=1),
+                self._get_intervention_input_steps("task", default=1),
+            )
+            self._intervention_obs_history = deque(maxlen=obs_steps)
+        return self._intervention_obs_history
+
+    def _get_executed_action_history(self) -> deque:
+        if self._executed_action_history is None:
+            history_steps = self._get_intervention_input_steps("action_history", default=1)
+            self._executed_action_history = deque(maxlen=history_steps)
+        return self._executed_action_history
+
+    def _append_executed_action(self, normalized_action: torch.Tensor) -> None:
+        if self._intervention_policy_name is None:
+            return
+        history = self._get_executed_action_history()
+        history.append(normalized_action.detach().clone())
+
+    def _pad_action_sequence(
+        self,
+        sequence: torch.Tensor,
+        target_steps: int,
+        *,
+        pad_with_last: bool = True,
+    ) -> torch.Tensor:
+        if sequence.shape[0] >= target_steps:
+            return sequence[:target_steps]
+        if sequence.shape[0] == 0:
+            raise ValueError("Cannot pad an empty action sequence.")
+        pad_value = sequence[-1:] if pad_with_last else torch.zeros_like(sequence[:1])
+        pad = pad_value.repeat(target_steps - sequence.shape[0], 1)
+        return torch.cat([sequence, pad], dim=0)
+
+    def _build_intervention_inputs(
+        self,
+        *,
+        obs: dict,
+        base_action_chunk: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        intervention_policy = self._get_intervention_policy()
+        if intervention_policy is None:
+            raise ValueError("Standalone intervention policy is not configured.")
+
+        input_keys = getattr(intervention_policy, "input_keys", [])
+        obs_window = self._stack_obs_history(obs, history=self._get_intervention_obs_history())
+        inputs = {}
+        if "proprioception" in input_keys:
+            prop_obs = []
+            for prop_key in self._intervention_prop_keys:
+                group, key = prop_key.split("/", 1)
+                prop_obs.append(obs_window[group][key])
+            inputs["proprioception"] = torch.cat(prop_obs, dim=-1)
+        if "task" in input_keys:
+            if "task" not in obs_window:
+                raise KeyError("Intervention policy expects task input, but task info is unavailable.")
+            inputs["task"] = obs_window["task"]
+        if "base_action_chunk" in input_keys:
+            steps = self._get_intervention_input_steps(
+                "base_action_chunk", default=base_action_chunk.shape[0]
+            )
+            base_chunk = self._pad_action_sequence(base_action_chunk, steps, pad_with_last=True)
+            inputs["base_action_chunk"] = base_chunk.unsqueeze(0)
+        if "action_history" in input_keys:
+            steps = self._get_intervention_input_steps("action_history", default=1)
+            history = list(self._get_executed_action_history())
+            history_values = history[-steps:]
+            if history_values:
+                history_tensor = torch.stack(history_values, dim=0)
+                if history_tensor.shape[0] < steps:
+                    pad = torch.zeros(
+                        (steps - history_tensor.shape[0], history_tensor.shape[-1]),
+                        device=history_tensor.device,
+                        dtype=history_tensor.dtype,
+                    )
+                    history_tensor = torch.cat([pad, history_tensor], dim=0)
+            else:
+                history_tensor = torch.zeros(
+                    (steps, self.policy.action_dim),
+                    device=base_action_chunk.device,
+                    dtype=base_action_chunk.dtype,
+                )
+            inputs["action_history"] = history_tensor.unsqueeze(0)
+        return inputs
+
+    @torch.no_grad()
+    def _predict_standalone_intervention(
+        self,
+        *,
+        obs: dict,
+        base_action_chunk: torch.Tensor,
+    ) -> torch.Tensor:
+        intervention_policy = self._get_intervention_policy()
+        if intervention_policy is None:
+            raise ValueError("Standalone intervention policy is not configured.")
+        inputs = self._build_intervention_inputs(obs=obs, base_action_chunk=base_action_chunk)
+        logits = intervention_policy(inputs)
+        probs = torch.sigmoid(logits)
+        threshold = self._intervention_policy_threshold
+        if threshold is None:
+            threshold = float(getattr(intervention_policy, "decision_threshold", 0.5))
+        return (probs >= threshold).to(torch.float32)
     
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
         """
@@ -740,26 +888,28 @@ class ResidualPolicyWrapper(PolicyWrapper):
 
         # Normalize base action back to [-1, 1] so it matches the residual's training space
         base_action_normalized = self._normalize_action(base_action.clone())
+        residual_horizon = getattr(self.policy, "action_prediction_horizon", 1)
+        intervention_chunk_steps = self._get_intervention_input_steps(
+            "base_action_chunk", default=residual_horizon
+        )
+        base_action_chunk_steps = max(residual_horizon, intervention_chunk_steps)
+        base_action_chunk = self._base_action_buffer[
+            base_action_idx : base_action_idx + base_action_chunk_steps
+        ]
+        if base_action_chunk.shape[0] < base_action_chunk_steps:
+            pad = base_action_chunk[-1:].repeat(
+                base_action_chunk_steps - base_action_chunk.shape[0], 1
+            )
+            base_action_chunk = torch.cat([base_action_chunk, pad], dim=0)
+        base_action_chunk = self._post_processing_fn(base_action_chunk)
+        base_action_chunk = self._normalize_action(base_action_chunk.clone())
         if "base_action" in getattr(self.policy, "_features", set()):
-            residual_horizon = getattr(self.policy, "action_prediction_horizon", 1)
             if residual_horizon > 1:
-                base_action_chunk = self._base_action_buffer[
-                    base_action_idx : base_action_idx + residual_horizon
-                ]
-                if base_action_chunk.shape[0] < residual_horizon:
-                    pad = base_action_chunk[-1:].repeat(
-                        residual_horizon - base_action_chunk.shape[0], 1
-                    )
-                    base_action_chunk = torch.cat([base_action_chunk, pad], dim=0)
-                base_action_chunk = self._post_processing_fn(base_action_chunk)
-                base_action_chunk = self._normalize_action(base_action_chunk.clone())
-                residual_obs["obs"]["base_action"] = base_action_chunk.view(
+                residual_obs["obs"]["base_action"] = base_action_chunk[:residual_horizon].view(
                     1, 1, residual_horizon, -1
                 )
             else:
-                residual_obs["obs"]["base_action"] = self._post_processing_fn(
-                    base_action_normalized.view(1, 1, -1)
-                )
+                residual_obs["obs"]["base_action"] = base_action_normalized.view(1, 1, -1)
 
         # ===== Residual Policy: Correction Chunk =====
         need_residual_inference = (
@@ -776,16 +926,23 @@ class ResidualPolicyWrapper(PolicyWrapper):
                 residual_action = residual_action[-1:].clone()  # (1, A)
             self._residual_action_buffer = residual_action
 
-            intervention = intervention.squeeze(0)
-            if intervention.dim() > 0:
-                intervention = intervention[-1]
-            self._residual_intervention_buffer = intervention.reshape(1).repeat(
-                self._residual_action_buffer.shape[0]
-            )
+            if self._intervention_policy_name is None:
+                intervention = intervention.squeeze(0)
+                if intervention.dim() > 0:
+                    intervention = intervention[-1]
+                self._residual_intervention_buffer = intervention.reshape(1).repeat(
+                    self._residual_action_buffer.shape[0]
+                )
             self._residual_action_idx = 0
 
         residual_action = self._residual_action_buffer[self._residual_action_idx]
-        intervention = self._residual_intervention_buffer[self._residual_action_idx]
+        if self._intervention_policy_name is not None:
+            intervention = self._predict_standalone_intervention(
+                obs=obs,
+                base_action_chunk=base_action_chunk,
+            ).reshape(-1)[0]
+        else:
+            intervention = self._residual_intervention_buffer[self._residual_action_idx]
         self._residual_action_idx += 1
 
         min_intervention_steps = max(
@@ -807,14 +964,20 @@ class ResidualPolicyWrapper(PolicyWrapper):
         combined_action = self._denormalize_action(combined_normalized.clone())
         if intervention >= 0.5:  # Intervention needed
             final_action = combined_action.clone()
-            residual_magnitude = residual_action.norm().item()
-            print(
-                f"Intervention active: applying combined action "
-                f"(residual_action_norm={residual_magnitude:.4f})"
-            )
+            source_label = "\033[1m\033[92mRESIDUAL\033[0m"
         else:
             # No intervention, use base action as-is (already denormalized)
             final_action = base_action.clone()
+            source_label = "\033[1m\033[94mBASE\033[0m"
+
+        print(
+            "\033[1m\033[96m[ResidualPolicyWrapper]\033[0m "
+            f"executing={source_label} "
+            f"intervention={float(intervention):.3f} "
+            f"chunk_step={self._residual_action_idx}/{self._residual_action_buffer.shape[0]} "
+            f"base_step={self._base_action_idx}/{self._base_action_buffer.shape[0]}",
+            flush=True,
+        )
 
         self._record_trace_step(
             base_action=base_action,
@@ -822,6 +985,9 @@ class ResidualPolicyWrapper(PolicyWrapper):
             combined_action=combined_action,
             applied_action=final_action,
             intervention=intervention.reshape(1),
+        )
+        self._append_executed_action(
+            combined_normalized if intervention >= 0.5 else base_action_normalized
         )
 
         return final_action
@@ -879,6 +1045,8 @@ class ResidualPolicyWrapper(PolicyWrapper):
         self._residual_action_idx = 0
         self._intervention_steps_remaining = 0
         self._base_obs_history = None
+        self._intervention_obs_history = None
+        self._executed_action_history = None
         if self.base_policy is not None:
             self.base_policy.reset()
 
