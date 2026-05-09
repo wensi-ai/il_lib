@@ -748,7 +748,10 @@ class ResidualPolicyWrapper(PolicyWrapper):
             return default
         cfg = getattr(intervention_policy, "input_configs", {})
         if key not in cfg:
-            return default
+            step_cfg = getattr(intervention_policy, "input_steps", {})
+            if key not in step_cfg:
+                return default
+            return int(step_cfg[key])
         return int(cfg[key]["steps"])
 
     def _get_intervention_obs_history(self) -> deque:
@@ -759,6 +762,8 @@ class ResidualPolicyWrapper(PolicyWrapper):
             obs_steps = max(
                 self._get_intervention_input_steps("proprioception", default=1),
                 self._get_intervention_input_steps("task", default=1),
+                self._get_intervention_input_steps("rgb", default=1),
+                self._get_intervention_input_steps("rgbd", default=1),
             )
             self._intervention_obs_history = deque(maxlen=obs_steps)
         return self._intervention_obs_history
@@ -800,26 +805,37 @@ class ResidualPolicyWrapper(PolicyWrapper):
         if intervention_policy is None:
             raise ValueError("Standalone intervention policy is not configured.")
 
-        input_keys = getattr(intervention_policy, "input_keys", [])
+        input_keys = set(getattr(intervention_policy, "input_keys", []))
+        feature_keys = set(getattr(intervention_policy, "_features", []))
+        requested_inputs = input_keys | feature_keys
         obs_window = self._stack_obs_history(obs, history=self._get_intervention_obs_history())
         inputs = {}
-        if "proprioception" in input_keys:
+        if "proprioception" in requested_inputs:
             prop_obs = []
             for prop_key in self._intervention_prop_keys:
                 group, key = prop_key.split("/", 1)
                 prop_obs.append(obs_window[group][key])
             inputs["proprioception"] = torch.cat(prop_obs, dim=-1)
-        if "task" in input_keys:
+        if "task" in requested_inputs:
             if "task" not in obs_window:
                 raise KeyError("Intervention policy expects task input, but task info is unavailable.")
             inputs["task"] = obs_window["task"]
-        if "base_action_chunk" in input_keys:
+        if "rgb" in requested_inputs:
+            rgb_inputs = {
+                key.rsplit("::", 1)[0]: value.float() / 255.0
+                for key, value in obs_window.items()
+                if key.endswith("::rgb")
+            }
+            if not rgb_inputs:
+                raise KeyError("Intervention policy expects RGB input, but RGB observations are unavailable.")
+            inputs["rgb"] = rgb_inputs
+        if "base_action_chunk" in requested_inputs:
             steps = self._get_intervention_input_steps(
                 "base_action_chunk", default=base_action_chunk.shape[0]
             )
             base_chunk = self._pad_action_sequence(base_action_chunk, steps, pad_with_last=True)
             inputs["base_action_chunk"] = base_chunk.unsqueeze(0)
-        if "action_history" in input_keys:
+        if "action_history" in requested_inputs:
             steps = self._get_intervention_input_steps("action_history", default=1)
             history = list(self._get_executed_action_history())
             history_values = history[-steps:]
@@ -1101,7 +1117,10 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
             return default
         cfg = getattr(intervention_policy, "input_configs", {})
         if key not in cfg:
-            return default
+            step_cfg = getattr(intervention_policy, "input_steps", {})
+            if key not in step_cfg:
+                return default
+            return int(step_cfg[key])
         return int(cfg[key]["steps"])
 
     def _get_intervention_obs_history(self) -> deque:
@@ -1112,6 +1131,8 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
             obs_steps = max(
                 self._get_intervention_input_steps("proprioception", default=1),
                 self._get_intervention_input_steps("task", default=1),
+                self._get_intervention_input_steps("rgb", default=1),
+                self._get_intervention_input_steps("rgbd", default=1),
             )
             self._intervention_obs_history = deque(maxlen=obs_steps)
         return self._intervention_obs_history
@@ -1156,24 +1177,35 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
         if intervention_policy is None:
             raise ValueError("Standalone intervention policy is not configured.")
 
-        input_keys = getattr(intervention_policy, "input_keys", [])
+        input_keys = set(getattr(intervention_policy, "input_keys", []))
+        feature_keys = set(getattr(intervention_policy, "_features", []))
+        requested_inputs = input_keys | feature_keys
         obs_window = self._stack_obs_history(obs, history=self._get_intervention_obs_history())
         inputs = {}
-        if "proprioception" in input_keys:
+        if "proprioception" in requested_inputs:
             prop_obs = []
             for prop_key in self._intervention_prop_keys:
                 group, key = prop_key.split("/", 1)
                 prop_obs.append(obs_window[group][key])
             inputs["proprioception"] = torch.cat(prop_obs, dim=-1)
-        if "task" in input_keys:
+        if "task" in requested_inputs:
             if "task" not in obs_window:
                 raise KeyError("Intervention policy expects task input, but task info is unavailable.")
             inputs["task"] = obs_window["task"]
-        if "base_action_chunk" in input_keys:
+        if "rgb" in requested_inputs:
+            rgb_inputs = {
+                key.rsplit("::", 1)[0]: value.float() / 255.0
+                for key, value in obs_window.items()
+                if key.endswith("::rgb")
+            }
+            if not rgb_inputs:
+                raise KeyError("Intervention policy expects RGB input, but RGB observations are unavailable.")
+            inputs["rgb"] = rgb_inputs
+        if "base_action_chunk" in requested_inputs:
             steps = self._get_intervention_input_steps("base_action_chunk", default=base_action_chunk.shape[0])
             base_chunk = self._pad_action_sequence(base_action_chunk, steps, pad_with_last=True)
             inputs["base_action_chunk"] = base_chunk.unsqueeze(0)
-        if "action_history" in input_keys:
+        if "action_history" in requested_inputs:
             steps = self._get_intervention_input_steps("action_history", default=1)
             history = list(self._get_executed_action_history())
             history_values = history[-steps:]
