@@ -4,6 +4,7 @@ __all__ = [
     "BaseChunkPolicy",
     "BC_RNN",
     "DiffusionPolicy",
+    "GatedDiffusionPolicy",
     "InterventionClassifier",
     "ResidualDiffusionPolicy",
     "ResidualPolicy",
@@ -33,6 +34,10 @@ def __getattr__(name):
         from .diffusion_policy import DiffusionPolicy
 
         return DiffusionPolicy
+    if name == "GatedDiffusionPolicy":
+        from .gated_diffusion_policy import GatedDiffusionPolicy
+
+        return GatedDiffusionPolicy
     if name == "InterventionClassifier":
         from .intervention_classifier import InterventionClassifier
 

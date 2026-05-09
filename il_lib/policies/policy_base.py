@@ -1363,3 +1363,82 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
         super().reset()
         self._intervention_obs_history = None
         self._executed_action_history = None
+
+
+class GatedPolicyWrapper(ResidualPolicyWrapper):
+    """
+    Wrapper for policies that internally blend a base-policy action chunk with
+    a learned diffusion action chunk. There is no intervention policy/head.
+    """
+
+    def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
+        obs = any_to_torch(obs, device="cpu")
+        obs = self.process_obs(obs=obs)
+        policy_obs = {"obs": self._stack_obs_history(obs)}
+
+        need_base_inference = self._base_action_idx % self.base_deployed_action_steps == 0
+        if need_base_inference:
+            base_policy = self._get_base_policy()
+            base_obs = {"obs": self._stack_obs_history(obs, history=self._get_base_obs_history())}
+            self._base_action_buffer = base_policy.act(base_obs).squeeze(0)
+            self._base_action_idx = 0
+        elif self._base_obs_history is not None:
+            self._stack_obs_history(obs, history=self._base_obs_history)
+
+        base_action_idx = self._base_action_idx
+        base_action = self._post_processing_fn(self._base_action_buffer[base_action_idx])
+        self._base_action_idx += 1
+
+        action_horizon = getattr(self.policy, "action_prediction_horizon", 1)
+        base_action_horizon = getattr(self.policy, "base_action_horizon", action_horizon)
+        base_action_chunk = self._base_action_buffer[
+            base_action_idx : base_action_idx + base_action_horizon
+        ]
+        if base_action_chunk.shape[0] < base_action_horizon:
+            pad = base_action_chunk[-1:].repeat(base_action_horizon - base_action_chunk.shape[0], 1)
+            base_action_chunk = torch.cat([base_action_chunk, pad], dim=0)
+        base_action_chunk = self._post_processing_fn(base_action_chunk)
+        normalized_base_chunk = self._normalize_action(base_action_chunk.clone())
+        policy_obs["obs"]["base_action"] = normalized_base_chunk.view(1, 1, base_action_horizon, -1)
+
+        need_policy_inference = (
+            self._residual_action_buffer is None
+            or self._residual_action_idx >= self._residual_action_buffer.shape[0]
+            or self._residual_action_idx % self.deployed_action_steps == 0
+        )
+        if need_policy_inference:
+            pred_action = self.policy.act(policy_obs["obs"]).squeeze(0)
+            if pred_action.dim() == 3:
+                pred_action = pred_action[-1]
+            elif pred_action.dim() != 2:
+                raise ValueError(
+                    "Gated policy must return an action chunk with shape (H, A) "
+                    f"or (T, H, A), got {pred_action.shape}."
+                )
+            self._residual_action_buffer = pred_action
+            self._residual_action_idx = 0
+
+        pred_action = self._residual_action_buffer[self._residual_action_idx].clamp(-1.0, 1.0)
+        self._residual_action_idx += 1
+
+        final_action = self._denormalize_action(pred_action.clone())
+        base_action_normalized = self._normalize_action(base_action.clone())
+        gate_proxy = torch.ones(1, device=pred_action.device, dtype=pred_action.dtype)
+
+        print(
+            "\033[1m\033[96m[GatedPolicyWrapper]\033[0m "
+            f"executing=\033[1m\033[92mGATED\033[0m "
+            f"chunk_step={self._residual_action_idx}/{self._residual_action_buffer.shape[0]} "
+            f"base_step={self._base_action_idx}/{self._base_action_buffer.shape[0]}",
+            flush=True,
+        )
+
+        self._record_trace_step(
+            base_action=base_action,
+            residual_action=pred_action - base_action_normalized,
+            combined_action=final_action,
+            applied_action=final_action,
+            intervention=gate_proxy,
+        )
+
+        return final_action
