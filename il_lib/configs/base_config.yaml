@@ -63,7 +63,7 @@ data:
     - ${task.name}
   batch_size: ${bs}
   val_batch_size: ${vbs}
-  val_split_ratio: 0.0
+  val_split_ratio: 0.1
   dataloader_num_workers: 8
   shuffle: ${eval:'not ${trainer.use_distributed_sampler}'}
   max_num_demos: ${max_num_demos}
