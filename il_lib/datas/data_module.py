@@ -93,6 +93,8 @@ class BehaviorDataModule(LightningDataModule):
         if not self._per_file_train_demo_limits:
             if self._max_num_demos is not None:
                 all_demo_keys = all_demo_keys[: self._max_num_demos]
+            if self._val_split_ratio <= 0:
+                return all_demo_keys, []
             return train_test_split(
                 all_demo_keys,
                 test_size=self._val_split_ratio,
@@ -118,6 +120,8 @@ class BehaviorDataModule(LightningDataModule):
             train_demo_keys = train_demo_keys[: self._max_num_demos]
         if val_demo_keys:
             return train_demo_keys, val_demo_keys
+        if self._val_split_ratio <= 0:
+            return train_demo_keys, []
         return train_test_split(
             train_demo_keys,
             test_size=self._val_split_ratio,
@@ -139,13 +143,14 @@ class BehaviorDataModule(LightningDataModule):
                 demo_keys=self._train_demo_keys,
                 seed=self._seed,
             )
-            self._val_dataset = DatasetClassModule(
-                *self._args,
-                **self._kwargs,
-                data_path=self._data_path,
-                demo_keys=self._val_demo_keys,
-                seed=self._seed,
-            )
+            if self._val_demo_keys:
+                self._val_dataset = DatasetClassModule(
+                    *self._args,
+                    **self._kwargs,
+                    data_path=self._data_path,
+                    demo_keys=self._val_demo_keys,
+                    seed=self._seed,
+                )
 
     def train_dataloader(self) -> DataLoader:
         assert self._train_dataset is not None
@@ -160,7 +165,8 @@ class BehaviorDataModule(LightningDataModule):
         )
 
     def val_dataloader(self) -> DataLoader:
-        assert self._val_dataset is not None
+        if self._val_dataset is None:
+            return None
         return DataLoader(
             self._val_dataset,
             batch_size=self._val_batch_size,
