@@ -29,6 +29,10 @@ val_check_interval: 10000
 check_val_every_n_epoch: null
 online_eval: null
 
+training_stages:
+  enabled: false
+  stages: []
+
 horizon: ???
 num_latest_obs: ???
 deployed_action_steps: ???
@@ -97,7 +101,7 @@ trainer:
   max_steps: ${max_steps}
   val_check_interval: ${val_check_interval}
   check_val_every_n_epoch: ${check_val_every_n_epoch}
-  limit_val_batches: 0
+  limit_val_batches: 1.0
   gradient_clip_val: 1.0
   fast_dev_run: false
   use_distributed_sampler: true
@@ -111,6 +115,8 @@ trainer:
     - _target_: pytorch_lightning.callbacks.RichModelSummary
     - _target_: il_lib.training.trainer.CustomProgressBar
       refresh_rate: ${progress_bar_refresh_rate}
+    - _target_: il_lib.training.trainer.StagedTrainingCallback
+      stage_cfg: ${training_stages}
 
 # ====== Policy Wrapper ======
 policy_wrapper:

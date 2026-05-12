@@ -214,7 +214,7 @@ class InterventionClassifier(LightningModule):
             value = value.to(torch.float32)
             if value.dim() == 2:
                 value = value.unsqueeze(1)
-            if key == "base_action_chunk":
+            if key in {"base_action_chunk", "action_history"}:
                 seq_len = 1 if value.dim() == 3 else value.shape[1]
                 value = value.reshape(value.shape[0], seq_len, -1)
             prepared[key] = value

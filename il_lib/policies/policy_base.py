@@ -538,6 +538,7 @@ class ResidualPolicyWrapper(PolicyWrapper):
         ]
         self._intervention_obs_history = None
         self._executed_action_history = None
+        self._current_state = None
 
         self._trace_hdf5_path = (
             Path(trace_hdf5_path).expanduser().resolve()
@@ -554,6 +555,55 @@ class ResidualPolicyWrapper(PolicyWrapper):
         if self._trace_hdf5_path is not None:
             self._init_trace_writer()
             atexit.register(self.close)
+
+    def _clone_state_tensor(self, value: torch.Tensor) -> torch.Tensor:
+        return value.detach().to("cpu", copy=True)
+
+    def _chunk_intervention_min_steps(self) -> int:
+        policy_min_steps = int(getattr(self.policy, "intervention_min_duration_steps", 1))
+        buffer_steps = 1
+        if self._residual_action_buffer is not None:
+            buffer_steps = int(self._residual_action_buffer.shape[0])
+        return max(1, policy_min_steps, int(self.deployed_action_steps), buffer_steps)
+
+    def _set_current_state(
+        self,
+        *,
+        base_action: torch.Tensor,
+        predicted_action: torch.Tensor,
+        applied_action: torch.Tensor,
+        intervention: torch.Tensor,
+        residual_action: Optional[torch.Tensor] = None,
+    ) -> None:
+        intervention_flag = torch.as_tensor(
+            float(intervention.detach().reshape(-1)[0] >= 0.5),
+            device=applied_action.device,
+            dtype=applied_action.dtype,
+        )
+        state = {
+            "base_action": self._clone_state_tensor(base_action),
+            "raw_base_policy_action": self._clone_state_tensor(base_action),
+            "base_policy_action": self._clone_state_tensor(base_action),
+            "base_policy_action_chunk": self._clone_state_tensor(self._base_action_buffer),
+            "predicted_action": self._clone_state_tensor(predicted_action),
+            "applied_action": self._clone_state_tensor(applied_action),
+            "oracle_action": self._clone_state_tensor(applied_action),
+            "intervention": self._clone_state_tensor(intervention.reshape(1)),
+            "is_oracle_active": self._clone_state_tensor(intervention_flag.reshape(())),
+            "int_state": self._clone_state_tensor(
+                torch.where(
+                    intervention_flag >= 0.5,
+                    torch.as_tensor(2.0, device=applied_action.device, dtype=applied_action.dtype),
+                    torch.as_tensor(1.0, device=applied_action.device, dtype=applied_action.dtype),
+                ).reshape(())
+            ),
+        }
+        if residual_action is not None:
+            state["residual_action"] = self._clone_state_tensor(residual_action)
+        self._current_state = state
+
+    def get_current_state(self) -> Optional[Dict[str, torch.Tensor]]:
+        return self._current_state
 
     def _init_trace_writer(self) -> None:
         assert self._trace_hdf5_path is not None
@@ -961,10 +1011,7 @@ class ResidualPolicyWrapper(PolicyWrapper):
             intervention = self._residual_intervention_buffer[self._residual_action_idx]
         self._residual_action_idx += 1
 
-        min_intervention_steps = max(
-            1,
-            int(getattr(self.policy, "intervention_min_duration_steps", 1)),
-        )
+        min_intervention_steps = self._chunk_intervention_min_steps()
         intervention_active = bool(float(intervention) >= 0.5)
         if intervention_active:
             self._intervention_steps_remaining = max(
@@ -999,6 +1046,13 @@ class ResidualPolicyWrapper(PolicyWrapper):
             base_action=base_action,
             residual_action=residual_action,
             combined_action=combined_action,
+            applied_action=final_action,
+            intervention=intervention.reshape(1),
+        )
+        self._set_current_state(
+            base_action=base_action,
+            residual_action=residual_action,
+            predicted_action=combined_action,
             applied_action=final_action,
             intervention=intervention.reshape(1),
         )
@@ -1060,6 +1114,7 @@ class ResidualPolicyWrapper(PolicyWrapper):
         self._residual_intervention_buffer = None
         self._residual_action_idx = 0
         self._intervention_steps_remaining = 0
+        self._current_state = None
         self._base_obs_history = None
         self._intervention_obs_history = None
         self._executed_action_history = None
@@ -1314,10 +1369,7 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
             intervention = self._residual_intervention_buffer[self._residual_action_idx]
         self._residual_action_idx += 1
 
-        min_intervention_steps = max(
-            1,
-            int(getattr(self.policy, "intervention_min_duration_steps", 1)),
-        )
+        min_intervention_steps = self._chunk_intervention_min_steps()
         intervention_active = bool(float(intervention) >= 0.5)
         if intervention_active:
             self._intervention_steps_remaining = max(
@@ -1350,6 +1402,13 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
             base_action=base_action,
             residual_action=pred_action - self._normalize_action(base_action.clone()),
             combined_action=pred_action_denormalized,
+            applied_action=final_action,
+            intervention=intervention.reshape(1),
+        )
+        self._set_current_state(
+            base_action=base_action,
+            residual_action=pred_action - self._normalize_action(base_action.clone()),
+            predicted_action=pred_action_denormalized,
             applied_action=final_action,
             intervention=intervention.reshape(1),
         )
@@ -1437,6 +1496,13 @@ class GatedPolicyWrapper(ResidualPolicyWrapper):
             base_action=base_action,
             residual_action=pred_action - base_action_normalized,
             combined_action=final_action,
+            applied_action=final_action,
+            intervention=gate_proxy,
+        )
+        self._set_current_state(
+            base_action=base_action,
+            residual_action=pred_action - base_action_normalized,
+            predicted_action=final_action,
             applied_action=final_action,
             intervention=gate_proxy,
         )

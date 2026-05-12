@@ -8,6 +8,7 @@ from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.optim import CosineScheduleFunction
 from il_lib.policies.base_chunk_policy import _AlwaysInterveneDistribution
 from il_lib.policies.policy_base import BasePolicy
+from il_lib.utils.training_utils import freeze_params, unfreeze_params
 from il_lib.utils.array_tensor_utils import any_concat, get_batch_size
 from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
 from omegaconf import DictConfig
@@ -56,6 +57,9 @@ class BaseChunkDiffusionPolicy(BasePolicy):
         intervention_loss_weight: float = 1.0,
         action_loss_on_intervention_only: bool = True,
         exclude_pre_intervention_from_action_loss: bool = False,
+        training_loss_mode: Optional[str] = None,
+        freeze_feature_extractor: bool = False,
+        freeze_backbone: bool = False,
         lr: float = 1e-4,
         use_cosine_lr: bool = True,
         lr_warmup_steps: Optional[int] = None,
@@ -130,6 +134,11 @@ class BaseChunkDiffusionPolicy(BasePolicy):
         self._intervention_loss_weight = intervention_loss_weight
         self._action_loss_on_intervention_only = action_loss_on_intervention_only
         self._exclude_pre_intervention_from_action_loss = exclude_pre_intervention_from_action_loss
+        self._training_loss_mode = training_loss_mode or ("joint" if use_intervention_head else "action")
+        self._freeze_feature_extractor = freeze_feature_extractor
+        self._freeze_backbone = freeze_backbone
+        self._validate_training_loss_mode()
+        self._apply_freeze_config()
 
         self.lr = lr
         self.use_cosine_lr = use_cosine_lr
@@ -142,16 +151,75 @@ class BaseChunkDiffusionPolicy(BasePolicy):
 
         self.save_hyperparameters()
 
-    def forward(self, obs, noisy_traj, diffusion_timesteps):
+    def _validate_training_loss_mode(self) -> None:
+        valid_modes = {"action", "intervention", "joint"}
+        if self._training_loss_mode not in valid_modes:
+            raise ValueError(
+                f"training_loss_mode must be one of {sorted(valid_modes)}, "
+                f"got {self._training_loss_mode!r}."
+            )
+        if self._training_loss_mode in {"intervention", "joint"} and not self._use_intervention_head:
+            raise ValueError(
+                f"training_loss_mode={self._training_loss_mode!r} requires "
+                "use_intervention_head=True."
+            )
+
+    def _apply_freeze_config(self) -> None:
+        (freeze_params if self._freeze_feature_extractor else unfreeze_params)(self.feature_extractor)
+        (freeze_params if self._freeze_backbone else unfreeze_params)(self.backbone)
+        if self.intervention_head is not None:
+            unfreeze_params(self.intervention_head)
+
+    def set_training_stage(
+        self,
+        *,
+        loss_mode: Optional[str] = None,
+        freeze_feature_extractor: Optional[bool] = None,
+        freeze_backbone: Optional[bool] = None,
+        intervention_loss_weight: Optional[float] = None,
+        action_loss_on_intervention_only: Optional[bool] = None,
+        exclude_pre_intervention_from_action_loss: Optional[bool] = None,
+        **kwargs,
+    ) -> None:
+        if kwargs:
+            unknown = ", ".join(sorted(kwargs))
+            raise ValueError(f"Unknown BaseChunkDiffusionPolicy stage option(s): {unknown}")
+        if loss_mode is not None:
+            self._training_loss_mode = loss_mode
+            self._validate_training_loss_mode()
+        if freeze_feature_extractor is not None:
+            self._freeze_feature_extractor = bool(freeze_feature_extractor)
+        if freeze_backbone is not None:
+            self._freeze_backbone = bool(freeze_backbone)
+        if intervention_loss_weight is not None:
+            self._intervention_loss_weight = float(intervention_loss_weight)
+        if action_loss_on_intervention_only is not None:
+            self._action_loss_on_intervention_only = bool(action_loss_on_intervention_only)
+        if exclude_pre_intervention_from_action_loss is not None:
+            self._exclude_pre_intervention_from_action_loss = bool(exclude_pre_intervention_from_action_loss)
+        self._apply_freeze_config()
+
+    def enforce_training_stage(self) -> None:
+        self._apply_freeze_config()
+
+    def forward(self, obs, noisy_traj, diffusion_timesteps, compute_intervention: bool = True):
         obs_feature = self._encode_obs(obs)
-        pred = self.backbone(
-            sample=noisy_traj,
-            timestep=diffusion_timesteps,
-            cond=obs_feature,
-        )
+        if self.training and self._freeze_backbone:
+            with torch.no_grad():
+                pred = self.backbone(
+                    sample=noisy_traj,
+                    timestep=diffusion_timesteps,
+                    cond=obs_feature,
+                )
+        else:
+            pred = self.backbone(
+                sample=noisy_traj,
+                timestep=diffusion_timesteps,
+                cond=obs_feature,
+            )
         intervention_feature = obs_feature[:, -1:]
-        if self._use_intervention_head:
-            intervention_dist = self.intervention_head(intervention_feature)
+        if self._use_intervention_head and compute_intervention:
+            intervention_dist = self._intervention_dist_from_feature(intervention_feature)
         else:
             intervention_dist = _AlwaysInterveneDistribution(intervention_feature)
         return pred, intervention_dist
@@ -223,25 +291,31 @@ class BaseChunkDiffusionPolicy(BasePolicy):
         elif self._exclude_pre_intervention_from_action_loss:
             chunk_mask = chunk_mask & (target_int_state != 1)
 
-        noise = torch.randn(target_action.shape, device=target_action.device)
-        timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (B,),
-            device=target_action.device,
-        ).long()
-        noisy_trajs = self.noise_scheduler.add_noise(target_action, noise, timesteps)
-        pred, intervention_dist = self.forward(
-            obs=batch,
-            noisy_traj=noisy_trajs,
-            diffusion_timesteps=timesteps,
-        )
-        raw_action_loss = F.mse_loss(pred, noise, reduction="none").mean(dim=-1)
-        action_loss = raw_action_loss * chunk_mask
         real_batch_size = chunk_mask.sum().clamp_min(1)
-        action_loss = action_loss.sum() / real_batch_size
+        action_loss = target_action.new_zeros(())
+        intervention_dist = None
+        if self._training_loss_mode in {"action", "joint"}:
+            noise = torch.randn(target_action.shape, device=target_action.device)
+            timesteps = torch.randint(
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                (B,),
+                device=target_action.device,
+            ).long()
+            noisy_trajs = self.noise_scheduler.add_noise(target_action, noise, timesteps)
+            pred, intervention_dist = self.forward(
+                obs=batch,
+                noisy_traj=noisy_trajs,
+                diffusion_timesteps=timesteps,
+                compute_intervention=self._training_loss_mode == "joint",
+            )
+            raw_action_loss = F.mse_loss(pred, noise, reduction="none").mean(dim=-1)
+            action_loss = raw_action_loss * chunk_mask
+            action_loss = action_loss.sum() / real_batch_size
 
-        if self._use_intervention_head:
+        if self._use_intervention_head and self._training_loss_mode in {"intervention", "joint"}:
+            if intervention_dist is None:
+                intervention_dist = self._intervention_dist_from_obs(batch)
             intervention_loss_mask = self._current_mask(pad_mask)
             intervention_target = self._current_intervention(intervention_mask)
             raw_intervention_loss = intervention_dist.imitation_loss(
@@ -256,11 +330,16 @@ class BaseChunkDiffusionPolicy(BasePolicy):
             intervention_loss = (
                 intervention_loss.sum() / intervention_loss_mask.sum().clamp_min(1)
             )
-            loss = action_loss + self._intervention_loss_weight * intervention_loss
+            if self._training_loss_mode == "intervention":
+                loss = self._intervention_loss_weight * intervention_loss
+                real_batch_size = intervention_loss_mask.sum().clamp_min(1)
+            else:
+                loss = action_loss + self._intervention_loss_weight * intervention_loss
         else:
             intervention_loss = action_loss.new_zeros(())
             intervention_acc = action_loss.new_ones(())
             loss = action_loss
+        loss = loss + self._unused_parameter_anchor(loss)
 
         log_dict = {
             "diffusion_loss": action_loss,
@@ -302,6 +381,30 @@ class BaseChunkDiffusionPolicy(BasePolicy):
             log_dict["l1_deployed_steps_only"] = l1_deployed_steps_only
         return loss, log_dict, real_batch_size
 
+    def _intervention_dist_from_feature(self, feature: torch.Tensor):
+        return self.intervention_head(feature)
+
+    def _intervention_dist_from_obs(self, obs: dict):
+        obs_feature = self._encode_obs(obs)
+        return self._intervention_dist_from_feature(obs_feature[:, -1:])
+
+    def _unused_parameter_anchor(self, loss: torch.Tensor) -> torch.Tensor:
+        modules = []
+        if self._training_loss_mode == "action" and self.intervention_head is not None:
+            modules.append(self.intervention_head)
+        elif self._training_loss_mode == "intervention":
+            modules.append(self.backbone)
+        anchor = None
+        for module in modules:
+            for param in module.parameters():
+                if not param.requires_grad:
+                    continue
+                term = param.sum() * 0.0
+                anchor = term if anchor is None else anchor + term
+        if anchor is None:
+            return loss.new_zeros(())
+        return anchor
+
     def _encode_obs(self, obs: dict) -> torch.Tensor:
         prop_obs = []
         for prop_key in self._prop_keys:
@@ -321,6 +424,9 @@ class BaseChunkDiffusionPolicy(BasePolicy):
                 obs["base_action"] = obs["base_action"].expand(-1, obs_time, -1)
 
         obs = {k: obs[k] for k in self._features}
+        if self.training and self._freeze_feature_extractor:
+            with torch.no_grad():
+                return self.feature_extractor(obs)
         return self.feature_extractor(obs)
 
     @torch.no_grad()
@@ -334,7 +440,7 @@ class BaseChunkDiffusionPolicy(BasePolicy):
         scheduler = self.noise_scheduler
         scheduler.set_timesteps(self.num_denoise_steps_per_inference)
         for t in scheduler.timesteps:
-            pred, _ = self.forward(obs, noisy_traj, t)
+            pred, _ = self.forward(obs, noisy_traj, t, compute_intervention=False)
             noisy_traj = scheduler.step(
                 pred, t, noisy_traj, **self.noise_scheduler_step_kwargs
             ).prev_sample

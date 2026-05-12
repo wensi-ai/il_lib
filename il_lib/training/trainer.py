@@ -23,6 +23,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 __all__ = [
     "Trainer",
     "CustomProgressBar",
+    "StagedTrainingCallback",
     "rank_zero_info",
     "rank_zero_debug",
     "rank_zero_warn",
@@ -45,9 +46,11 @@ class Trainer:
         OmegaConf.set_struct(cfg, False)
         CU.register_omegaconf_resolvers()
         run_name = self.generate_run_name(cfg)
+        self.run_name = run_name
         self.run_dir = FU.f_join(cfg.exp_root_dir, run_name)
         self._eval_only = eval_only
         self._resume_mode = None  # 'full state' or 'model only'
+        self._maybe_apply_staged_training_max_steps(cfg)
         if eval_only:
             rank_zero_info("Eval only, will not save any model dir")
         else:
@@ -77,7 +80,6 @@ class Trainer:
             CU.omegaconf_save(cfg, self.run_dir, "conf.yaml")
             rank_zero_print("Checkpoint cfg:", CU.omegaconf_to_dict(cfg.trainer.checkpoint))
         self.cfg = cfg
-        self.run_name = run_name
         self.ckpt_cfg = cfg.trainer.pop("checkpoint")
         self.data_module = self.create_data_module(cfg)
         self._monkey_patch_add_info(self.data_module)
@@ -101,6 +103,41 @@ class Trainer:
 
     def generate_run_name(self, cfg):
         return cfg.run_name + "_" + time.strftime("%Y%m%d-%H%M%S")
+
+    def _maybe_apply_staged_training_max_steps(self, cfg):
+        if not cfg.get("training_stages", {}).get("enabled", False):
+            return
+        stages = cfg.training_stages.get("stages", [])
+        start_stage_idx = 0
+        stage_ckpt_path = None
+        for stage in stages:
+            ckpt_path = stage.get("ckpt_path", None)
+            if not ckpt_path:
+                break
+            stage_ckpt_path = ckpt_path
+            start_stage_idx += 1
+        if start_stage_idx >= len(stages):
+            raise ValueError("All configured training stages have ckpt_path set; nothing remains to train.")
+
+        if stage_ckpt_path:
+            stage_ckpt_path = FU.f_expand(
+                str(stage_ckpt_path)
+                .replace("_RUN_DIR_", self.run_dir)
+                .replace("_RUN_NAME_", self.run_name)
+            )
+            cfg.resume.ckpt_path = stage_ckpt_path
+            cfg.resume.full_state = False
+            rank_zero_info(
+                f"Skipping {start_stage_idx} completed training stage(s); "
+                f"loading model weights from {stage_ckpt_path}"
+            )
+
+        cfg.training_stages.start_stage_idx = start_stage_idx
+        total_steps = sum(int(stage.get("num_steps", 0)) for stage in stages[start_stage_idx:])
+        if total_steps <= 0:
+            raise ValueError("training_stages.enabled=true requires stages with positive num_steps.")
+        cfg.max_steps = total_steps
+        cfg.trainer.max_steps = total_steps
 
     def _monkey_patch_add_info(self, obj):
         """
@@ -253,6 +290,68 @@ def rank_zero_debug(*msg, **kwargs):
 
 
 rank_zero_debug.enabled = True
+
+
+class StagedTrainingCallback(Callback):
+    def __init__(self, stage_cfg=None):
+        super().__init__()
+        cfg = OmegaConf.to_container(stage_cfg, resolve=True) if isinstance(stage_cfg, DictConfig) else stage_cfg
+        self.enabled = bool((cfg or {}).get("enabled", False))
+        self.start_stage_idx = int((cfg or {}).get("start_stage_idx", 0))
+        self.stages = list((cfg or {}).get("stages", []))[self.start_stage_idx :]
+        self._active_stage_idx = None
+        self._boundaries = []
+        total = 0
+        for stage in self.stages:
+            total += int(stage.get("num_steps", 0))
+            self._boundaries.append(total)
+
+    def _stage_index_for_step(self, global_step: int) -> int:
+        for idx, boundary in enumerate(self._boundaries):
+            if global_step < boundary:
+                return idx
+        return max(len(self.stages) - 1, 0)
+
+    def _normalize_module_options(self, options: dict) -> dict:
+        options = dict(options or {})
+        if "freeze_vision_encoders" in options and "freeze_feature_extractor" not in options:
+            options["freeze_feature_extractor"] = options.pop("freeze_vision_encoders")
+        if "freeze_diffusion" in options and "freeze_backbone" not in options:
+            options["freeze_backbone"] = options.pop("freeze_diffusion")
+        return options
+
+    def _apply_stage(self, trainer, pl_module, stage_idx: int) -> None:
+        if self._active_stage_idx == stage_idx:
+            if hasattr(pl_module, "enforce_training_stage"):
+                pl_module.enforce_training_stage()
+            return
+        stage = self.stages[stage_idx]
+        if "module" in stage:
+            if not hasattr(pl_module, "set_training_stage"):
+                raise AttributeError(
+                    f"{pl_module.__class__.__name__} does not support staged training."
+                )
+            pl_module.set_training_stage(**self._normalize_module_options(stage["module"]))
+        datamodule = trainer.datamodule
+        if datamodule is not None and hasattr(datamodule, "apply_stage_config"):
+            datamodule.apply_stage_config(stage.get("data", {}))
+        self._active_stage_idx = stage_idx
+        rank_zero_info(
+            f"Applied training stage {self.start_stage_idx + stage_idx + 1}:",
+            stage.get("name", f"stage_{stage_idx + 1}"),
+        )
+
+    def on_train_start(self, trainer, pl_module) -> None:
+        if not self.enabled:
+            return
+        if not self.stages:
+            raise ValueError("StagedTrainingCallback requires at least one stage.")
+        self._apply_stage(trainer, pl_module, self._stage_index_for_step(trainer.global_step))
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:
+        if not self.enabled:
+            return
+        self._apply_stage(trainer, pl_module, self._stage_index_for_step(trainer.global_step))
 
 
 class CustomProgressBar(TQDMProgressBar):
