@@ -24,6 +24,7 @@ wd: 0.0
 bs: 64
 vbs: ${bs}
 data_dir: ???
+val_data_dir: null
 max_steps: 2e5
 val_check_interval: 10000  
 check_val_every_n_epoch: null
@@ -58,7 +59,8 @@ module:
 data:
   _target_: il_lib.datas.BehaviorDataModule
   data_path: ${data_dir}
-  task_name: 
+  val_data_path: ${val_data_dir}
+  task_name:
     - ${task.name}
   batch_size: ${bs}
   val_batch_size: ${vbs}

@@ -20,11 +20,13 @@ class BehaviorDataModule(LightningDataModule):
         seed: int,
         shuffle: bool,
         max_num_demos: Optional[int] = None,
+        val_data_path: Optional[str] = None,
         dataset_class: str,
         **kwargs,
     ):
         super().__init__()
         self._data_path = os.path.expanduser(data_path)
+        self._val_data_path = os.path.expanduser(val_data_path) if val_data_path is not None else None
         self._task_name = task_name
         self._batch_size = batch_size
         self._val_batch_size = val_batch_size if val_batch_size is not None else batch_size
@@ -49,11 +51,18 @@ class BehaviorDataModule(LightningDataModule):
             # limit number of demos
             if self._max_num_demos is not None:
                 all_demo_keys = all_demo_keys[: self._max_num_demos]
-            self._train_demo_keys, self._val_demo_keys = train_test_split(
-                all_demo_keys,
-                test_size=self._val_split_ratio,
-                shuffle=False,
-            )
+
+            if self._val_data_path is not None:
+                # use separate val directory
+                self._train_demo_keys = all_demo_keys
+                self._val_demo_keys = DatasetClassModule.get_all_demo_keys(self._val_data_path, self._task_name)
+            else:
+                self._train_demo_keys, self._val_demo_keys = train_test_split(
+                    all_demo_keys,
+                    test_size=self._val_split_ratio,
+                    shuffle=False,
+                )
+
             # initialize datasets
             self._train_dataset = DatasetClassModule(
                 *self._args,
@@ -65,7 +74,7 @@ class BehaviorDataModule(LightningDataModule):
             self._val_dataset = DatasetClassModule(
                 *self._args,
                 **self._kwargs,
-                data_path=self._data_path,
+                data_path=self._val_data_path if self._val_data_path is not None else self._data_path,
                 demo_keys=self._val_demo_keys,
                 seed=self._seed,
             )
