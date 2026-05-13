@@ -1368,6 +1368,12 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
         else:
             intervention = self._residual_intervention_buffer[self._residual_action_idx]
         self._residual_action_idx += 1
+        if self._residual_intervention_buffer is not None:
+            policy_intervention_chunk = self._residual_intervention_buffer
+        else:
+            policy_intervention_chunk = intervention.reshape(1).repeat(
+                self._residual_action_buffer.shape[0]
+            )
 
         min_intervention_steps = self._chunk_intervention_min_steps()
         intervention_active = bool(float(intervention) >= 0.5)
@@ -1411,6 +1417,10 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
             predicted_action=pred_action_denormalized,
             applied_action=final_action,
             intervention=intervention.reshape(1),
+        )
+        self._current_state["policy_action"] = self._clone_state_tensor(final_action)
+        self._current_state["policy_intervention_chunk"] = self._clone_state_tensor(
+            policy_intervention_chunk
         )
         self._append_executed_action(
             pred_action if intervention >= 0.5 else self._normalize_action(base_action.clone())

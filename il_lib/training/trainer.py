@@ -104,6 +104,52 @@ class Trainer:
     def generate_run_name(self, cfg):
         return cfg.run_name + "_" + time.strftime("%Y%m%d-%H%M%S")
 
+    def _stage_validation_overrides(self, stage):
+        validation_config = stage.get("validation", {}) or {}
+        validation_keys = {
+            "val_check_interval",
+            "check_val_every_n_epoch",
+            "limit_val_batches",
+            "num_sanity_val_steps",
+        }
+        validation_overrides = {
+            key: validation_config[key]
+            for key in validation_keys
+            if key in validation_config
+        }
+        validation_overrides.update(
+            {
+                key: stage[key]
+                for key in validation_keys
+                if key in stage
+            }
+        )
+        return validation_overrides
+
+    def _apply_initial_stage_overrides(self, cfg, stage):
+        checkpoint_frequency = stage.get("checkpoint_every_n_train_steps", None)
+        if checkpoint_frequency is not None:
+            checkpoint_frequency = int(checkpoint_frequency)
+            if checkpoint_frequency <= 0:
+                raise ValueError(
+                    "checkpoint_every_n_train_steps must be positive, "
+                    f"got {checkpoint_frequency}."
+                )
+            checkpoint_cfg = cfg.trainer.get("checkpoint", None)
+            if isinstance(checkpoint_cfg, DictConfig):
+                checkpoint_cfg.every_n_train_steps = checkpoint_frequency
+            elif isinstance(checkpoint_cfg, ListConfig):
+                for item in checkpoint_cfg:
+                    item.every_n_train_steps = checkpoint_frequency
+
+        for key, value in self._stage_validation_overrides(stage).items():
+            cfg.trainer[key] = value
+
+        validation_data_config = (stage.get("validation", {}) or {}).get("data", {})
+        for key in ("val_data_path", "val_split_ratio", "val_batch_size"):
+            if key in validation_data_config:
+                cfg.data[key] = validation_data_config[key]
+
     def _maybe_apply_staged_training_max_steps(self, cfg):
         if not cfg.get("training_stages", {}).get("enabled", False):
             return
@@ -138,6 +184,7 @@ class Trainer:
             raise ValueError("training_stages.enabled=true requires stages with positive num_steps.")
         cfg.max_steps = total_steps
         cfg.trainer.max_steps = total_steps
+        self._apply_initial_stage_overrides(cfg, stages[start_stage_idx])
 
     def _monkey_patch_add_info(self, obj):
         """
@@ -293,6 +340,14 @@ rank_zero_debug.enabled = True
 
 
 class StagedTrainingCallback(Callback):
+    CHECKPOINT_FREQUENCY_KEY = "checkpoint_every_n_train_steps"
+    VALIDATION_OVERRIDE_KEYS = {
+        "val_check_interval",
+        "check_val_every_n_epoch",
+        "limit_val_batches",
+        "num_sanity_val_steps",
+    }
+
     def __init__(self, stage_cfg=None):
         super().__init__()
         cfg = OmegaConf.to_container(stage_cfg, resolve=True) if isinstance(stage_cfg, DictConfig) else stage_cfg
@@ -320,6 +375,73 @@ class StagedTrainingCallback(Callback):
             options["freeze_backbone"] = options.pop("freeze_diffusion")
         return options
 
+    def _apply_checkpoint_frequency(self, trainer, stage: dict) -> None:
+        every_n_train_steps = stage.get(self.CHECKPOINT_FREQUENCY_KEY, None)
+        if every_n_train_steps is None:
+            return
+
+        every_n_train_steps = int(every_n_train_steps)
+        if every_n_train_steps <= 0:
+            raise ValueError(
+                f"{self.CHECKPOINT_FREQUENCY_KEY} must be positive, got {every_n_train_steps}."
+            )
+
+        for callback in trainer.callbacks:
+            if not isinstance(callback, ModelCheckpoint):
+                continue
+            callback._every_n_train_steps = every_n_train_steps
+            if hasattr(callback, "every_n_train_steps"):
+                try:
+                    callback.every_n_train_steps = every_n_train_steps
+                except AttributeError:
+                    pass
+        rank_zero_info(
+            "Set checkpoint frequency:",
+            f"every {every_n_train_steps} train steps",
+        )
+
+    def _apply_validation_overrides(self, trainer, stage: dict) -> None:
+        validation_config = dict(stage.get("validation", {}) or {})
+        validation_overrides = {
+            key: validation_config[key]
+            for key in self.VALIDATION_OVERRIDE_KEYS
+            if key in validation_config
+        }
+        validation_overrides.update(
+            {
+                key: stage[key]
+                for key in self.VALIDATION_OVERRIDE_KEYS
+                if key in stage
+            }
+        )
+        if not validation_overrides:
+            return
+
+        for key, value in validation_overrides.items():
+            self._set_validation_attr(trainer, key, value)
+        rank_zero_info("Applied validation overrides:", validation_overrides)
+
+    def _set_validation_attr(self, trainer, key: str, value) -> None:
+        targets = [trainer, getattr(trainer, "fit_loop", None)]
+        fit_loop = targets[-1]
+        if fit_loop is not None:
+            targets.append(getattr(fit_loop, "epoch_loop", None))
+
+        attr_names = [key, f"_{key}"]
+        if key == "val_check_interval":
+            attr_names.append("_val_check_batch")
+
+        for target in targets:
+            if target is None:
+                continue
+            for attr_name in attr_names:
+                if not hasattr(target, attr_name):
+                    continue
+                try:
+                    setattr(target, attr_name, value)
+                except AttributeError:
+                    pass
+
     def _apply_stage(self, trainer, pl_module, stage_idx: int) -> None:
         if self._active_stage_idx == stage_idx:
             if hasattr(pl_module, "enforce_training_stage"):
@@ -334,7 +456,9 @@ class StagedTrainingCallback(Callback):
             pl_module.set_training_stage(**self._normalize_module_options(stage["module"]))
         datamodule = trainer.datamodule
         if datamodule is not None and hasattr(datamodule, "apply_stage_config"):
-            datamodule.apply_stage_config(stage.get("data", {}))
+            datamodule.apply_stage_config(stage)
+        self._apply_checkpoint_frequency(trainer, stage)
+        self._apply_validation_overrides(trainer, stage)
         self._active_stage_idx = stage_idx
         rank_zero_info(
             f"Applied training stage {self.start_stage_idx + stage_idx + 1}:",

@@ -99,6 +99,10 @@ class BehaviorDataModule(LightningDataModule):
     def _supports_separate_val_data_path(self) -> bool:
         return self._dataset_class == "iiil.datas.IIILInterventionDataset"
 
+    def _get_dataset_class(self):
+        module_path, class_name = self._dataset_class.rsplit(".", 1)
+        return getattr(importlib.import_module(module_path), class_name)
+
     def _select_train_demo_keys(self, all_demo_keys):
         if not self._per_file_train_demo_limits:
             if self._max_num_demos is not None:
@@ -168,9 +172,7 @@ class BehaviorDataModule(LightningDataModule):
                     "data.val_data_path is only supported for "
                     "iiil.datas.IIILInterventionDataset."
                 )
-            # get dataset class module
-            module_path, class_name = self._dataset_class.rsplit(".", 1)
-            DatasetClassModule = getattr(importlib.import_module(module_path), class_name)
+            DatasetClassModule = self._get_dataset_class()
             all_demo_keys = DatasetClassModule.get_all_demo_keys(self._data_path, self._task_name)
             if self._uses_separate_val_data_path:
                 self._train_demo_keys = self._select_train_demo_keys(all_demo_keys)
@@ -211,15 +213,63 @@ class BehaviorDataModule(LightningDataModule):
             shuffle=self._shuffle,
         )
 
+    def _rebuild_validation_dataset(self) -> None:
+        if self._uses_separate_val_data_path and not self._supports_separate_val_data_path:
+            raise ValueError(
+                "data.val_data_path is only supported for "
+                "iiil.datas.IIILInterventionDataset."
+            )
+
+        DatasetClassModule = self._get_dataset_class()
+        all_demo_keys = DatasetClassModule.get_all_demo_keys(self._data_path, self._task_name)
+        if self._uses_separate_val_data_path:
+            self._val_demo_keys = DatasetClassModule.get_all_demo_keys(
+                self._val_data_path,
+                self._task_name,
+            )
+            val_data_path = self._val_data_path
+        else:
+            _, self._val_demo_keys = self._split_demo_keys(all_demo_keys)
+            val_data_path = self._data_path
+
+        self._val_dataset = None
+        if self._val_demo_keys:
+            self._val_dataset = DatasetClassModule(
+                *self._args,
+                **self._kwargs,
+                data_path=val_data_path,
+                demo_keys=self._val_demo_keys,
+                seed=self._seed,
+            )
+
+    def _apply_validation_data_config(self, validation_data_config: dict) -> None:
+        if not validation_data_config:
+            return
+
+        rebuild_validation_dataset = False
+        if "val_data_path" in validation_data_config:
+            val_data_path = validation_data_config["val_data_path"]
+            self._val_data_path = os.path.expanduser(val_data_path) if val_data_path else None
+            rebuild_validation_dataset = True
+        if "val_split_ratio" in validation_data_config:
+            self._val_split_ratio = float(validation_data_config["val_split_ratio"])
+            rebuild_validation_dataset = True
+        if "val_batch_size" in validation_data_config:
+            self._val_batch_size = int(validation_data_config["val_batch_size"])
+
+        if rebuild_validation_dataset and self._train_dataset is not None:
+            self._rebuild_validation_dataset()
+
     def apply_stage_config(self, stage_config: dict) -> None:
         data_config = stage_config.get("data", stage_config) if stage_config else {}
-        if "reweight_strategy" not in data_config:
-            return
-        reweight_strategy = data_config["reweight_strategy"]
-        self._kwargs["reweight_strategy"] = reweight_strategy
-        for dataset in (self._train_dataset, self._val_dataset):
-            if dataset is not None and hasattr(dataset, "set_reweight_strategy"):
-                dataset.set_reweight_strategy(reweight_strategy)
+        validation_config = stage_config.get("validation", {}) if stage_config else {}
+        self._apply_validation_data_config(validation_config.get("data", {}))
+        if "reweight_strategy" in data_config:
+            reweight_strategy = data_config["reweight_strategy"]
+            self._kwargs["reweight_strategy"] = reweight_strategy
+            for dataset in (self._train_dataset, self._val_dataset):
+                if dataset is not None and hasattr(dataset, "set_reweight_strategy"):
+                    dataset.set_reweight_strategy(reweight_strategy)
 
     def val_dataloader(self) -> DataLoader:
         if self._val_dataset is None:

@@ -227,6 +227,7 @@ class BaseChunkDiffusionPolicy(BasePolicy):
     @torch.no_grad()
     def act(self, obs, deterministic=None):
         del deterministic
+        obs = self.process_data(obs, extract_action=False)
         B = get_batch_size(obs, strict=True)
         noisy_traj = torch.randn(
             size=(B, self.action_prediction_horizon, self.action_dim),
