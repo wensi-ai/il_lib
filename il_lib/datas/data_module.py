@@ -5,12 +5,25 @@ from pytorch_lightning import LightningDataModule
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from pathlib import Path
-from typing import Optional
+from omegaconf import DictConfig, ListConfig, OmegaConf
+from typing import Any, Optional
+
+
+def _expand_path_value(value: Any):
+    if isinstance(value, (ListConfig, DictConfig)):
+        value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, (list, tuple)):
+        return [os.path.expanduser(str(item)) for item in value]
+    return os.path.expanduser(str(value))
 
 
 def _parse_per_file_limits(value) -> dict[str, int]:
     if value in (None, "", {}):
         return {}
+    if isinstance(value, DictConfig):
+        value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, ListConfig):
+        value = OmegaConf.to_container(value, resolve=True)
     if isinstance(value, str):
         limits = {}
         for item in value.split(","):
@@ -22,10 +35,16 @@ def _parse_per_file_limits(value) -> dict[str, int]:
                     "per_file_train_demo_limits entries must look like filename.hdf5:count"
                 )
             key, raw_count = item.rsplit(":", 1)
-            limits[key.strip()] = int(raw_count)
+            limit = int(raw_count)
+            if limit < 0:
+                raise ValueError("per_file_train_demo_limits counts must be non-negative.")
+            limits[key.strip()] = limit
         return limits
     if isinstance(value, dict):
-        return {str(key): int(limit) for key, limit in value.items()}
+        limits = {str(key): int(limit) for key, limit in value.items()}
+        if any(limit < 0 for limit in limits.values()):
+            raise ValueError("per_file_train_demo_limits counts must be non-negative.")
+        return limits
     limits = {}
     for item in value:
         if isinstance(item, str):
@@ -35,21 +54,56 @@ def _parse_per_file_limits(value) -> dict[str, int]:
             limits[str(item[0])] = int(item[1])
         else:
             raise ValueError(f"Unsupported per-file limit entry: {item!r}")
+    if any(limit < 0 for limit in limits.values()):
+        raise ValueError("per_file_train_demo_limits counts must be non-negative.")
     return limits
+
+
+def _parse_file_names(value) -> set[str]:
+    if value in (None, "", [], {}):
+        return set()
+    if isinstance(value, (ListConfig, DictConfig)):
+        value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, str):
+        names = [item.strip() for item in value.split(",")]
+    else:
+        names = [str(item).strip() for item in value]
+    return {name for name in names if name}
 
 
 def _demo_source_name(demo_key) -> str:
     filename = getattr(getattr(demo_key, "file", None), "filename", "")
-    return Path(filename).name
+    return str(filename)
+
+
+def _demo_label(demo_key) -> str:
+    source = _demo_source_name(demo_key)
+    name = getattr(demo_key, "name", "")
+    source_label = Path(source).name if source else ""
+    return f"{source_label}:{Path(name).name}" if source_label and name else source_label or str(demo_key)
 
 
 def _limit_for_source(source_name: str, limits: dict[str, int]) -> Optional[int]:
     if source_name in limits:
         return limits[source_name]
-    source_stem = Path(source_name).stem
+    source_path = Path(source_name)
+    if source_path.name in limits:
+        return limits[source_path.name]
+    source_stem = source_path.stem
     if source_stem in limits:
         return limits[source_stem]
     return None
+
+
+def _source_is_selected(source_name: str, selected_names: set[str]) -> bool:
+    if not selected_names:
+        return True
+    source_path = Path(source_name)
+    return (
+        source_name in selected_names
+        or source_path.name in selected_names
+        or source_path.stem in selected_names
+    )
 
 
 class BehaviorDataModule(LightningDataModule):
@@ -65,6 +119,7 @@ class BehaviorDataModule(LightningDataModule):
         seed: int,
         shuffle: bool,
         max_num_demos: Optional[int] = None,
+        included_data_files=None,
         per_file_train_demo_limits=None,
         use_limit_overflow_as_val: bool = False,
         dataset_class: str,
@@ -72,8 +127,8 @@ class BehaviorDataModule(LightningDataModule):
         **kwargs,
     ):
         super().__init__()
-        self._data_path = os.path.expanduser(data_path)
-        self._val_data_path = os.path.expanduser(val_data_path) if val_data_path else None
+        self._data_path = _expand_path_value(data_path)
+        self._val_data_path = _expand_path_value(val_data_path) if val_data_path else None
         self._task_name = task_name
         self._batch_size = batch_size
         self._val_batch_size = val_batch_size if val_batch_size is not None else batch_size
@@ -83,6 +138,7 @@ class BehaviorDataModule(LightningDataModule):
         self._seed = seed
         self._shuffle = shuffle
         self._dataset_class = dataset_class
+        self._included_data_files = _parse_file_names(included_data_files)
         self._per_file_train_demo_limits = _parse_per_file_limits(per_file_train_demo_limits)
         self._use_limit_overflow_as_val = use_limit_overflow_as_val
         # store args and kwargs for dataset initialization
@@ -97,13 +153,49 @@ class BehaviorDataModule(LightningDataModule):
 
     @property
     def _supports_separate_val_data_path(self) -> bool:
-        return self._dataset_class == "iiil.datas.IIILInterventionDataset"
+        return self._dataset_class in {
+            "iiil.datas.IIILInterventionDataset",
+            "iiil.datas.IIILLeRobotInterventionDataset",
+        }
 
     def _get_dataset_class(self):
         module_path, class_name = self._dataset_class.rsplit(".", 1)
         return getattr(importlib.import_module(module_path), class_name)
 
+    def _filter_demo_keys_by_source(self, demo_keys):
+        if not self._included_data_files:
+            return demo_keys
+        filtered = [
+            demo_key
+            for demo_key in demo_keys
+            if _source_is_selected(_demo_source_name(demo_key), self._included_data_files)
+        ]
+        if not filtered:
+            selected = ", ".join(sorted(self._included_data_files))
+            available = sorted({_demo_source_name(demo_key) for demo_key in demo_keys})
+            raise ValueError(
+                f"data.included_data_files selected no demos. Requested: {selected}. "
+                f"Available files: {available}"
+            )
+        return filtered
+
+    def _log_selected_demo_keys(self) -> None:
+        train_by_source = {}
+        val_by_source = {}
+        for demo_key in getattr(self, "_train_demo_keys", []):
+            source = _demo_source_name(demo_key)
+            train_by_source[source] = train_by_source.get(source, 0) + 1
+        for demo_key in getattr(self, "_val_demo_keys", []):
+            source = _demo_source_name(demo_key)
+            val_by_source[source] = val_by_source.get(source, 0) + 1
+        print(
+            "BehaviorDataModule demo split: "
+            f"train={len(getattr(self, '_train_demo_keys', []))} {train_by_source}, "
+            f"val={len(getattr(self, '_val_demo_keys', []))} {val_by_source}"
+        )
+
     def _select_train_demo_keys(self, all_demo_keys):
+        all_demo_keys = self._filter_demo_keys_by_source(all_demo_keys)
         if not self._per_file_train_demo_limits:
             if self._max_num_demos is not None:
                 return all_demo_keys[: self._max_num_demos]
@@ -127,6 +219,7 @@ class BehaviorDataModule(LightningDataModule):
         return train_demo_keys
 
     def _split_demo_keys(self, all_demo_keys):
+        all_demo_keys = self._filter_demo_keys_by_source(all_demo_keys)
         if not self._per_file_train_demo_limits:
             if self._max_num_demos is not None:
                 all_demo_keys = all_demo_keys[: self._max_num_demos]
@@ -170,7 +263,8 @@ class BehaviorDataModule(LightningDataModule):
             if self._uses_separate_val_data_path and not self._supports_separate_val_data_path:
                 raise ValueError(
                     "data.val_data_path is only supported for "
-                    "iiil.datas.IIILInterventionDataset."
+                    "iiil.datas.IIILInterventionDataset and "
+                    "iiil.datas.IIILLeRobotInterventionDataset."
                 )
             DatasetClassModule = self._get_dataset_class()
             all_demo_keys = DatasetClassModule.get_all_demo_keys(self._data_path, self._task_name)
@@ -184,6 +278,15 @@ class BehaviorDataModule(LightningDataModule):
             else:
                 self._train_demo_keys, self._val_demo_keys = self._split_demo_keys(all_demo_keys)
                 val_data_path = self._data_path
+            if not self._train_demo_keys:
+                selected = sorted(self._included_data_files) if self._included_data_files else "all files"
+                examples = [_demo_label(demo_key) for demo_key in all_demo_keys[:10]]
+                raise ValueError(
+                    "No training demos were selected. Check data.included_data_files, "
+                    f"data.per_file_train_demo_limits, and max_num_demos. Selection: {selected}. "
+                    f"Example available demos: {examples}"
+                )
+            self._log_selected_demo_keys()
             # initialize datasets
             self._train_dataset = DatasetClassModule(
                 *self._args,
@@ -217,7 +320,8 @@ class BehaviorDataModule(LightningDataModule):
         if self._uses_separate_val_data_path and not self._supports_separate_val_data_path:
             raise ValueError(
                 "data.val_data_path is only supported for "
-                "iiil.datas.IIILInterventionDataset."
+                "iiil.datas.IIILInterventionDataset and "
+                "iiil.datas.IIILLeRobotInterventionDataset."
             )
 
         DatasetClassModule = self._get_dataset_class()
@@ -249,7 +353,7 @@ class BehaviorDataModule(LightningDataModule):
         rebuild_validation_dataset = False
         if "val_data_path" in validation_data_config:
             val_data_path = validation_data_config["val_data_path"]
-            self._val_data_path = os.path.expanduser(val_data_path) if val_data_path else None
+            self._val_data_path = _expand_path_value(val_data_path) if val_data_path else None
             rebuild_validation_dataset = True
         if "val_split_ratio" in validation_data_config:
             self._val_split_ratio = float(validation_data_config["val_split_ratio"])
