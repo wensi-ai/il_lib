@@ -1,8 +1,10 @@
 __all__ = [
     "ACT",
     "BaseChunkDiffusionPolicy",
+    "BaseChunkFlowMatchingPolicy",
     "BaseChunkPolicy",
     "BC_RNN",
+    "CompositionalPolicy",
     "DiffusionPolicy",
     "GatedDiffusionPolicy",
     "InterventionClassifier",
@@ -22,6 +24,10 @@ def __getattr__(name):
         from .base_chunk_diffusion_policy import BaseChunkDiffusionPolicy
 
         return BaseChunkDiffusionPolicy
+    if name == "BaseChunkFlowMatchingPolicy":
+        from .base_chunk_flow_matching_policy import BaseChunkFlowMatchingPolicy
+
+        return BaseChunkFlowMatchingPolicy
     if name == "BaseChunkPolicy":
         from .base_chunk_policy import BaseChunkPolicy
 
@@ -30,6 +36,10 @@ def __getattr__(name):
         from .bcrnn_policy import BC_RNN
 
         return BC_RNN
+    if name == "CompositionalPolicy":
+        from .compositional_policy import CompositionalPolicy
+
+        return CompositionalPolicy
     if name == "DiffusionPolicy":
         from .diffusion_policy import DiffusionPolicy
 

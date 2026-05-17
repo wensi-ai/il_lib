@@ -1,8 +1,8 @@
 import importlib
+import math
 import os
 from il_lib.datas.dataset import DummyDataset
 from pytorch_lightning import LightningDataModule
-from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from pathlib import Path
 from omegaconf import DictConfig, ListConfig, OmegaConf
@@ -72,11 +72,17 @@ def _parse_file_names(value) -> set[str]:
 
 
 def _demo_source_name(demo_key) -> str:
+    if isinstance(demo_key, dict) and "source" in demo_key:
+        return str(demo_key["source"])
     filename = getattr(getattr(demo_key, "file", None), "filename", "")
     return str(filename)
 
 
 def _demo_label(demo_key) -> str:
+    if isinstance(demo_key, dict):
+        source = str(demo_key.get("source", ""))
+        episode = demo_key.get("episode_index")
+        return f"{source}:episode_{episode}" if episode is not None else source
     source = _demo_source_name(demo_key)
     name = getattr(demo_key, "name", "")
     source_label = Path(source).name if source else ""
@@ -104,6 +110,18 @@ def _source_is_selected(source_name: str, selected_names: set[str]) -> bool:
         or source_path.name in selected_names
         or source_path.stem in selected_names
     )
+
+
+def _ordered_train_val_split(items, test_size: float):
+    if not 0 < test_size < 1:
+        raise ValueError("val_split_ratio must be between 0 and 1 when validation splitting is enabled.")
+    val_count = math.ceil(len(items) * test_size)
+    train_count = len(items) - val_count
+    if train_count <= 0:
+        raise ValueError(
+            f"val_split_ratio={test_size} leaves no training demos from {len(items)} total demos."
+        )
+    return items[:train_count], items[train_count:]
 
 
 class BehaviorDataModule(LightningDataModule):
@@ -225,11 +243,7 @@ class BehaviorDataModule(LightningDataModule):
                 all_demo_keys = all_demo_keys[: self._max_num_demos]
             if self._val_split_ratio <= 0:
                 return all_demo_keys, []
-            return train_test_split(
-                all_demo_keys,
-                test_size=self._val_split_ratio,
-                shuffle=False,
-            )
+            return _ordered_train_val_split(all_demo_keys, self._val_split_ratio)
 
         source_counts = {}
         train_demo_keys, val_demo_keys = [], []
@@ -252,11 +266,7 @@ class BehaviorDataModule(LightningDataModule):
             return train_demo_keys, val_demo_keys
         if self._val_split_ratio <= 0:
             return train_demo_keys, []
-        return train_test_split(
-            train_demo_keys,
-            test_size=self._val_split_ratio,
-            shuffle=False,
-        )
+        return _ordered_train_val_split(train_demo_keys, self._val_split_ratio)
 
     def setup(self, stage: str) -> None:
         if stage == "fit" or stage is None:

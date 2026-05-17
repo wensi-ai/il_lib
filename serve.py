@@ -59,7 +59,9 @@ class PolicyStateWebsocketPolicyServer(WebsocketPolicyServer):
             except websockets.ConnectionClosed:
                 break
             except Exception:
-                await websocket.send(traceback.format_exc())
+                error = traceback.format_exc()
+                print(error, file=sys.stderr, flush=True)
+                await websocket.send(error)
 
 
 def main():

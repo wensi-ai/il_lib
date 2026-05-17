@@ -3,10 +3,60 @@ from hydra.utils import instantiate
 from il_lib.nn.distributions import CategoricalNet, GMMHead
 from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.optim import CosineScheduleFunction
-from il_lib.policies.policy_base import BasePolicy
 from il_lib.utils.array_tensor_utils import any_concat
-from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
 from typing import Any, Dict, List
+
+try:
+    from il_lib.policies.policy_base import BasePolicy
+except ModuleNotFoundError as exc:
+    if exc.name != "omnigibson":
+        raise
+    from pytorch_lightning import LightningModule as _LightningModule
+
+    class BasePolicy(_LightningModule):
+        """Minimal offline fallback for base-chunk training without OmniGibson."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+        def training_step(self, *args, **kwargs):
+            loss, log_dict, batch_size = self.policy_training_step(*args, **kwargs)
+            log_dict = {f"train/{k}": v for k, v in log_dict.items()}
+            log_dict["train/loss"] = loss
+            self.log_dict(
+                log_dict,
+                prog_bar=True,
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+                sync_dist=True,
+            )
+            return loss
+
+        def validation_step(self, *args, **kwargs):
+            loss, log_dict, batch_size = self.policy_evaluation_step(*args, **kwargs)
+            log_dict = {f"val/{k}": v for k, v in log_dict.items()}
+            log_dict["val/loss"] = loss
+            self.log_dict(
+                log_dict,
+                prog_bar=True,
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+                sync_dist=True,
+            )
+            return log_dict
+
+        def test_step(self, *args, **kwargs):
+            return None
+
+try:
+    from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
+except ModuleNotFoundError as exc:
+    if exc.name != "omnigibson":
+        raise
+    MIN_DEPTH = 0.0
+    MAX_DEPTH = 10.0
 
 
 class _AlwaysInterveneDistribution:

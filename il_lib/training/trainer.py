@@ -58,7 +58,9 @@ class Trainer:
                 cfg.resume.ckpt_path = FU.f_expand(
                     cfg.resume.ckpt_path.replace("_RUN_DIR_", self.run_dir).replace("_RUN_NAME_", run_name)
                 )
+                assert FU.f_exists(cfg.resume.ckpt_path), "resume ckpt_path does not exist"
                 self._resume_mode = "full state" if cfg.resume.get("full_state", False) else "model only"
+                self._maybe_apply_resume_additional_steps(cfg)
                 rank_zero_info(
                     "=" * 80,
                     "=" * 80 + "\n",
@@ -70,7 +72,6 @@ class Trainer:
                     end="\n\n",
                 )
                 time.sleep(3)
-                assert FU.f_exists(cfg.resume.ckpt_path), "resume ckpt_path does not exist"
 
             rank_zero_print("Run name:", run_name, "\nExp dir:", self.run_dir)
             FU.f_mkdir(self.run_dir)
@@ -103,6 +104,28 @@ class Trainer:
 
     def generate_run_name(self, cfg):
         return cfg.run_name + "_" + time.strftime("%Y%m%d-%H%M%S")
+
+    def _maybe_apply_resume_additional_steps(self, cfg):
+        additional_steps = cfg.resume.get("additional_steps", None)
+        if additional_steps is None:
+            return
+        additional_steps = int(additional_steps)
+        if additional_steps <= 0:
+            raise ValueError(f"resume.additional_steps must be positive, got {additional_steps}.")
+        checkpoint_step = 0
+        if cfg.resume.get("full_state", False):
+            checkpoint = load_torch(cfg.resume.ckpt_path)
+            checkpoint_step = int(checkpoint.get("global_step", 0))
+        total_steps = checkpoint_step + additional_steps
+        cfg.max_steps = total_steps
+        cfg.trainer.max_steps = total_steps
+        if checkpoint_step:
+            rank_zero_info(
+                f"Resume checkpoint global_step={checkpoint_step}; "
+                f"setting max_steps={total_steps} to run {additional_steps} more step(s)."
+            )
+        else:
+            rank_zero_info(f"Setting max_steps={total_steps} from resume.additional_steps.")
 
     def _stage_validation_overrides(self, stage):
         validation_config = stage.get("validation", {}) or {}
@@ -294,10 +317,12 @@ class Trainer:
         )
 
     def fit(self):
+        resume_full_state = self._resume_mode == "full state"
         return self.trainer.fit(
             self.module,
             datamodule=self.data_module,
-            ckpt_path=(self.cfg.resume.ckpt_path if self._resume_mode == "full state" else None),
+            ckpt_path=(self.cfg.resume.ckpt_path if resume_full_state else None),
+            weights_only=(False if resume_full_state else None),
         )
 
     def validate(self):

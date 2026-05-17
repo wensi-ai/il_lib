@@ -6,6 +6,7 @@ from pathlib import Path
 from time import perf_counter
 
 import h5py
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -42,6 +43,115 @@ from typing import Any, Dict, List, Optional
 
 
 logger = logging.getLogger("BasePolicy")
+
+
+def _to_numpy_tree(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().numpy()
+    if isinstance(value, dict):
+        return {k: _to_numpy_tree(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_numpy_tree(v) for v in value]
+    return value
+
+
+def _rgb_to_openpi_array(value) -> np.ndarray:
+    image = _to_numpy_tree(value)
+    image = np.asarray(image)
+
+    if image.ndim >= 3 and image.shape[-1] not in (3, 4) and image.shape[-3] in (3, 4):
+        image = np.moveaxis(image, -3, -1)
+
+    # Drop singleton history/time axes while preserving HWC or BHWC image layout.
+    while image.ndim > 4:
+        squeezed = False
+        for axis in range(image.ndim - 3):
+            if image.shape[axis] == 1:
+                image = np.squeeze(image, axis=axis)
+                squeezed = True
+                break
+        if not squeezed:
+            image = image.reshape((-1, *image.shape[-3:]))
+            break
+
+    if image.ndim == 4 and image.shape[0] == 1:
+        image = image[0]
+
+    if image.dtype != np.uint8:
+        image = image.astype(np.float32, copy=False)
+        if image.size:
+            image_min = float(np.nanmin(image))
+            image_max = float(np.nanmax(image))
+            if image_min >= 0.0 and image_max <= 1.0:
+                image = image * 255.0
+            elif image_min >= -1.0 and image_max <= 1.0:
+                image = (image + 1.0) * 127.5
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    return image
+
+
+def _to_base_policy_obs(value):
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            if isinstance(key, str) and key.endswith("::rgb"):
+                result[key] = _rgb_to_openpi_array(item)
+            else:
+                result[key] = _to_base_policy_obs(item)
+        return result
+    return _to_numpy_tree(value)
+
+
+def _coerce_action_chunk(value: Any) -> torch.Tensor:
+    if isinstance(value, dict):
+        if "actions" in value:
+            value = value["actions"]
+        elif "action" in value:
+            value = value["action"]
+        else:
+            raise KeyError(
+                "Websocket base policy response must include 'actions' or 'action'. "
+                f"Got keys: {sorted(value)}"
+            )
+    action = torch.as_tensor(value, dtype=torch.float32)
+    if action.dim() == 1:
+        action = action.unsqueeze(0)
+    elif action.dim() > 2:
+        action = action.reshape(-1, action.shape[-1])
+    return action
+
+
+class WebsocketBasePolicyAdapter:
+    """Adapts an openpi-style websocket policy to the local base-policy act API."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        api_key: Optional[str] = None,
+    ) -> None:
+        self.num_latest_obs = 1
+        try:
+            from openpi_client import websocket_client_policy
+        except ModuleNotFoundError:
+            workspace_root = Path(__file__).resolve().parents[3]
+            openpi_client_src = workspace_root / "openpi" / "packages" / "openpi-client" / "src"
+            if openpi_client_src.exists() and str(openpi_client_src) not in sys.path:
+                sys.path.insert(0, str(openpi_client_src))
+            from openpi_client import websocket_client_policy
+
+        self._client = websocket_client_policy.WebsocketClientPolicy(
+            host=host,
+            port=port,
+            api_key=api_key,
+        )
+
+    def act(self, obs: dict) -> torch.Tensor:
+        return _coerce_action_chunk(self._client.infer(_to_base_policy_obs(obs)))
+
+    def reset(self) -> None:
+        self._client.reset()
 
 
 def _collect_base_policy_overrides() -> List[str]:
@@ -490,8 +600,13 @@ class ResidualPolicyWrapper(PolicyWrapper):
         *args,
         base_deployed_action_steps: int,  # Base policy's action chunk size
         base_policy: str,
-        base_policy_ckpt_path: str,
+        base_policy_ckpt_path: Optional[str] = None,
         base_policy_overrides: Optional[List[str]] = None,
+        base_policy_use_websocket: bool = False,
+        base_policy_host: str = "127.0.0.1",
+        base_policy_port: Optional[int] = None,
+        base_policy_api_key: Optional[str] = None,
+        base_policy_execution_horizon: Optional[int] = None,
         residual_deployed_action_steps: int = 1,  # Residual policy's action step (usually 1)
         intervention_policy: Optional[str] = None,
         intervention_policy_ckpt_path: Optional[str] = None,
@@ -499,6 +614,7 @@ class ResidualPolicyWrapper(PolicyWrapper):
         intervention_policy_threshold: Optional[float] = None,
         intervention_include_current_action_in_history: bool = False,
         intervention_prop_keys: Optional[List[str]] = None,
+        base_policy_only: bool = False,
         trace_hdf5_path: Optional[str] = None,
         trace_overwrite: bool = False,
         **kwargs,
@@ -512,17 +628,29 @@ class ResidualPolicyWrapper(PolicyWrapper):
         
         # Base policy specific attributes
         self.base_deployed_action_steps = base_deployed_action_steps
+        self.base_policy_execution_horizon = (
+            base_deployed_action_steps
+            if base_policy_execution_horizon is None
+            else int(base_policy_execution_horizon)
+        )
+        if self.base_policy_execution_horizon < 1:
+            raise ValueError("base_policy_execution_horizon must be >= 1.")
         self._base_action_buffer = None  # Will store (T_A, A) from base policy
         self._base_action_idx = 0
         self._residual_action_buffer = None
         self._residual_intervention_buffer = None
         self._residual_action_idx = 0
+        self._base_action_dim = None
         self._intervention_steps_remaining = 0
         self.base_policy = None  # Will be set to the base policy from residual_policy.base_policy
         self._base_obs_history = None  # Created lazily once the base policy is attached
         self._base_policy_name = base_policy
         self._base_policy_ckpt_path = base_policy_ckpt_path
         self._base_policy_overrides = base_policy_overrides
+        self._base_policy_use_websocket = base_policy_use_websocket or base_policy_ckpt_path is None
+        self._base_policy_host = base_policy_host
+        self._base_policy_port = base_policy_port
+        self._base_policy_api_key = base_policy_api_key
         self._base_policy_device = None
         self.intervention_policy = None
         self._intervention_policy_name = intervention_policy
@@ -532,6 +660,7 @@ class ResidualPolicyWrapper(PolicyWrapper):
         self._intervention_include_current_action_in_history = (
             intervention_include_current_action_in_history
         )
+        self._base_policy_only = bool(base_policy_only)
         self._intervention_prop_keys = intervention_prop_keys or [
             "qpos/arm",
             "qpos/gripper",
@@ -763,14 +892,78 @@ class ResidualPolicyWrapper(PolicyWrapper):
 
     def _get_base_policy(self):
         if self.base_policy is None:
-            assert self._base_policy_ckpt_path is not None, "base_policy_ckpt_path must be provided for residual inference!"
-            self.base_policy = self._instantiate_arch_module(
-                arch_name=self._base_policy_name,
-                ckpt_path=self._base_policy_ckpt_path,
-                extra_overrides=self._base_policy_overrides,
-            )
-            self._base_policy_device = self.policy.device
+            if self._base_policy_use_websocket:
+                if self._base_policy_port is None:
+                    raise ValueError(
+                        "base_policy_port must be provided when using a websocket base policy."
+                    )
+                self.base_policy = WebsocketBasePolicyAdapter(
+                    host=self._base_policy_host,
+                    port=int(self._base_policy_port),
+                    api_key=self._base_policy_api_key,
+                )
+                self._base_policy_device = torch.device("cpu")
+            else:
+                assert self._base_policy_ckpt_path is not None, (
+                    "base_policy_ckpt_path must be provided for local residual inference."
+                )
+                self.base_policy = self._instantiate_arch_module(
+                    arch_name=self._base_policy_name,
+                    ckpt_path=self._base_policy_ckpt_path,
+                    extra_overrides=self._base_policy_overrides,
+                )
+                self._base_policy_device = self.policy.device
         return self.base_policy
+
+    def _refresh_base_action_buffer(self, *, raw_obs: dict, obs: dict) -> None:
+        base_policy = self._get_base_policy()
+        if self._base_policy_use_websocket:
+            self._base_action_buffer = self._infer_websocket_base_action_buffer(
+                base_policy=base_policy,
+                raw_obs=raw_obs,
+            )
+        else:
+            base_obs = {"obs": self._stack_obs_history(obs, history=self._get_base_obs_history())}
+            self._base_action_buffer = base_policy.act(base_obs).squeeze(0)
+        self._base_action_buffer = _coerce_action_chunk(self._base_action_buffer)
+        self._base_action_dim = int(self._base_action_buffer.shape[-1])
+        self._base_action_idx = 0
+
+    def _get_base_action_condition_horizon(self) -> int:
+        default_horizon = int(
+            getattr(
+                self.policy,
+                "base_action_horizon",
+                getattr(self.policy, "action_prediction_horizon", 1),
+            )
+        )
+        intervention_horizon = self._get_intervention_input_steps(
+            "base_action_chunk",
+            default=default_horizon,
+        )
+        return max(1, default_horizon, intervention_horizon)
+
+    def _get_websocket_base_buffer_target_steps(self) -> int:
+        return self._get_base_action_condition_horizon()
+
+    def _infer_websocket_base_action_buffer(self, *, base_policy, raw_obs: dict) -> torch.Tensor:
+        target_steps = self._get_websocket_base_buffer_target_steps()
+        chunks = []
+        collected_steps = 0
+        while collected_steps < target_steps:
+            chunk = _coerce_action_chunk(base_policy.act(raw_obs))
+            if chunk.shape[0] == 0:
+                raise ValueError("Websocket base policy returned an empty action chunk.")
+            chunks.append(chunk)
+            collected_steps += int(chunk.shape[0])
+        return torch.cat(chunks, dim=0)
+
+    def _needs_base_inference(self) -> bool:
+        return (
+            self._base_action_buffer is None
+            or self._base_action_idx >= self._base_action_buffer.shape[0]
+            or self._base_action_idx % self.base_policy_execution_horizon == 0
+        )
 
     def _get_intervention_policy(self):
         if self._intervention_policy_name is None:
@@ -800,9 +993,64 @@ class ResidualPolicyWrapper(PolicyWrapper):
         if key not in cfg:
             step_cfg = getattr(intervention_policy, "input_steps", {})
             if key not in step_cfg:
+                input_dim = self._get_intervention_extractor_input_dim(key)
+                if input_dim is not None and key in {"action_history", "base_action_chunk"}:
+                    action_dim = self._get_intervention_action_dim()
+                    return max(1, int(input_dim) // int(action_dim))
                 return default
             return int(step_cfg[key])
         return int(cfg[key]["steps"])
+
+    def _get_intervention_extractor_input_dim(self, key: str) -> Optional[int]:
+        intervention_policy = self._get_intervention_policy()
+        feature_extractor = getattr(intervention_policy, "feature_extractor", None)
+        extractors = getattr(feature_extractor, "_extractors", {})
+        if hasattr(extractors, "get"):
+            extractor = extractors.get(key)
+        else:
+            extractor = extractors[key] if key in extractors else None
+        if extractor is None:
+            return None
+
+        input_dim = getattr(extractor, "input_dim", None)
+        if input_dim is not None:
+            return int(input_dim)
+
+        for module in extractor.modules():
+            if isinstance(module, torch.nn.Linear):
+                return int(module.in_features)
+        return None
+
+    def _get_intervention_action_dim(self) -> int:
+        intervention_policy = self._get_intervention_policy()
+        for source in (intervention_policy, getattr(intervention_policy, "hparams", None)):
+            if source is None:
+                continue
+            action_dim = getattr(source, "action_dim", None)
+            if action_dim is None and hasattr(source, "get"):
+                action_dim = source.get("action_dim")
+            if action_dim is not None:
+                return int(action_dim)
+
+        if self._base_action_dim is not None:
+            return int(self._base_action_dim)
+        action_key_dims = getattr(self.policy, "_action_key_dims", None)
+        if action_key_dims:
+            return int(sum(action_key_dims.values()))
+        return int(self.policy.action_dim)
+
+    def _validate_intervention_flat_input_dim(self, key: str, value: torch.Tensor) -> None:
+        input_dim = self._get_intervention_extractor_input_dim(key)
+        if input_dim is None:
+            return
+
+        flat_dim = int(value.reshape(value.shape[0], -1).shape[-1])
+        if flat_dim != int(input_dim):
+            raise ValueError(
+                f"Intervention input '{key}' has flattened dim {flat_dim}, "
+                f"but the loaded probe expects {int(input_dim)}. "
+                "This usually means the serving process is using the wrong action-history horizon."
+            )
 
     def _get_intervention_obs_history(self) -> deque:
         intervention_policy = self._get_intervention_policy()
@@ -884,6 +1132,7 @@ class ResidualPolicyWrapper(PolicyWrapper):
                 "base_action_chunk", default=base_action_chunk.shape[0]
             )
             base_chunk = self._pad_action_sequence(base_action_chunk, steps, pad_with_last=True)
+            self._validate_intervention_flat_input_dim("base_action_chunk", base_chunk.unsqueeze(0))
             inputs["base_action_chunk"] = base_chunk.unsqueeze(0)
         if "action_history" in requested_inputs:
             steps = self._get_intervention_input_steps("action_history", default=1)
@@ -900,10 +1149,11 @@ class ResidualPolicyWrapper(PolicyWrapper):
                     history_tensor = torch.cat([pad, history_tensor], dim=0)
             else:
                 history_tensor = torch.zeros(
-                    (steps, self.policy.action_dim),
+                    (steps, self._get_intervention_action_dim()),
                     device=base_action_chunk.device,
                     dtype=base_action_chunk.dtype,
                 )
+            self._validate_intervention_flat_input_dim("action_history", history_tensor.unsqueeze(0))
             inputs["action_history"] = history_tensor.unsqueeze(0)
         return inputs
 
@@ -928,21 +1178,18 @@ class ResidualPolicyWrapper(PolicyWrapper):
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
         """
         Coordinated action generation:
-        1. Get base action from buffer (refresh every base_deployed_action_steps)
+        1. Get base action from buffer (refresh every base_policy_execution_horizon steps)
         2. Get residual correction from residual policy
         3. Combine: final_action = base_action + residual_correction
         """
-        obs = any_to_torch(obs, device="cpu")
-        obs = self.process_obs(obs=obs)
+        raw_obs = any_to_torch(obs, device="cpu")
+        obs = self.process_obs(obs=raw_obs)
         residual_obs = {"obs": self._stack_obs_history(obs)}
 
         # ===== Base Policy: Action Chunking =====
-        need_base_inference = self._base_action_idx % self.base_deployed_action_steps == 0
-        if need_base_inference:
-            base_policy = self._get_base_policy()
-            base_obs = {"obs": self._stack_obs_history(obs, history=self._get_base_obs_history())}
-            self._base_action_buffer = base_policy.act(base_obs).squeeze(0)  # (T_A, A)
-            self._base_action_idx = 0
+        base_refreshed = self._needs_base_inference()
+        if base_refreshed:
+            self._refresh_base_action_buffer(raw_obs=raw_obs, obs=obs)
         elif self._base_obs_history is not None:
             self._stack_obs_history(obs, history=self._base_obs_history)
         
@@ -977,9 +1224,37 @@ class ResidualPolicyWrapper(PolicyWrapper):
             else:
                 residual_obs["obs"]["base_action"] = base_action_normalized.view(1, 1, -1)
 
+        if self._base_policy_only:
+            residual_action = torch.zeros_like(base_action_normalized)
+            intervention = torch.zeros(1, device=base_action.device, dtype=base_action.dtype)
+            print(
+                "\033[1m\033[96m[ResidualPolicyWrapper]\033[0m "
+                "executing=\033[1m\033[94mBASE-ONLY\033[0m "
+                f"intervention={float(intervention):.3f} "
+                f"base_step={self._base_action_idx}/{self._base_action_buffer.shape[0]}",
+                flush=True,
+            )
+            self._record_trace_step(
+                base_action=base_action,
+                residual_action=residual_action,
+                combined_action=base_action,
+                applied_action=base_action,
+                intervention=intervention.reshape(1),
+            )
+            self._set_current_state(
+                base_action=base_action,
+                residual_action=residual_action,
+                predicted_action=base_action,
+                applied_action=base_action,
+                intervention=intervention.reshape(1),
+            )
+            self._append_executed_action(base_action_normalized)
+            return base_action.clone()
+
         # ===== Residual Policy: Correction Chunk =====
         need_residual_inference = (
-            self._residual_action_buffer is None
+            base_refreshed
+            or self._residual_action_buffer is None
             or self._residual_action_idx >= self._residual_action_buffer.shape[0]
             or self._residual_action_idx % self.deployed_action_steps == 0
         )
@@ -1174,9 +1449,26 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
         if key not in cfg:
             step_cfg = getattr(intervention_policy, "input_steps", {})
             if key not in step_cfg:
+                input_dim = self._get_intervention_extractor_input_dim(key)
+                if input_dim is not None and key in {"action_history", "base_action_chunk"}:
+                    action_dim = self._get_intervention_action_dim()
+                    return max(1, int(input_dim) // int(action_dim))
                 return default
             return int(step_cfg[key])
         return int(cfg[key]["steps"])
+
+    def _validate_intervention_flat_input_dim(self, key: str, value: torch.Tensor) -> None:
+        input_dim = self._get_intervention_extractor_input_dim(key)
+        if input_dim is None:
+            return
+
+        flat_dim = int(value.reshape(value.shape[0], -1).shape[-1])
+        if flat_dim != int(input_dim):
+            raise ValueError(
+                f"Intervention input '{key}' has flattened dim {flat_dim}, "
+                f"but the loaded probe expects {int(input_dim)}. "
+                "This usually means the serving process is using the wrong action-history horizon."
+            )
 
     def _get_intervention_obs_history(self) -> deque:
         intervention_policy = self._get_intervention_policy()
@@ -1259,6 +1551,7 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
         if "base_action_chunk" in requested_inputs:
             steps = self._get_intervention_input_steps("base_action_chunk", default=base_action_chunk.shape[0])
             base_chunk = self._pad_action_sequence(base_action_chunk, steps, pad_with_last=True)
+            self._validate_intervention_flat_input_dim("base_action_chunk", base_chunk.unsqueeze(0))
             inputs["base_action_chunk"] = base_chunk.unsqueeze(0)
         if "action_history" in requested_inputs:
             steps = self._get_intervention_input_steps("action_history", default=1)
@@ -1275,10 +1568,11 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
                     history_tensor = torch.cat([pad, history_tensor], dim=0)
             else:
                 history_tensor = torch.zeros(
-                    (steps, self.policy.action_dim),
+                    (steps, self._get_intervention_action_dim()),
                     device=base_action_chunk.device,
                     dtype=base_action_chunk.dtype,
                 )
+            self._validate_intervention_flat_input_dim("action_history", history_tensor.unsqueeze(0))
             inputs["action_history"] = history_tensor.unsqueeze(0)
         return inputs
 
@@ -1301,16 +1595,13 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
         return (probs >= threshold).to(torch.float32)
 
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
-        obs = any_to_torch(obs, device="cpu")
-        obs = self.process_obs(obs=obs)
+        raw_obs = any_to_torch(obs, device="cpu")
+        obs = self.process_obs(obs=raw_obs)
         policy_obs = {"obs": self._stack_obs_history(obs)}
 
-        need_base_inference = self._base_action_idx % self.base_deployed_action_steps == 0
-        if need_base_inference:
-            base_policy = self._get_base_policy()
-            base_obs = {"obs": self._stack_obs_history(obs, history=self._get_base_obs_history())}
-            self._base_action_buffer = base_policy.act(base_obs).squeeze(0)
-            self._base_action_idx = 0
+        base_refreshed = self._needs_base_inference()
+        if base_refreshed:
+            self._refresh_base_action_buffer(raw_obs=raw_obs, obs=obs)
         elif self._base_obs_history is not None:
             self._stack_obs_history(obs, history=self._base_obs_history)
 
@@ -1330,8 +1621,47 @@ class BaseChunkPolicyWrapper(ResidualPolicyWrapper):
         base_action_chunk = self._normalize_chunk(base_action_chunk)
         policy_obs["obs"]["base_action"] = base_action_chunk.view(1, 1, base_action_horizon, -1)
 
+        if self._base_policy_only:
+            pred_action = self._normalize_action(base_action.clone())
+            pred_action_denormalized = base_action.clone()
+            residual_action = torch.zeros_like(pred_action)
+            intervention = torch.zeros(1, device=base_action.device, dtype=base_action.dtype)
+            policy_intervention_chunk = torch.zeros(
+                max(1, int(self.deployed_action_steps)),
+                device=base_action.device,
+                dtype=base_action.dtype,
+            )
+            print(
+                "\033[1m\033[96m[BaseChunkPolicyWrapper]\033[0m "
+                "executing=\033[1m\033[94mBASE-ONLY\033[0m "
+                f"intervention={float(intervention):.3f} "
+                f"base_step={self._base_action_idx}/{self._base_action_buffer.shape[0]}",
+                flush=True,
+            )
+            self._record_trace_step(
+                base_action=base_action,
+                residual_action=residual_action,
+                combined_action=pred_action_denormalized,
+                applied_action=base_action,
+                intervention=intervention.reshape(1),
+            )
+            self._set_current_state(
+                base_action=base_action,
+                residual_action=residual_action,
+                predicted_action=pred_action_denormalized,
+                applied_action=base_action,
+                intervention=intervention.reshape(1),
+            )
+            self._current_state["policy_action"] = self._clone_state_tensor(base_action)
+            self._current_state["policy_intervention_chunk"] = self._clone_state_tensor(
+                policy_intervention_chunk
+            )
+            self._append_executed_action(pred_action)
+            return base_action.clone()
+
         need_policy_inference = (
-            self._residual_action_buffer is None
+            base_refreshed
+            or self._residual_action_buffer is None
             or self._residual_action_idx >= self._residual_action_buffer.shape[0]
             or self._residual_action_idx % self.deployed_action_steps == 0
         )
@@ -1441,16 +1771,13 @@ class GatedPolicyWrapper(ResidualPolicyWrapper):
     """
 
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
-        obs = any_to_torch(obs, device="cpu")
-        obs = self.process_obs(obs=obs)
+        raw_obs = any_to_torch(obs, device="cpu")
+        obs = self.process_obs(obs=raw_obs)
         policy_obs = {"obs": self._stack_obs_history(obs)}
 
-        need_base_inference = self._base_action_idx % self.base_deployed_action_steps == 0
-        if need_base_inference:
-            base_policy = self._get_base_policy()
-            base_obs = {"obs": self._stack_obs_history(obs, history=self._get_base_obs_history())}
-            self._base_action_buffer = base_policy.act(base_obs).squeeze(0)
-            self._base_action_idx = 0
+        base_refreshed = self._needs_base_inference()
+        if base_refreshed:
+            self._refresh_base_action_buffer(raw_obs=raw_obs, obs=obs)
         elif self._base_obs_history is not None:
             self._stack_obs_history(obs, history=self._base_obs_history)
 
@@ -1470,8 +1797,35 @@ class GatedPolicyWrapper(ResidualPolicyWrapper):
         normalized_base_chunk = self._normalize_action(base_action_chunk.clone())
         policy_obs["obs"]["base_action"] = normalized_base_chunk.view(1, 1, base_action_horizon, -1)
 
+        if self._base_policy_only:
+            pred_action = self._normalize_action(base_action.clone())
+            residual_action = torch.zeros_like(pred_action)
+            gate_proxy = torch.zeros(1, device=base_action.device, dtype=base_action.dtype)
+            print(
+                "\033[1m\033[96m[GatedPolicyWrapper]\033[0m "
+                "executing=\033[1m\033[94mBASE-ONLY\033[0m "
+                f"base_step={self._base_action_idx}/{self._base_action_buffer.shape[0]}",
+                flush=True,
+            )
+            self._record_trace_step(
+                base_action=base_action,
+                residual_action=residual_action,
+                combined_action=base_action,
+                applied_action=base_action,
+                intervention=gate_proxy,
+            )
+            self._set_current_state(
+                base_action=base_action,
+                residual_action=residual_action,
+                predicted_action=base_action,
+                applied_action=base_action,
+                intervention=gate_proxy,
+            )
+            return base_action.clone()
+
         need_policy_inference = (
-            self._residual_action_buffer is None
+            base_refreshed
+            or self._residual_action_buffer is None
             or self._residual_action_idx >= self._residual_action_buffer.shape[0]
             or self._residual_action_idx % self.deployed_action_steps == 0
         )

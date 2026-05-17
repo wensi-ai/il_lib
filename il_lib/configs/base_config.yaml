@@ -12,7 +12,7 @@ ckpt_path: null
 
 # ====== Main Config ======
 seed: 42
-gpus: 1
+gpus: -1  # Lightning devices=-1 uses all visible GPUs.
 num_nodes: 1
 lr: 7e-4
 use_cosine_lr: true
@@ -137,6 +137,8 @@ resume:
   full_state: false  
   # whether to strictly enforce that the keys in state_dict match the keys returned by the model
   strict: true  
+  # if set, train for this many more steps after the checkpoint global_step
+  additional_steps: null
 
 hydra:
   job:
