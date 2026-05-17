@@ -78,6 +78,7 @@ module:
   horizon: ${horizon}
   deployed_action_steps: ${deployed_action_steps}
   optimizer: adam
+  freeze_encoder: false
 
 data:
   use_action_chunks: false

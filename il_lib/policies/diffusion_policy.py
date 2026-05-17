@@ -6,6 +6,7 @@ from il_lib.optim import CosineScheduleFunction
 from il_lib.policies.policy_base import BasePolicy
 from il_lib.utils.array_tensor_utils import any_slice, get_batch_size, any_concat
 from il_lib.utils.functional_utils import call_once
+from il_lib.utils.training_utils import freeze_params, unfreeze_params
 from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
 from omegaconf import DictConfig
 from typing import Any, Dict, Optional, List
@@ -53,6 +54,8 @@ class DiffusionPolicy(BasePolicy):
         lr_layer_decay: float = 1.0,
         optimizer: str = "adam",
         weight_decay: float = 0.0,
+        freeze_encoder: bool = False,
+        freeze_feature_extractor: Optional[bool] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -94,8 +97,40 @@ class DiffusionPolicy(BasePolicy):
         self.lr_layer_decay = lr_layer_decay
         self.optimizer = optimizer
         self.weight_decay = weight_decay
+        if freeze_feature_extractor is not None:
+            freeze_encoder = freeze_feature_extractor
+        self._freeze_encoder = bool(freeze_encoder)
+        self._apply_freeze_config()
         # Save hyperparameters
         self.save_hyperparameters()
+
+    def _apply_freeze_config(self) -> None:
+        (freeze_params if self._freeze_encoder else unfreeze_params)(self.feature_extractor)
+
+    def train(self, mode: bool = True):
+        ret = super().train(mode)
+        if mode and getattr(self, "_freeze_encoder", False):
+            freeze_params(self.feature_extractor)
+        return ret
+
+    def set_training_stage(
+        self,
+        *,
+        freeze_encoder: Optional[bool] = None,
+        freeze_feature_extractor: Optional[bool] = None,
+        **kwargs,
+    ) -> None:
+        if kwargs:
+            unknown = ", ".join(sorted(kwargs))
+            raise ValueError(f"Unknown DiffusionPolicy stage option(s): {unknown}")
+        if freeze_feature_extractor is not None:
+            freeze_encoder = freeze_feature_extractor
+        if freeze_encoder is not None:
+            self._freeze_encoder = bool(freeze_encoder)
+        self._apply_freeze_config()
+
+    def enforce_training_stage(self) -> None:
+        self._apply_freeze_config()
 
     def forward(self, obs, noisy_traj, diffusion_timesteps):
         """
@@ -115,7 +150,11 @@ class DiffusionPolicy(BasePolicy):
         obs["proprioception"] = prop_obs
         obs = {k: obs[k] for k in self._features}  # filter obs to only include features we have
         self._check_forward_input_shape(obs, noisy_traj, diffusion_timesteps)
-        obs_feature = self.feature_extractor(obs)  # (B, T_O, D)
+        if self.training and self._freeze_encoder:
+            with torch.no_grad():
+                obs_feature = self.feature_extractor(obs)  # (B, T_O, D)
+        else:
+            obs_feature = self.feature_extractor(obs)  # (B, T_O, D)
 
         pred = self.backbone(
             sample=noisy_traj,
