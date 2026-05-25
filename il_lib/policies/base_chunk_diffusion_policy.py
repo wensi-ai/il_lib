@@ -568,6 +568,8 @@ class BaseChunkDiffusionPolicy(BasePolicy):
             }
         if "task" in self._features:
             data["task"] = obs_batch["task"]
+        if "rl_token" in self._features:
+            data["rl_token"] = obs_batch["rl_token"]
         if "base_action" in self._features and "base_action" in obs_batch:
             data["base_action"] = obs_batch["base_action"]
         if extract_action:

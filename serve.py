@@ -15,6 +15,8 @@ import os
 import sys
 
 
+DEFAULT_BASE_POLICY_PORT = 8002
+
 def _to_msgpackable(value):
     if torch.is_tensor(value):
         return value.detach().cpu().numpy()

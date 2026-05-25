@@ -11,7 +11,7 @@ from il_lib.nn.distributions import CategoricalNet
 from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.optim import CosineScheduleFunction
 from il_lib.policies.policy_base import BasePolicy
-from il_lib.utils.training_utils import freeze_params, load_state_dict
+from il_lib.utils.training_utils import freeze_params, load_state_dict, unfreeze_params
 from omnigibson.learning.utils.eval_utils import ACTION_QPOS_INDICES
 from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
 
@@ -44,6 +44,9 @@ class _SimpleResidualMLP(nn.Module):
         hidden_depth: int,
         activation: str = "gelu",
         dropout: float = 0.0,
+        use_tanh_output: bool = False,
+        output_scale: float = 1.0,
+        last_layer_init_scale: Optional[float] = None,
     ):
         super().__init__()
         if hidden_depth < 1:
@@ -65,6 +68,12 @@ class _SimpleResidualMLP(nn.Module):
         )
         self.output_layer = nn.Linear(hidden_dim, output_dim)
         self.dropout = dropout
+        self.use_tanh_output = use_tanh_output
+        self.output_scale = float(output_scale)
+
+        if last_layer_init_scale is not None:
+            nn.init.normal_(self.output_layer.weight, mean=0.0, std=float(last_layer_init_scale))
+            nn.init.zeros_(self.output_layer.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.input_layer(x)
@@ -74,7 +83,10 @@ class _SimpleResidualMLP(nn.Module):
             h = layer(h)
             h = self.activation(h)
             h = F.dropout(h, p=self.dropout, training=self.training)
-        return self.output_layer(h)
+        out = self.output_layer(h)
+        if self.use_tanh_output:
+            out = torch.tanh(out) * self.output_scale
+        return out
 
 
 class SimpleResidualPolicy(BasePolicy):
@@ -95,6 +107,9 @@ class SimpleResidualPolicy(BasePolicy):
         action_net_hidden_dim: int = 128,
         action_net_hidden_depth: int = 3,
         action_net_activation: str = "gelu",
+        action_net_use_tanh_output: bool = False,
+        action_scale: float = 1.0,
+        actor_last_layer_init_scale: Optional[float] = None,
         dropout: float = 0.0,
         learn_gripper_action: bool = True,
         include_robot_gripper_action_input: bool = True,
@@ -108,7 +123,11 @@ class SimpleResidualPolicy(BasePolicy):
         supervise_zero_residual_off_intervention: bool = False,
         zero_residual_loss_weight: float = 0.0,
         off_intervention_residual_l1_weight: float = 0.0,
+        predict_direct_action: bool = False,
+        direct_action_loss_on_all_valid: bool = True,
         stage2_ckpt_path: Optional[str] = None,
+        pretrained_vision_encoder_ckpt_path: Optional[str] = None,
+        freeze_pretrained_vision_encoder: bool = False,
         residual_target_normalization: str = "none",
         residual_target_normalization_eps: float = 1e-6,
         lr: float = 1e-4,
@@ -146,6 +165,9 @@ class SimpleResidualPolicy(BasePolicy):
             hidden_depth=action_net_hidden_depth,
             activation=action_net_activation,
             dropout=dropout,
+            use_tanh_output=action_net_use_tanh_output,
+            output_scale=action_scale,
+            last_layer_init_scale=actor_last_layer_init_scale,
         )
 
         self._use_intervention_head = use_intervention_head
@@ -171,7 +193,14 @@ class SimpleResidualPolicy(BasePolicy):
         )
         self._zero_residual_loss_weight = zero_residual_loss_weight
         self._off_intervention_residual_l1_weight = off_intervention_residual_l1_weight
+        self._predict_direct_action = bool(predict_direct_action)
+        self._direct_action_loss_on_all_valid = bool(direct_action_loss_on_all_valid)
         self._residual_target_normalization = residual_target_normalization.lower()
+        if self._predict_direct_action and self._uses_residual_target_normalization():
+            raise ValueError(
+                "residual_target_normalization is only supported for residual targets, "
+                "not predict_direct_action=True."
+            )
         self._residual_target_normalization_eps = residual_target_normalization_eps
         if self._residual_target_normalization not in {"none", "min_max"}:
             raise ValueError(
@@ -197,6 +226,11 @@ class SimpleResidualPolicy(BasePolicy):
 
         if stage2_ckpt_path is not None:
             self._load_stage2_checkpoint(stage2_ckpt_path)
+        if pretrained_vision_encoder_ckpt_path is not None:
+            self._load_pretrained_vision_encoder(
+                pretrained_vision_encoder_ckpt_path,
+                freeze=freeze_pretrained_vision_encoder,
+            )
 
     def _load_stage2_checkpoint(self, ckpt_path: str) -> None:
         if not os.path.exists(ckpt_path):
@@ -245,6 +279,35 @@ class SimpleResidualPolicy(BasePolicy):
         )
         freeze_params(self.action_net)
 
+    def _load_pretrained_vision_encoder(self, ckpt_path: str, *, freeze: bool) -> None:
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(
+                f"pretrained_vision_encoder_ckpt_path does not exist: {ckpt_path}"
+            )
+        extractors = getattr(self.feature_extractor, "_extractors", {})
+        if "rgb" not in extractors:
+            raise KeyError("pretrained_vision_encoder_ckpt_path requires an rgb feature extractor.")
+
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+        prefixes = [
+            "base_chunk_diffusion_policy.feature_extractor._extractors.rgb.",
+            "residual_diffusion_policy.feature_extractor._extractors.rgb.",
+            "diffusion_policy.feature_extractor._extractors.rgb.",
+            "feature_extractor._extractors.rgb.",
+        ]
+        for prefix in prefixes:
+            weights = {k: v for k, v in state_dict.items() if k.startswith(prefix)}
+            if weights:
+                load_state_dict(extractors["rgb"], weights, strip_prefix=prefix, strict=True)
+                (freeze_params if freeze else unfreeze_params)(extractors["rgb"])
+                return
+        available_keys = list(state_dict.keys())[:10]
+        raise KeyError(
+            "Could not find rgb vision encoder weights in checkpoint. "
+            f"Tried prefixes {prefixes}. Sample checkpoint keys: {available_keys}"
+        )
+
     def forward(self, obs):
         prop_obs = []
         for prop_key in self._prop_keys:
@@ -258,6 +321,14 @@ class SimpleResidualPolicy(BasePolicy):
 
         obs = dict(obs)
         obs["proprioception"] = prop_obs
+        if "rgb" in self._features and "rgb" not in obs:
+            rgb_obs = {
+                k.rsplit("::", 1)[0]: v
+                for k, v in obs.items()
+                if isinstance(k, str) and k.endswith("::rgb")
+            }
+            if rgb_obs:
+                obs["rgb"] = rgb_obs
         obs = {k: obs[k] for k in self._features}
         if "base_action" in obs:
             obs["base_action"] = self._format_action_chunk(obs["base_action"])
@@ -282,9 +353,10 @@ class SimpleResidualPolicy(BasePolicy):
 
         residual_action, intervention_dist = self.forward(obs)
         intervention = intervention_dist.mode() if deterministic else intervention_dist.sample()
-        residual_action = self._unflatten_action_chunk(residual_action)
-        residual_action = self._denormalize_residual_target(residual_action)
-        return residual_action, intervention
+        action = self._unflatten_action_chunk(residual_action)
+        if not self._predict_direct_action:
+            action = self._denormalize_residual_target(action)
+        return action, intervention
 
     def reset(self) -> None:
         pass
@@ -345,34 +417,48 @@ class SimpleResidualPolicy(BasePolicy):
             oracle_action[..., -1:],
         )
 
-        robot_policy_gripper_action = torch.where(
-            robot_policy_gripper_action >= 0, 1, 0
-        )
-        oracle_gripper_action = torch.where(oracle_gripper_action >= 0, 1, 0)
-        residual_q = oracle_action - robot_policy_action
-        residual_gripper = oracle_gripper_action - robot_policy_gripper_action
-
-        if self._learn_gripper_action:
-            target_action = torch.cat([residual_q, residual_gripper], dim=-1)
+        if self._predict_direct_action:
+            oracle_gripper_action = torch.where(oracle_gripper_action >= 0, 1, -1)
+            target_action = (
+                torch.cat([oracle_action, oracle_gripper_action], dim=-1)
+                if self._learn_gripper_action
+                else oracle_action
+            )
         else:
-            target_action = residual_q
+            robot_policy_gripper_action = torch.where(
+                robot_policy_gripper_action >= 0, 1, 0
+            )
+            oracle_gripper_action = torch.where(oracle_gripper_action >= 0, 1, 0)
+            residual_q = oracle_action - robot_policy_action
+            residual_gripper = oracle_gripper_action - robot_policy_gripper_action
+
+            if self._learn_gripper_action:
+                target_action = torch.cat([residual_q, residual_gripper], dim=-1)
+            else:
+                target_action = residual_q
 
         if self._include_robot_gripper_action_input:
             batch["robot_policy_gripper_action"] = robot_policy_gripper_action
 
+        action_label_mask = (
+            torch.ones_like(intervention_mask, dtype=torch.bool)
+            if self._predict_direct_action and self._direct_action_loss_on_all_valid
+            else intervention_mask
+        )
         action_valid_mask = self._action_valid_mask(
             pad_mask,
-            intervention_mask if not self._supervise_zero_residual_off_intervention else torch.ones_like(intervention_mask, dtype=torch.bool),
+            action_label_mask if not self._supervise_zero_residual_off_intervention else torch.ones_like(intervention_mask, dtype=torch.bool),
         )
         off_intervention_mask = self._action_valid_mask(pad_mask, ~intervention_mask)
 
-        if self._supervise_zero_residual_off_intervention:
+        if self._supervise_zero_residual_off_intervention and not self._predict_direct_action:
             target_action = target_action * intervention_mask.unsqueeze(-1).to(target_action.dtype)
 
         zero_target_action = torch.zeros_like(target_action)
         if target_action.dim() == 4:
-            target_action = self._normalize_residual_target(target_action)
-            zero_target_action = self._normalize_residual_target(zero_target_action)
+            if not self._predict_direct_action:
+                target_action = self._normalize_residual_target(target_action)
+                zero_target_action = self._normalize_residual_target(zero_target_action)
             target_action = self._format_action_chunk(target_action)
             zero_target_action = self._format_action_chunk(zero_target_action)
             action_valid_mask = self._current_mask(action_valid_mask) & pad_mask.all(dim=-1)
@@ -383,12 +469,17 @@ class SimpleResidualPolicy(BasePolicy):
                 f"(B, T, {self.action_prediction_horizon}, A), but got {target_action.shape}."
             )
         else:
-            target_action = self._normalize_residual_target(target_action)
-            zero_target_action = self._normalize_residual_target(zero_target_action)
+            if not self._predict_direct_action:
+                target_action = self._normalize_residual_target(target_action)
+                zero_target_action = self._normalize_residual_target(zero_target_action)
 
         pred_action, intervention_dist = self.forward(batch)
         pred_action = pred_action.reshape_as(target_action)
-        pred_action_denormalized = self._denormalize_residual_target(pred_action)
+        pred_action_denormalized = (
+            pred_action
+            if self._predict_direct_action
+            else self._denormalize_residual_target(pred_action)
+        )
 
         action_loss_mask = action_valid_mask.unsqueeze(-1).expand_as(pred_action).to(
             pred_action.dtype
@@ -399,7 +490,7 @@ class SimpleResidualPolicy(BasePolicy):
         real_batch_size = action_valid_mask.sum().clamp_min(1)
 
         zero_residual_loss = pred_action.new_zeros(())
-        if self._zero_residual_loss_weight > 0:
+        if self._zero_residual_loss_weight > 0 and not self._predict_direct_action:
             zero_mask = off_intervention_mask.unsqueeze(-1).expand_as(pred_action).to(
                 pred_action.dtype
             )
@@ -409,7 +500,7 @@ class SimpleResidualPolicy(BasePolicy):
             ).sum() / zero_loss_denom
 
         off_intervention_l1 = pred_action.new_zeros(())
-        if self._off_intervention_residual_l1_weight > 0:
+        if self._off_intervention_residual_l1_weight > 0 and not self._predict_direct_action:
             off_mask = off_intervention_mask.unsqueeze(-1).expand_as(pred_action).to(
                 pred_action.dtype
             )
