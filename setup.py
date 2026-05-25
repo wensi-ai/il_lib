@@ -18,6 +18,19 @@ def _fill_extras(extras):
     return extras
 
 
+def _read_requirements(fname="requirements.txt"):
+    requirements_path = pathlib.Path(fname)
+    if not requirements_path.exists():
+        return []
+    requirements = []
+    for line in requirements_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        requirements.append(line)
+    return requirements
+
+
 setup(
     name=PKG_NAME,
     version=VERSION,
@@ -27,8 +40,6 @@ setup(
     long_description_content_type="text/markdown",
     keywords=["Deep Learning", "Machine Learning"],
     license="Apache License, Version 2.0",
-    # Keep editable installs lightweight and let the runtime environment manage
-    # heavyweight ML dependencies separately.
     packages=find_packages(include=[PKG_NAME, f"{PKG_NAME}.*", "hydra_plugins"]),
     include_package_data=True,
     zip_safe=False,
@@ -38,7 +49,7 @@ setup(
             'search_path_plugin = hydra_plugins.search_path_plugin:SearchPathPlugin'
         ]
     },
-    install_requires=[],
+    install_requires=_read_requirements(),
     extras_require=_fill_extras(EXTRAS),
     #python_requires=">=3.9",
     classifiers=[
