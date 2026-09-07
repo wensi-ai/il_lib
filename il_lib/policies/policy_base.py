@@ -143,6 +143,7 @@ class WebsocketBasePolicyAdapter:
         api_key: Optional[str] = None,
     ) -> None:
         self.num_latest_obs = 1
+        self._uses_openpi_client = True
         try:
             from openpi_client import websocket_client_policy
         except ModuleNotFoundError:
@@ -150,18 +151,36 @@ class WebsocketBasePolicyAdapter:
             openpi_client_src = workspace_root / "openpi" / "packages" / "openpi-client" / "src"
             if openpi_client_src.exists() and str(openpi_client_src) not in sys.path:
                 sys.path.insert(0, str(openpi_client_src))
-            from openpi_client import websocket_client_policy
+            try:
+                from openpi_client import websocket_client_policy
+            except ModuleNotFoundError:
+                # Local il_lib servers speak OmniGibson's msgpack websocket
+                # protocol, so they do not require the optional OpenPI client.
+                from omnigibson.learning.utils.network_utils import WebsocketClientPolicy
 
-        self._client = websocket_client_policy.WebsocketClientPolicy(
-            host=host,
-            port=port,
-            api_key=api_key,
-        )
+                self._uses_openpi_client = False
+                self._client = WebsocketClientPolicy(
+                    host=host,
+                    port=port,
+                    api_key=api_key,
+                    allow_reconnect=True,
+                )
+
+        if self._uses_openpi_client:
+            self._client = websocket_client_policy.WebsocketClientPolicy(
+                host=host,
+                port=port,
+                api_key=api_key,
+            )
         self._last_response = None
 
     def act(self, obs: dict) -> torch.Tensor:
         _debug_break("base_ws_before_infer")
-        self._last_response = self._client.infer(_to_base_policy_obs(obs))
+        base_obs = _to_base_policy_obs(obs)
+        if self._uses_openpi_client:
+            self._last_response = self._client.infer(base_obs)
+        else:
+            self._last_response = self._client.act(base_obs)
         _debug_break("base_ws_after_infer")
         return _coerce_action_chunk(self._last_response)
 
@@ -169,6 +188,10 @@ class WebsocketBasePolicyAdapter:
         return self._last_response
 
     def reset(self) -> None:
+        if not self._uses_openpi_client:
+            self._client.reset()
+            self._last_response = None
+            return
         ws = getattr(self._client, "_ws", None)
         packer = getattr(self._client, "_packer", None)
         if ws is not None and packer is not None:
@@ -639,6 +662,9 @@ class ResidualPolicyWrapper(PolicyWrapper):
         intervention_include_current_action_in_history: bool = False,
         intervention_prop_keys: Optional[List[str]] = None,
         base_policy_only: bool = False,
+        clamp_combined_arm_action: bool = False,
+        gripper_from_base: bool = False,
+        arm_from_base: bool = False,
         trace_hdf5_path: Optional[str] = None,
         trace_overwrite: bool = False,
         **kwargs,
@@ -686,6 +712,15 @@ class ResidualPolicyWrapper(PolicyWrapper):
             intervention_include_current_action_in_history
         )
         self._base_policy_only = bool(base_policy_only)
+        self._clamp_combined_arm_action = bool(clamp_combined_arm_action)
+        # Channel ablations: keep the residual's output in the trace, but hand the
+        # gripper and/or arm channel of the *applied* action back to the base policy.
+        self._gripper_from_base = bool(gripper_from_base)
+        self._arm_from_base = bool(arm_from_base)
+        if self._gripper_from_base:
+            logger.info("ResidualPolicyWrapper ablation: gripper channel taken from the base policy.")
+        if self._arm_from_base:
+            logger.info("ResidualPolicyWrapper ablation: arm channels taken from the base policy.")
         self._intervention_prop_keys = intervention_prop_keys or [
             "qpos/arm",
             "qpos/gripper",
@@ -1291,6 +1326,35 @@ class ResidualPolicyWrapper(PolicyWrapper):
         if threshold is None:
             threshold = float(getattr(intervention_policy, "decision_threshold", 0.5))
         return (probs >= threshold).to(torch.float32)
+
+    def _combine_normalized_actions(
+        self,
+        base_action: torch.Tensor,
+        policy_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Combine continuous residuals while allowing absolute gripper commands."""
+        if bool(getattr(self.policy, "_predict_direct_action", False)):
+            return policy_action, policy_action - base_action
+
+        combined_action = base_action + policy_action
+        if getattr(self.policy, "_gripper_action_mode", "delta") == "absolute":
+            for action_key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
+                if "gripper" in action_key:
+                    combined_action[..., indices] = policy_action[..., indices]
+        if self._clamp_combined_arm_action:
+            for action_key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
+                if "gripper" not in action_key:
+                    combined_action[..., indices] = combined_action[..., indices].clamp(
+                        -1.0, 1.0
+                    )
+        gripper_from_base = bool(getattr(self, "_gripper_from_base", False))
+        arm_from_base = bool(getattr(self, "_arm_from_base", False))
+        if gripper_from_base or arm_from_base:
+            for action_key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
+                is_gripper = "gripper" in action_key
+                if (is_gripper and gripper_from_base) or (not is_gripper and arm_from_base):
+                    combined_action[..., indices] = base_action[..., indices]
+        return combined_action, policy_action
     
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
         """
@@ -1418,13 +1482,10 @@ class ResidualPolicyWrapper(PolicyWrapper):
             self._intervention_steps_remaining -= 1
 
         # ===== Combine Actions =====
-        predicts_direct_action = bool(getattr(self.policy, "_predict_direct_action", False))
-        if predicts_direct_action:
-            combined_normalized = residual_action
-            residual_for_logging = residual_action - base_action_normalized
-        else:
-            combined_normalized = base_action_normalized + residual_action
-            residual_for_logging = residual_action
+        combined_normalized, residual_for_logging = self._combine_normalized_actions(
+            base_action_normalized,
+            residual_action,
+        )
         combined_action = self._denormalize_action(combined_normalized.clone())
         if intervention >= 0.5:  # Intervention needed
             final_action = combined_action.clone()

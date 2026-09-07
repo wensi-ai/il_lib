@@ -45,7 +45,7 @@ class _SimpleResidualMLP(nn.Module):
         activation: str = "gelu",
         dropout: float = 0.0,
         use_tanh_output: bool = False,
-        output_scale: float = 1.0,
+        output_scale: Any = 1.0,
         last_layer_init_scale: Optional[float] = None,
     ):
         super().__init__()
@@ -69,7 +69,15 @@ class _SimpleResidualMLP(nn.Module):
         self.output_layer = nn.Linear(hidden_dim, output_dim)
         self.dropout = dropout
         self.use_tanh_output = use_tanh_output
-        self.output_scale = float(output_scale)
+        if isinstance(output_scale, (list, tuple)):
+            if len(output_scale) != output_dim:
+                raise ValueError(
+                    f"Per-dimension output_scale has length {len(output_scale)}, "
+                    f"expected {output_dim}."
+                )
+            self.output_scale = tuple(float(scale) for scale in output_scale)
+        else:
+            self.output_scale = float(output_scale)
 
         if last_layer_init_scale is not None:
             nn.init.normal_(self.output_layer.weight, mean=0.0, std=float(last_layer_init_scale))
@@ -85,7 +93,12 @@ class _SimpleResidualMLP(nn.Module):
             h = F.dropout(h, p=self.dropout, training=self.training)
         out = self.output_layer(h)
         if self.use_tanh_output:
-            out = torch.tanh(out) * self.output_scale
+            output_scale = torch.as_tensor(
+                self.output_scale,
+                device=out.device,
+                dtype=out.dtype,
+            )
+            out = torch.tanh(out) * output_scale
         return out
 
 
@@ -113,6 +126,8 @@ class SimpleResidualPolicy(BasePolicy):
         dropout: float = 0.0,
         learn_gripper_action: bool = True,
         include_robot_gripper_action_input: bool = True,
+        gripper_action_mode: str = "absolute",
+        gripper_action_scale: float = 1.0,
         use_intervention_head: bool = True,
         intervention_head_hidden_dim: int = 128,
         intervention_head_hidden_depth: int = 1,
@@ -158,6 +173,24 @@ class SimpleResidualPolicy(BasePolicy):
 
         self.action_dim = action_dim
         self.action_prediction_horizon = action_prediction_horizon
+        self._learn_gripper_action = learn_gripper_action
+        self._include_robot_gripper_action_input = include_robot_gripper_action_input
+        self._gripper_action_mode = gripper_action_mode.lower()
+        if self._gripper_action_mode not in {"absolute", "delta"}:
+            raise ValueError("gripper_action_mode must be one of {absolute, delta}.")
+
+        gripper_action_mask = torch.zeros(action_dim, dtype=torch.bool)
+        for joint_key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
+            if "gripper" in joint_key:
+                gripper_action_mask[indices] = True
+        self._gripper_action_indices = torch.where(gripper_action_mask)[0].tolist()
+
+        output_scale = torch.full(
+            (action_prediction_horizon, action_dim),
+            float(action_scale),
+        )
+        if self._learn_gripper_action and self._gripper_action_indices:
+            output_scale[:, self._gripper_action_indices] = float(gripper_action_scale)
         self.action_net = _SimpleResidualMLP(
             input_dim=feature_fusion_output_dim,
             output_dim=action_dim * action_prediction_horizon,
@@ -166,7 +199,7 @@ class SimpleResidualPolicy(BasePolicy):
             activation=action_net_activation,
             dropout=dropout,
             use_tanh_output=action_net_use_tanh_output,
-            output_scale=action_scale,
+            output_scale=output_scale.reshape(-1).tolist(),
             last_layer_init_scale=actor_last_layer_init_scale,
         )
 
@@ -186,8 +219,6 @@ class SimpleResidualPolicy(BasePolicy):
 
         self._deterministic_inference = deterministic_inference
         self._intervention_loss_weight = intervention_loss_weight
-        self._learn_gripper_action = learn_gripper_action
-        self._include_robot_gripper_action_input = include_robot_gripper_action_input
         self._supervise_zero_residual_off_intervention = (
             supervise_zero_residual_off_intervention
         )
@@ -202,14 +233,12 @@ class SimpleResidualPolicy(BasePolicy):
                 "not predict_direct_action=True."
             )
         self._residual_target_normalization_eps = residual_target_normalization_eps
-        if self._residual_target_normalization not in {"none", "min_max"}:
+        if self._residual_target_normalization not in {"none", "min_max", "transic"}:
             raise ValueError(
-                "SimpleResidualPolicy supports residual_target_normalization in {none, min_max}."
+                "SimpleResidualPolicy supports residual_target_normalization in "
+                "{none, min_max, transic}."
             )
-        residual_target_mask = torch.ones(action_dim, dtype=torch.bool)
-        for joint_key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
-            if "gripper" in joint_key:
-                residual_target_mask[indices] = False
+        residual_target_mask = ~gripper_action_mask
         self.register_buffer("_residual_target_normalization_min", torch.zeros(action_dim))
         self.register_buffer("_residual_target_normalization_max", torch.ones(action_dim))
         self.register_buffer("_residual_target_normalization_mask", residual_target_mask)
@@ -400,6 +429,39 @@ class SimpleResidualPolicy(BasePolicy):
     def policy_evaluation_step(self, batch, batch_idx):
         return self._residual_forward_step(batch, batch_idx, is_train=False)
 
+    def _build_action_target(
+        self,
+        robot_policy_action: torch.Tensor,
+        oracle_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build mixed continuous-residual / binary-gripper action targets."""
+        gripper_indices = self._gripper_action_indices
+        robot_policy_gripper_action = torch.where(
+            robot_policy_action[..., gripper_indices] >= 0,
+            1.0,
+            -1.0,
+        )
+        oracle_gripper_action = torch.where(
+            oracle_action[..., gripper_indices] >= 0,
+            1.0,
+            -1.0,
+        )
+
+        if self._predict_direct_action:
+            target_action = oracle_action.clone()
+            if self._learn_gripper_action:
+                target_action[..., gripper_indices] = oracle_gripper_action
+        else:
+            target_action = oracle_action - robot_policy_action
+            if self._learn_gripper_action:
+                if self._gripper_action_mode == "absolute":
+                    target_action[..., gripper_indices] = oracle_gripper_action
+                else:
+                    target_action[..., gripper_indices] = (
+                        oracle_gripper_action - robot_policy_gripper_action
+                    )
+        return target_action, robot_policy_gripper_action, oracle_gripper_action
+
     def _residual_forward_step(self, batch, batch_idx, is_train: bool):
         batch = self.process_data(batch, extract_action=True)
 
@@ -408,34 +470,10 @@ class SimpleResidualPolicy(BasePolicy):
 
         robot_policy_action = batch["base_action"]
         oracle_action = batch["oracle_action"]
-        robot_policy_action, robot_policy_gripper_action = (
-            robot_policy_action[..., :-1],
-            robot_policy_action[..., -1:],
+        gripper_indices = self._gripper_action_indices
+        target_action, robot_policy_gripper_action, oracle_gripper_action = (
+            self._build_action_target(robot_policy_action, oracle_action)
         )
-        oracle_action, oracle_gripper_action = (
-            oracle_action[..., :-1],
-            oracle_action[..., -1:],
-        )
-
-        if self._predict_direct_action:
-            oracle_gripper_action = torch.where(oracle_gripper_action >= 0, 1, -1)
-            target_action = (
-                torch.cat([oracle_action, oracle_gripper_action], dim=-1)
-                if self._learn_gripper_action
-                else oracle_action
-            )
-        else:
-            robot_policy_gripper_action = torch.where(
-                robot_policy_gripper_action >= 0, 1, 0
-            )
-            oracle_gripper_action = torch.where(oracle_gripper_action >= 0, 1, 0)
-            residual_q = oracle_action - robot_policy_action
-            residual_gripper = oracle_gripper_action - robot_policy_gripper_action
-
-            if self._learn_gripper_action:
-                target_action = torch.cat([residual_q, residual_gripper], dim=-1)
-            else:
-                target_action = residual_q
 
         if self._include_robot_gripper_action_input:
             batch["robot_policy_gripper_action"] = robot_policy_gripper_action
@@ -453,6 +491,12 @@ class SimpleResidualPolicy(BasePolicy):
 
         if self._supervise_zero_residual_off_intervention and not self._predict_direct_action:
             target_action = target_action * intervention_mask.unsqueeze(-1).to(target_action.dtype)
+            if self._learn_gripper_action and self._gripper_action_mode == "absolute":
+                target_action[..., gripper_indices] = torch.where(
+                    intervention_mask.unsqueeze(-1),
+                    oracle_gripper_action,
+                    robot_policy_gripper_action,
+                )
 
         zero_target_action = torch.zeros_like(target_action)
         if target_action.dim() == 4:
@@ -494,6 +538,17 @@ class SimpleResidualPolicy(BasePolicy):
             zero_mask = off_intervention_mask.unsqueeze(-1).expand_as(pred_action).to(
                 pred_action.dtype
             )
+            if self._learn_gripper_action and self._gripper_action_mode == "absolute":
+                zero_mask = zero_mask.clone()
+                if self.action_prediction_horizon > 1:
+                    gripper_flat_indices = [
+                        step * self.action_dim + index
+                        for step in range(self.action_prediction_horizon)
+                        for index in gripper_indices
+                    ]
+                    zero_mask[..., gripper_flat_indices] = 0
+                else:
+                    zero_mask[..., gripper_indices] = 0
             zero_loss_denom = zero_mask.sum().clamp_min(1.0)
             zero_residual_loss = (
                 F.mse_loss(pred_action, zero_target_action, reduction="none") * zero_mask
@@ -564,7 +619,7 @@ class SimpleResidualPolicy(BasePolicy):
         return super().load_state_dict(state_dict, strict=strict)
 
     def _uses_residual_target_normalization(self) -> bool:
-        return self._residual_target_normalization == "min_max"
+        return self._residual_target_normalization != "none"
 
     def _reshape_action_for_residual_target_normalization(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Size]:
         original_shape = action.shape
@@ -599,16 +654,29 @@ class SimpleResidualPolicy(BasePolicy):
     ) -> torch.Tensor:
         if not self._uses_residual_target_normalization():
             return action
-        if not bool(self._residual_target_normalization_ready.item()):
-            raise RuntimeError(
-                "Residual target normalization is enabled but stats are not initialized."
-            )
-
         reshaped_action, original_shape = self._reshape_action_for_residual_target_normalization(action)
         normalized_action = reshaped_action.clone()
         mask = self._residual_target_normalization_mask.to(device=action.device)
         if not bool(mask.any().item()):
             return normalized_action.reshape(original_shape)
+
+        if self._residual_target_normalization == "transic":
+            # Each normalized joint command is in [-1, 1], so the largest
+            # physically meaningful oracle-minus-base delta is in [-2, 2].
+            # TRANSIC trains on this theoretical residual range, then clamps
+            # the composed command to physical joint limits at deployment.
+            if inverse:
+                normalized_action[..., mask] = normalized_action[..., mask] * 2.0
+            else:
+                normalized_action[..., mask] = (
+                    normalized_action[..., mask].clamp(-2.0, 2.0) / 2.0
+                )
+            return normalized_action.reshape(original_shape)
+
+        if not bool(self._residual_target_normalization_ready.item()):
+            raise RuntimeError(
+                "Residual target normalization is enabled but stats are not initialized."
+            )
 
         min_vals = self._residual_target_normalization_min.to(
             device=action.device,
@@ -644,7 +712,7 @@ class SimpleResidualPolicy(BasePolicy):
         return normalized_action.reshape(original_shape)
 
     def _maybe_initialize_residual_target_normalization(self) -> None:
-        if not self._uses_residual_target_normalization():
+        if self._residual_target_normalization != "min_max":
             return
         if bool(self._residual_target_normalization_ready.item()):
             return
