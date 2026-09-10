@@ -59,6 +59,12 @@ class PolicyStateWebsocketPolicyServer(WebsocketPolicyServer):
                 prev_total_time = time.monotonic() - start_time
 
             except websockets.ConnectionClosed:
+                if websocket.close_code is None:
+                    # An upstream base-policy disconnect must not look like a
+                    # clean shutdown to the simulator client.
+                    error = traceback.format_exc()
+                    print(error, file=sys.stderr, flush=True)
+                    await websocket.send(error)
                 break
             except Exception:
                 error = traceback.format_exc()
