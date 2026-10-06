@@ -1,13 +1,25 @@
+import atexit
 import logging
 import os
+import sys
+from pathlib import Path
+from time import perf_counter
+
+import h5py
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from abc import ABC, abstractmethod
 from collections import deque
+from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
+from hydra.core.global_hydra import GlobalHydra
+from hydra.core.hydra_config import HydraConfig
 from il_lib.utils.array_tensor_utils import any_concat
 from il_lib.utils.convert_utils import any_to_torch
+from il_lib.utils.config_utils import register_omegaconf_resolvers
+from il_lib.utils.training_utils import load_state_dict, load_torch
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from omnigibson.learning.utils.eval_utils import (
     ACTION_QPOS_INDICES,
@@ -31,6 +43,191 @@ from typing import Any, Dict, List, Optional
 
 
 logger = logging.getLogger("BasePolicy")
+
+
+def _to_numpy_tree(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().numpy()
+    if isinstance(value, dict):
+        return {k: _to_numpy_tree(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_numpy_tree(v) for v in value]
+    return value
+
+
+def _rgb_to_openpi_array(value) -> np.ndarray:
+    image = _to_numpy_tree(value)
+    image = np.asarray(image)
+
+    if image.ndim >= 3 and image.shape[-1] not in (3, 4) and image.shape[-3] in (3, 4):
+        image = np.moveaxis(image, -3, -1)
+
+    # Drop singleton history/time axes while preserving HWC or BHWC image layout.
+    while image.ndim > 4:
+        squeezed = False
+        for axis in range(image.ndim - 3):
+            if image.shape[axis] == 1:
+                image = np.squeeze(image, axis=axis)
+                squeezed = True
+                break
+        if not squeezed:
+            image = image.reshape((-1, *image.shape[-3:]))
+            break
+
+    if image.ndim == 4 and image.shape[0] == 1:
+        image = image[0]
+
+    if image.dtype != np.uint8:
+        image = image.astype(np.float32, copy=False)
+        if image.size:
+            image_min = float(np.nanmin(image))
+            image_max = float(np.nanmax(image))
+            if image_min >= 0.0 and image_max <= 1.0:
+                image = image * 255.0
+            elif image_min >= -1.0 and image_max <= 1.0:
+                image = (image + 1.0) * 127.5
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    return image
+
+
+def _to_base_policy_obs(value):
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            if isinstance(key, str) and key.endswith("::rgb"):
+                result[key] = _rgb_to_openpi_array(item)
+            else:
+                result[key] = _to_base_policy_obs(item)
+        return result
+    return _to_numpy_tree(value)
+
+
+def _coerce_action_chunk(value: Any) -> torch.Tensor:
+    if isinstance(value, dict):
+        if "actions" in value:
+            value = value["actions"]
+        elif "action" in value:
+            value = value["action"]
+        else:
+            raise KeyError(
+                "Websocket base policy response must include 'actions' or 'action'. "
+                f"Got keys: {sorted(value)}"
+            )
+    action = torch.as_tensor(value, dtype=torch.float32)
+    if action.dim() == 1:
+        action = action.unsqueeze(0)
+    elif action.dim() > 2:
+        action = action.reshape(-1, action.shape[-1])
+    return action
+
+
+class WebsocketBasePolicyAdapter:
+    """Adapts an openpi-style websocket policy to the local base-policy act API."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        api_key: Optional[str] = None,
+    ) -> None:
+        self.num_latest_obs = 1
+        self._uses_openpi_client = True
+        try:
+            from openpi_client import websocket_client_policy
+        except ModuleNotFoundError:
+            workspace_root = Path(__file__).resolve().parents[3]
+            openpi_client_src = workspace_root / "openpi" / "packages" / "openpi-client" / "src"
+            if openpi_client_src.exists() and str(openpi_client_src) not in sys.path:
+                sys.path.insert(0, str(openpi_client_src))
+            try:
+                from openpi_client import websocket_client_policy
+            except ModuleNotFoundError:
+                # Local il_lib servers speak OmniGibson's msgpack websocket
+                # protocol, so they do not require the optional OpenPI client.
+                from omnigibson.learning.utils.network_utils import WebsocketClientPolicy
+
+                self._uses_openpi_client = False
+                self._client = WebsocketClientPolicy(
+                    host=host,
+                    port=port,
+                    api_key=api_key,
+                    allow_reconnect=True,
+                )
+
+        if self._uses_openpi_client:
+            self._client = websocket_client_policy.WebsocketClientPolicy(
+                host=host,
+                port=port,
+                api_key=api_key,
+            )
+        self._last_response = None
+
+    def act(self, obs: dict) -> torch.Tensor:
+        base_obs = _to_base_policy_obs(obs)
+        if self._uses_openpi_client:
+            self._last_response = self._client.infer(base_obs)
+        else:
+            self._last_response = self._client.act(base_obs)
+        return _coerce_action_chunk(self._last_response)
+
+    def get_last_response(self) -> Optional[dict]:
+        return self._last_response
+
+    def reset(self) -> None:
+        if not self._uses_openpi_client:
+            self._client.reset()
+            self._last_response = None
+            return
+        ws = getattr(self._client, "_ws", None)
+        packer = getattr(self._client, "_packer", None)
+        if ws is not None and packer is not None:
+            ws.send(packer.pack({"reset": True}))
+        else:
+            self._client.reset()
+        self._last_response = None
+
+
+def _collect_base_policy_overrides() -> List[str]:
+    """
+    Recover top-level CLI overrides that should also apply to the nested base policy config.
+    """
+    if GlobalHydra.instance().is_initialized():
+        try:
+            hydra_cfg = HydraConfig.get()
+            return [
+                override
+                for override in hydra_cfg.overrides.task
+                if not override.startswith(("arch=", "+arch=", "++arch="))
+            ]
+        except Exception:
+            pass
+
+    passthrough_overrides = []
+    excluded_prefixes = (
+        "arch=",
+        "+arch=",
+        "++arch=",
+        "ckpt_path=",
+        "+ckpt_path=",
+        "++ckpt_path=",
+        "module.",
+        "+module.",
+        "++module.",
+        "resume.",
+        "+resume.",
+        "++resume.",
+        "hydra.",
+        "+hydra.",
+        "++hydra.",
+    )
+    for override in sys.argv[1:]:
+        if override.startswith("-"):
+            continue
+        if override.startswith(excluded_prefixes):
+            continue
+        passthrough_overrides.append(override)
+    return passthrough_overrides
 
 
 class BasePolicy(LightningModule, ABC):
@@ -269,12 +466,7 @@ class PolicyWrapper:
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
         obs = any_to_torch(obs, device="cpu")
         obs = self.process_obs(obs=obs)
-        if len(self._obs_history) == 0:
-            for _ in range(self.obs_window_size):
-                self._obs_history.append(obs)
-        else:
-            self._obs_history.append(obs)
-        obs = any_concat(self._obs_history, dim=1)
+        obs = self._stack_obs_history(obs)
 
         need_inference = self._action_idx % self.deployed_action_steps == 0
         if need_inference:
@@ -290,6 +482,15 @@ class PolicyWrapper:
         self._obs_history = deque(maxlen=self.obs_window_size)
         self._action_traj_pred = None
         self._action_idx = 0
+
+    def _stack_obs_history(self, obs: dict, history: Optional[deque] = None) -> torch.Tensor:
+        history = self._obs_history if history is None else history
+        if len(history) == 0:
+            for _ in range(history.maxlen):
+                history.append(obs)
+        else:
+            history.append(obs)
+        return any_concat(history, dim=1)
 
     def process_obs(self, obs: dict) -> dict:
         # Expand twice to get B and T_A dimensions
@@ -421,172 +622,563 @@ class PolicyWrapper:
 
 class ResidualPolicyWrapper(PolicyWrapper):
     """
-    A specialized wrapper for ResidualPolicy that manages both base policy and residual policy
-    with different action execution frequencies.
-    
-    Base policy: Predicts action chunks (e.g., 16 actions every 16 steps)
-    Residual policy: Predicts per-step corrections (1 correction every step)
+    Wrapper that composes a frozen base policy with a residual correction policy.
+
+    The base policy predicts an action chunk and is queried again every
+    `base_policy_execution_horizon` steps (defaults to `base_deployed_action_steps`).
+    The residual policy is re-inferred whenever the base chunk is refreshed (and
+    every `residual_deployed_action_steps` steps otherwise), predicting one
+    correction per executed base step, so residual step k is added to base
+    chunk step k.
+
+    The base policy is either instantiated locally from `base_policy` +
+    `base_policy_ckpt_path`, or queried over websocket when
+    `base_policy_use_websocket` is set (or no checkpoint path is given), which
+    also covers OpenPI servers such as a pi 0.5 base.
     """
 
     def __init__(
         self,
         *args,
         base_deployed_action_steps: int,  # Base policy's action chunk size
-        residual_deployed_action_steps: int = 1,  # Residual policy's action step (usually 1)
-        action_history_len: int = 1,
-        gate_threshold: float = 0.5,
-        residual_scale: float = 1.0,
+        base_policy: str,
+        base_policy_ckpt_path: Optional[str] = None,
+        base_policy_overrides: Optional[List[str]] = None,
+        base_policy_use_websocket: bool = False,
+        base_policy_host: str = "127.0.0.1",
+        base_policy_port: Optional[int] = None,
+        base_policy_api_key: Optional[str] = None,
+        base_policy_execution_horizon: Optional[int] = None,
+        residual_deployed_action_steps: int = 1,  # Residual chunk length actually executed
+        base_policy_only: bool = False,
+        clamp_combined_arm_action: bool = False,
+        trace_hdf5_path: Optional[str] = None,
+        trace_overwrite: bool = False,
         **kwargs,
     ) -> None:
-        # Remove deployed_action_steps from kwargs if present to avoid duplicate
-        kwargs.pop("deployed_action_steps", None)
+        compat_deployed_action_steps = kwargs.pop("deployed_action_steps", None)
+        if compat_deployed_action_steps is not None:
+            residual_deployed_action_steps = compat_deployed_action_steps
+
         # Initialize parent with residual policy's deployment frequency
         super().__init__(*args, deployed_action_steps=residual_deployed_action_steps, **kwargs)
-        self._action_history_len = action_history_len
-        self._base_action_history = deque(maxlen=action_history_len)
-        self._gate_threshold = gate_threshold
-        self._residual_scale = residual_scale
-        self._oracle_blend_alpha = kwargs.pop("oracle_blend_alpha", 1.0)
-        
+
         # Base policy specific attributes
         self.base_deployed_action_steps = base_deployed_action_steps
+        self.base_policy_execution_horizon = (
+            base_deployed_action_steps
+            if base_policy_execution_horizon is None
+            else int(base_policy_execution_horizon)
+        )
+        if self.base_policy_execution_horizon < 1:
+            raise ValueError("base_policy_execution_horizon must be >= 1.")
         self._base_action_buffer = None  # Will store (T_A, A) from base policy
         self._base_action_idx = 0
-        self.base_policy = None  # Will be set to the base policy from residual_policy.base_policy
-        self._base_obs_history = None  # Separate obs history for base policy
-        self._base_obs_window_size = None
-        # Per-step stats tracking for eval reporting
-        self._stats = {
-            "interventions": 0,
-            "total_steps": 0,
-            "residual_mags": [],
-            "gate_decisions": [],       # 1=intervened, 0=passthrough
-            "residual_norms": [],       # L2 norm of residual per step
-            "base_action_norms": [],    # L2 norm of base action per step
+        self._residual_action_buffer = None
+        self._residual_intervention_buffer = None
+        self._residual_action_idx = 0
+        self._base_action_dim = None
+        self._intervention_steps_remaining = 0
+        self.base_policy = None  # Created lazily on first act()
+        self._base_obs_history = None  # Created lazily once the base policy is attached
+        self._base_policy_name = base_policy
+        self._base_policy_ckpt_path = base_policy_ckpt_path
+        self._base_policy_overrides = base_policy_overrides
+        self._base_policy_use_websocket = base_policy_use_websocket or base_policy_ckpt_path is None
+        self._base_policy_host = base_policy_host
+        self._base_policy_port = base_policy_port
+        self._base_policy_api_key = base_policy_api_key
+        self._base_policy_device = None
+        self._base_policy_only = bool(base_policy_only)
+        self._clamp_combined_arm_action = bool(clamp_combined_arm_action)
+        self._current_state = None
+
+        self._trace_hdf5_path = (
+            Path(trace_hdf5_path).expanduser().resolve()
+            if trace_hdf5_path is not None
+            else None
+        )
+        self._trace_overwrite = trace_overwrite
+        self._trace_file = None
+        self._trace_demo_idx = 0
+        self._trace_step_idx = 0
+        self._trace_episode_start_time = None
+        self._trace_steps: List[Dict[str, torch.Tensor]] = []
+        self._trace_closed = False
+        if self._trace_hdf5_path is not None:
+            self._init_trace_writer()
+            atexit.register(self.close)
+
+    def _clone_state_tensor(self, value: torch.Tensor) -> torch.Tensor:
+        return value.detach().to("cpu", copy=True)
+
+    def _action_l2(self, action: torch.Tensor) -> float:
+        return float(torch.linalg.vector_norm(action.detach().reshape(-1)).cpu())
+
+    def _chunk_intervention_min_steps(self) -> int:
+        policy_min_steps = int(getattr(self.policy, "intervention_min_duration_steps", 1))
+        buffer_steps = 1
+        if self._residual_action_buffer is not None:
+            buffer_steps = int(self._residual_action_buffer.shape[0])
+        return max(1, policy_min_steps, int(self.deployed_action_steps), buffer_steps)
+
+    def _set_current_state(
+        self,
+        *,
+        base_action: torch.Tensor,
+        predicted_action: torch.Tensor,
+        applied_action: torch.Tensor,
+        intervention: torch.Tensor,
+        residual_action: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Expose per-step policy state (served to clients that record correction data)."""
+        intervention_flag = torch.as_tensor(
+            float(intervention.detach().reshape(-1)[0] >= 0.5),
+            device=applied_action.device,
+            dtype=applied_action.dtype,
+        )
+        state = {
+            "base_action": self._clone_state_tensor(base_action),
+            "raw_base_policy_action": self._clone_state_tensor(base_action),
+            "base_policy_action": self._clone_state_tensor(base_action),
+            "base_policy_action_chunk": self._clone_state_tensor(self._base_action_buffer),
+            "predicted_action": self._clone_state_tensor(predicted_action),
+            "applied_action": self._clone_state_tensor(applied_action),
+            "oracle_action": self._clone_state_tensor(applied_action),
+            "intervention": self._clone_state_tensor(intervention.reshape(1)),
+            "is_oracle_active": self._clone_state_tensor(intervention_flag.reshape(())),
+            "int_state": self._clone_state_tensor(
+                torch.where(
+                    intervention_flag >= 0.5,
+                    torch.as_tensor(2.0, device=applied_action.device, dtype=applied_action.dtype),
+                    torch.as_tensor(1.0, device=applied_action.device, dtype=applied_action.dtype),
+                ).reshape(())
+            ),
         }
-        # Per-step action vectors for detailed analysis
-        self._episode_traces = []   # list of per-episode dicts
-        self._current_episode = None
-    
+        if residual_action is not None:
+            state["residual_action"] = self._clone_state_tensor(residual_action)
+        self._current_state = state
+
+    def get_current_state(self) -> Optional[Dict[str, torch.Tensor]]:
+        return self._current_state
+
+    # ----- Trace logging ---------------------------------------------------------
+
+    def _init_trace_writer(self) -> None:
+        assert self._trace_hdf5_path is not None
+        self._trace_hdf5_path.parent.mkdir(parents=True, exist_ok=True)
+        file_mode = "w" if self._trace_overwrite else "a"
+        self._trace_file = h5py.File(self._trace_hdf5_path, file_mode)
+        if "data" not in self._trace_file:
+            self._trace_file.create_group("data")
+        existing_demo_ids = []
+        for key in self._trace_file["data"].keys():
+            if key.startswith("demo_"):
+                try:
+                    existing_demo_ids.append(int(key.split("_")[-1]))
+                except ValueError:
+                    continue
+        self._trace_demo_idx = max(existing_demo_ids, default=-1) + 1
+        logger.info("Residual trace logging enabled: %s", self._trace_hdf5_path)
+
+    def _to_trace_tensor(self, value: torch.Tensor) -> torch.Tensor:
+        return value.detach().to("cpu", copy=True).reshape(-1).to(torch.float32)
+
+    def _record_trace_step(
+        self,
+        *,
+        base_action: torch.Tensor,
+        residual_action: torch.Tensor,
+        combined_action: torch.Tensor,
+        applied_action: torch.Tensor,
+        intervention: torch.Tensor,
+    ) -> None:
+        if self._trace_hdf5_path is None:
+            return
+        if self._trace_episode_start_time is None:
+            self._trace_episode_start_time = perf_counter()
+            self._trace_step_idx = 0
+
+        self._trace_steps.append(
+            {
+                "base_action": self._to_trace_tensor(base_action),
+                "residual_action": self._to_trace_tensor(residual_action),
+                "combined_action": self._to_trace_tensor(combined_action),
+                "applied_action": self._to_trace_tensor(applied_action),
+                # Alias so the correction visualizer can render residual traces
+                # without a new dataset schema.
+                "oracle_action": self._to_trace_tensor(combined_action),
+                "intervention": self._to_trace_tensor(intervention),
+                "is_oracle_active": self._to_trace_tensor(intervention >= 0.5),
+                "int_state": self._to_trace_tensor(
+                    torch.where(intervention >= 0.5, 2.0, 1.0)
+                ),
+                "timestamp_ms": torch.tensor(
+                    [1000.0 * (perf_counter() - self._trace_episode_start_time)],
+                    dtype=torch.float32,
+                ),
+            }
+        )
+        self._trace_step_idx += 1
+
+    def _flush_trace_demo(self) -> None:
+        if self._trace_file is None or not self._trace_steps:
+            self._trace_steps = []
+            self._trace_episode_start_time = None
+            self._trace_step_idx = 0
+            return
+
+        data_group = self._trace_file["data"]
+        demo_key = f"demo_{self._trace_demo_idx}"
+        if demo_key in data_group:
+            del data_group[demo_key]
+        demo_group = data_group.create_group(demo_key)
+        policy_group = demo_group.create_group("policy")
+        time_group = demo_group.create_group("time")
+
+        def _stack(name: str) -> torch.Tensor:
+            return torch.stack([step[name] for step in self._trace_steps], dim=0)
+
+        demo_group.create_dataset("action", data=_stack("applied_action").numpy())
+        for name in (
+            "base_action",
+            "residual_action",
+            "combined_action",
+            "applied_action",
+            "oracle_action",
+            "intervention",
+            "is_oracle_active",
+            "int_state",
+        ):
+            policy_group.create_dataset(name, data=_stack(name).numpy())
+        time_group.create_dataset("timestamp_ms", data=_stack("timestamp_ms").numpy())
+        demo_group.attrs["source"] = "ResidualPolicyWrapper"
+
+        self._trace_file.flush()
+        logger.info(
+            "Saved residual trace %s with %d steps to %s",
+            demo_key,
+            len(self._trace_steps),
+            self._trace_hdf5_path,
+        )
+        self._trace_demo_idx += 1
+        self._trace_steps = []
+        self._trace_episode_start_time = None
+        self._trace_step_idx = 0
+
+    def close(self) -> None:
+        if self._trace_closed:
+            return
+        self._trace_closed = True
+        try:
+            self._flush_trace_demo()
+        finally:
+            if self._trace_file is not None:
+                self._trace_file.close()
+                self._trace_file = None
+
+    # ----- Base policy -------------------------------------------------------------
+
+    def _compose_module_cfg(self, arch_name: str, extra_overrides: Optional[List[str]] = None):
+        overrides = [f"arch={arch_name}"]
+        overrides.extend(_collect_base_policy_overrides())
+        if extra_overrides is not None:
+            overrides.extend(extra_overrides)
+
+        if GlobalHydra.instance().is_initialized():
+            module_cfg = compose(config_name="base_config", overrides=overrides).module
+        else:
+            config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs")
+            config_dir = os.path.abspath(config_dir)
+            with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
+                module_cfg = compose(config_name="base_config", overrides=overrides).module
+
+        register_omegaconf_resolvers()
+        OmegaConf.resolve(module_cfg)
+        return module_cfg
+
+    def _instantiate_arch_module(
+        self,
+        *,
+        arch_name: str,
+        ckpt_path: str,
+        extra_overrides: Optional[List[str]] = None,
+    ):
+        if ckpt_path is None:
+            raise AssertionError(f"{arch_name} requires a checkpoint path for inference.")
+        module_cfg = self._compose_module_cfg(arch_name, extra_overrides=extra_overrides)
+        module = instantiate(module_cfg, _recursive_=False)
+        ckpt = load_torch(ckpt_path, map_location="cpu")
+        state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+        load_state_dict(module, state_dict, strict=True)
+        module = module.to(self.policy.device)
+        module.eval()
+        return module
+
+    def _get_base_policy(self):
+        if self.base_policy is None:
+            if self._base_policy_use_websocket:
+                if self._base_policy_port is None:
+                    raise ValueError(
+                        "base_policy_port must be provided when using a websocket base policy."
+                    )
+                self.base_policy = WebsocketBasePolicyAdapter(
+                    host=self._base_policy_host,
+                    port=int(self._base_policy_port),
+                    api_key=self._base_policy_api_key,
+                )
+                self._base_policy_device = torch.device("cpu")
+            else:
+                assert self._base_policy_ckpt_path is not None, (
+                    "base_policy_ckpt_path must be provided for local residual inference."
+                )
+                self.base_policy = self._instantiate_arch_module(
+                    arch_name=self._base_policy_name,
+                    ckpt_path=self._base_policy_ckpt_path,
+                    extra_overrides=self._base_policy_overrides,
+                )
+                self._base_policy_device = self.policy.device
+        return self.base_policy
+
+    def _get_base_obs_history(self) -> deque:
+        base_policy = self._get_base_policy()
+        if self._base_obs_history is None:
+            base_obs_window_size = getattr(base_policy, "num_latest_obs", self.obs_window_size)
+            self._base_obs_history = deque(maxlen=base_obs_window_size)
+        return self._base_obs_history
+
+    def _refresh_base_action_buffer(self, *, raw_obs: dict, obs: dict) -> None:
+        base_policy = self._get_base_policy()
+        if self._base_policy_use_websocket:
+            self._base_action_buffer = self._infer_websocket_base_action_buffer(
+                base_policy=base_policy,
+                raw_obs=raw_obs,
+            )
+        else:
+            base_obs = {"obs": self._stack_obs_history(obs, history=self._get_base_obs_history())}
+            self._base_action_buffer = base_policy.act(base_obs).squeeze(0)
+        self._base_action_buffer = _coerce_action_chunk(self._base_action_buffer)
+        self._base_action_dim = int(self._base_action_buffer.shape[-1])
+        self._base_action_idx = 0
+
+    def _get_base_action_condition_horizon(self) -> int:
+        """Number of base steps the residual conditions on (its chunk length)."""
+        return max(
+            1,
+            int(
+                getattr(
+                    self.policy,
+                    "base_action_horizon",
+                    getattr(self.policy, "action_prediction_horizon", 1),
+                )
+            ),
+        )
+
+    def _infer_websocket_base_action_buffer(self, *, base_policy, raw_obs: dict) -> torch.Tensor:
+        # A websocket base may return fewer steps per request than the residual
+        # conditions on; keep requesting until the buffer covers the horizon.
+        target_steps = self._get_base_action_condition_horizon()
+        chunks = []
+        collected_steps = 0
+        while collected_steps < target_steps:
+            chunk = _coerce_action_chunk(base_policy.act(raw_obs))
+            if chunk.shape[0] == 0:
+                raise ValueError("Websocket base policy returned an empty action chunk.")
+            chunks.append(chunk)
+            collected_steps += int(chunk.shape[0])
+        return torch.cat(chunks, dim=0)
+
+    def _needs_base_inference(self) -> bool:
+        return (
+            self._base_action_buffer is None
+            or self._base_action_idx >= self._base_action_buffer.shape[0]
+            or self._base_action_idx % self.base_policy_execution_horizon == 0
+        )
+
+    # ----- Composition -------------------------------------------------------------
+
+    def _combine_normalized_actions(
+        self,
+        base_action: torch.Tensor,
+        policy_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Add continuous residuals to the base action; the gripper may be an absolute command."""
+        combined_action = base_action + policy_action
+        if getattr(self.policy, "_gripper_action_mode", "delta") == "absolute":
+            for action_key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
+                if "gripper" in action_key:
+                    combined_action[..., indices] = policy_action[..., indices]
+        if self._clamp_combined_arm_action:
+            for action_key, indices in ACTION_QPOS_INDICES[self.robot_type].items():
+                if "gripper" not in action_key:
+                    combined_action[..., indices] = combined_action[..., indices].clamp(
+                        -1.0, 1.0
+                    )
+        return combined_action, policy_action
+
     def act(self, obs: dict, *args, **kwargs) -> torch.Tensor:
         """
-        Coordinated action generation:
-        1. Get base action from buffer (refresh every base_deployed_action_steps)
-        2. Get residual correction from residual policy (every step)
+        1. Get the base action from the buffer (refreshed every base_policy_execution_horizon steps)
+        2. Get the residual correction chunk (re-inferred when the base chunk is refreshed)
         3. Combine: final_action = base_action + residual_correction
         """
-        obs = any_to_torch(obs, device="cpu")
-        obs = self.process_obs(obs=obs)
-        
-        # Maintain observation history
-        if len(self._obs_history) == 0:
-            for _ in range(self.obs_window_size):
-                self._obs_history.append(obs)
-        else:
-            self._obs_history.append(obs)
-        obs_stacked = any_concat(self._obs_history, dim=1)  # (B=1, T_obs, ...)
+        raw_obs = any_to_torch(obs, device="cpu")
+        obs = self.process_obs(obs=raw_obs)
+        residual_obs = {"obs": self._stack_obs_history(obs)}
 
         # ===== Base Policy: Action Chunking =====
-        if self.base_policy is None and hasattr(self.policy, 'base_policy'):
-            self.base_policy = self.policy.base_policy
-        if self.base_policy is None:
-            raise ValueError("base_policy not found in residual policy!")
+        base_refreshed = self._needs_base_inference()
+        if base_refreshed:
+            self._refresh_base_action_buffer(raw_obs=raw_obs, obs=obs)
+        elif self._base_obs_history is not None:
+            self._stack_obs_history(obs, history=self._base_obs_history)
 
-        # Maintain separate obs history for base policy (may need different window)
-        if self._base_obs_history is None:
-            self._base_obs_window_size = getattr(self.base_policy, '_num_latest_obs', 2)
-            if hasattr(self.base_policy, 'num_latest_obs'):
-                self._base_obs_window_size = self.base_policy.num_latest_obs
-            self._base_obs_history = deque(maxlen=self._base_obs_window_size)
-        if len(self._base_obs_history) == 0:
-            for _ in range(self._base_obs_window_size):
-                self._base_obs_history.append(obs)
-        else:
-            self._base_obs_history.append(obs)
-
-        need_base_inference = self._base_action_idx % self.base_deployed_action_steps == 0
-        if need_base_inference:
-            base_obs_stacked = any_concat(self._base_obs_history, dim=1)
-            self._base_action_buffer = self.base_policy.act({"obs": base_obs_stacked}).squeeze(0)
-            self._base_action_idx = 0
-            if hasattr(self.base_policy, '_last_obs_embedding'):
-                self._base_obs_embedding = self.base_policy._last_obs_embedding
-        
-        # Get current base action from buffer (raw radians, denormalized by base policy)
-        base_action = self._base_action_buffer[self._base_action_idx]  # (A,)
+        # Current base action from the buffer (raw joint space)
+        base_action_idx = self._base_action_idx
+        base_action = self._base_action_buffer[base_action_idx]  # (A,)
         self._base_action_idx += 1
+        base_action = self._post_processing_fn(base_action)
 
-        # Normalize base action back to [-1, 1] so it matches the residual's training space
+        # Normalize the base action to [-1, 1] so it matches the residual's training space
         base_action_normalized = self._normalize_action(base_action.clone())
-
-        # Maintain action history for temporal context
-        self._base_action_history.append(base_action_normalized.clone())
-        while len(self._base_action_history) < self._action_history_len:
-            self._base_action_history.appendleft(self._base_action_history[0])
-
-        # ===== Residual Policy: Per-step Correction =====
-        if self._action_history_len > 1:
-            action_hist_flat = torch.cat(list(self._base_action_history), dim=-1)
-            obs_for_residual = {"obs": obs_stacked, "base_action": action_hist_flat.unsqueeze(0).unsqueeze(0)}
-        else:
-            obs_for_residual = {"obs": obs_stacked, "base_action": base_action_normalized.unsqueeze(0).unsqueeze(0)}
-        if hasattr(self, '_base_obs_embedding') and self._base_obs_embedding is not None:
-            obs_for_residual["base_embedding"] = self._base_obs_embedding
-
-        # Get residual correction (intervention decision + action correction)
-        result = self.policy.act(obs_for_residual)
-        if isinstance(result, tuple) and len(result) == 2:
-            residual_action = result[0].squeeze().cpu()
-            intervention = result[1].squeeze().cpu()
-        else:
-            residual_action = result.squeeze().cpu()
-            intervention = torch.tensor(1.0)
-
-        intervened = intervention >= self._gate_threshold
-        if intervened:
-            predict_oracle = getattr(self.policy, '_predict_oracle_action', False)
-            if predict_oracle:
-                # Use MLP arm prediction but keep base gripper
-                oracle_pred = residual_action.clone()
-                oracle_pred[..., -1] = base_action_normalized[..., -1]
-                # Blend: mix oracle prediction with base using oracle_blend_alpha
-                alpha = self._oracle_blend_alpha
-                blended = alpha * oracle_pred + (1 - alpha) * base_action_normalized
-                blended[..., -1] = base_action_normalized[..., -1]  # always keep base gripper
-                final_action = self._denormalize_action(blended)
+        residual_horizon = getattr(self.policy, "action_prediction_horizon", 1)
+        base_action_chunk = self._base_action_buffer[
+            base_action_idx : base_action_idx + residual_horizon
+        ]
+        if base_action_chunk.shape[0] < residual_horizon:
+            pad = base_action_chunk[-1:].repeat(residual_horizon - base_action_chunk.shape[0], 1)
+            base_action_chunk = torch.cat([base_action_chunk, pad], dim=0)
+        base_action_chunk = self._post_processing_fn(base_action_chunk)
+        base_action_chunk = self._normalize_action(base_action_chunk.clone())
+        if "base_action" in getattr(self.policy, "_features", set()):
+            if residual_horizon > 1:
+                residual_obs["obs"]["base_action"] = base_action_chunk.view(
+                    1, 1, residual_horizon, -1
+                )
             else:
-                scaled_residual = residual_action * self._residual_scale
-                combined_normalized = base_action_normalized + scaled_residual
-                final_action = self._denormalize_action(combined_normalized)
+                residual_obs["obs"]["base_action"] = base_action_normalized.view(1, 1, -1)
+
+        if self._base_policy_only:
+            residual_action = torch.zeros_like(base_action_normalized)
+            intervention = torch.zeros(1, device=base_action.device, dtype=base_action.dtype)
+            print(
+                "\033[1m\033[96m[ResidualPolicyWrapper]\033[0m "
+                "executing=\033[1m\033[94mBASE-ONLY\033[0m "
+                f"base_step={self._base_action_idx}/{self._base_action_buffer.shape[0]}",
+                flush=True,
+            )
+            self._record_trace_step(
+                base_action=base_action,
+                residual_action=residual_action,
+                combined_action=base_action,
+                applied_action=base_action,
+                intervention=intervention.reshape(1),
+            )
+            self._set_current_state(
+                base_action=base_action,
+                residual_action=residual_action,
+                predicted_action=base_action,
+                applied_action=base_action,
+                intervention=intervention.reshape(1),
+            )
+            return base_action.clone()
+
+        # ===== Residual Policy: Correction Chunk =====
+        need_residual_inference = (
+            base_refreshed
+            or self._residual_action_buffer is None
+            or self._residual_action_idx >= self._residual_action_buffer.shape[0]
+            or self._residual_action_idx % self.deployed_action_steps == 0
+        )
+        if need_residual_inference:
+            residual_action, intervention = self.policy.act(residual_obs["obs"])
+            residual_action = residual_action.squeeze(0)
+            if residual_action.dim() == 3:
+                residual_action = residual_action[-1]  # (T_A, A)
+            elif residual_action.dim() == 2:
+                residual_action = residual_action[-1:].clone()  # (1, A)
+            self._residual_action_buffer = residual_action
+
+            intervention = intervention.squeeze(0)
+            if intervention.dim() > 0:
+                intervention = intervention[-1]
+            self._residual_intervention_buffer = intervention.reshape(1).repeat(
+                self._residual_action_buffer.shape[0]
+            )
+            self._residual_action_idx = 0
+
+        residual_action = self._residual_action_buffer[self._residual_action_idx]
+        intervention = self._residual_intervention_buffer[self._residual_action_idx]
+        self._residual_action_idx += 1
+
+        # Once the residual decides to intervene, hold the decision for at least
+        # the executed chunk so the correction is not cut mid-chunk.
+        min_intervention_steps = self._chunk_intervention_min_steps()
+        if bool(float(intervention) >= 0.5):
+            self._intervention_steps_remaining = max(
+                self._intervention_steps_remaining,
+                min_intervention_steps,
+            )
+        if self._intervention_steps_remaining > 0:
+            intervention = intervention.new_ones(intervention.shape)
+            self._intervention_steps_remaining -= 1
+
+        # ===== Combine Actions =====
+        combined_normalized, residual_for_logging = self._combine_normalized_actions(
+            base_action_normalized,
+            residual_action,
+        )
+        combined_action = self._denormalize_action(combined_normalized.clone())
+        if intervention >= 0.5:
+            final_action = combined_action.clone()
+            source_label = "\033[1m\033[92mRESIDUAL\033[0m"
         else:
-            final_action = base_action
+            final_action = base_action.clone()
+            source_label = "\033[1m\033[94mBASE\033[0m"
 
-        # Track per-step stats
-        self._stats["total_steps"] += 1
-        if intervened:
-            self._stats["interventions"] += 1
-        self._stats["gate_decisions"].append(1 if intervened else 0)
-        self._stats["residual_mags"].append(float(residual_action.abs().mean()))
-        self._stats["residual_norms"].append(float(residual_action.norm()))
-        self._stats["base_action_norms"].append(float(base_action_normalized.norm()))
+        print(
+            "\033[1m\033[96m[ResidualPolicyWrapper]\033[0m "
+            f"executing={source_label} "
+            f"intervention={float(intervention):.3f} "
+            f"residual_l2={self._action_l2(residual_for_logging):.4f} "
+            f"chunk_step={self._residual_action_idx}/{self._residual_action_buffer.shape[0]} "
+            f"base_step={self._base_action_idx}/{self._base_action_buffer.shape[0]}",
+            flush=True,
+        )
 
-        # Log per-step action vectors
-        if self._current_episode is None:
-            self._current_episode = {"base": [], "residual": [], "final": [], "gate": []}
-        self._current_episode["base"].append(base_action.detach().cpu().numpy().tolist())
-        self._current_episode["residual"].append(residual_action.detach().cpu().numpy().tolist())
-        self._current_episode["final"].append(final_action.detach().cpu().numpy().tolist())
-        self._current_episode["gate"].append(1 if intervened else 0)
-
+        self._record_trace_step(
+            base_action=base_action,
+            residual_action=residual_for_logging,
+            combined_action=combined_action,
+            applied_action=final_action,
+            intervention=intervention.reshape(1),
+        )
+        self._set_current_state(
+            base_action=base_action,
+            residual_action=residual_for_logging,
+            predicted_action=combined_action,
+            applied_action=final_action,
+            intervention=intervention.reshape(1),
+        )
         return final_action
 
     def _normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         """Normalize action from raw joint space to [-1, 1]."""
         for k, v in ACTION_QPOS_INDICES[self.robot_type].items():
             if "gripper" not in k:
+                joint_min = torch.as_tensor(
+                    JOINT_RANGE[self.robot_type][k][0],
+                    device=action.device,
+                    dtype=action.dtype,
+                )
+                joint_max = torch.as_tensor(
+                    JOINT_RANGE[self.robot_type][k][1],
+                    device=action.device,
+                    dtype=action.dtype,
+                )
                 action[..., v] = (
-                    2 * (action[..., v] - JOINT_RANGE[self.robot_type][k][0])
-                    / (JOINT_RANGE[self.robot_type][k][1] - JOINT_RANGE[self.robot_type][k][0])
+                    2 * (action[..., v] - joint_min)
+                    / (joint_max - joint_min)
                     - 1.0
                 )
         return action
@@ -597,73 +1189,32 @@ class ResidualPolicyWrapper(PolicyWrapper):
             if "gripper" in k:
                 action[..., v] = torch.where(action[..., v] > 0, 1.0, -1.0)
             else:
+                joint_min = torch.as_tensor(
+                    JOINT_RANGE[self.robot_type][k][0],
+                    device=action.device,
+                    dtype=action.dtype,
+                )
+                joint_max = torch.as_tensor(
+                    JOINT_RANGE[self.robot_type][k][1],
+                    device=action.device,
+                    dtype=action.dtype,
+                )
                 action[..., v] = (action[..., v] + 1) / 2 * (
-                    JOINT_RANGE[self.robot_type][k][1] - JOINT_RANGE[self.robot_type][k][0]
-                ) + JOINT_RANGE[self.robot_type][k][0]
+                    joint_max - joint_min
+                ) + joint_min
         return action
 
-    def get_eval_stats(self):
-        """Return summary stats from inference run."""
-        import numpy as np
-        total = self._stats["total_steps"]
-        ints = self._stats["interventions"]
-        mags = np.array(self._stats["residual_mags"]) if self._stats["residual_mags"] else np.array([0.0])
-        norms = np.array(self._stats["residual_norms"]) if self._stats["residual_norms"] else np.array([0.0])
-        gates = np.array(self._stats["gate_decisions"]) if self._stats["gate_decisions"] else np.array([0])
-        base_norms = np.array(self._stats["base_action_norms"]) if self._stats["base_action_norms"] else np.array([0.0])
-
-        # Split residual stats by gate decision
-        intervened_mask = gates == 1
-        passthrough_mask = gates == 0
-
-        stats = {
-            "total_steps": total,
-            "intervention_steps": ints,
-            "passthrough_steps": total - ints,
-            "intervention_rate": float(ints / max(total, 1)),
-            # Residual magnitude (all steps)
-            "residual_mag_mean": float(mags.mean()),
-            "residual_mag_std": float(mags.std()),
-            "residual_mag_p50": float(np.median(mags)),
-            "residual_mag_p95": float(np.percentile(mags, 95)),
-            "residual_mag_max": float(mags.max()),
-            # Residual L2 norm
-            "residual_norm_mean": float(norms.mean()),
-            # Base action norm (for scale reference)
-            "base_action_norm_mean": float(base_norms.mean()),
-            # Residual as % of base action
-            "residual_pct_of_base": float(norms.mean() / max(base_norms.mean(), 1e-8) * 100),
-        }
-
-        # Stats split by gate decision
-        if intervened_mask.sum() > 0:
-            stats["residual_mag_when_intervened"] = float(mags[intervened_mask].mean())
-            stats["residual_norm_when_intervened"] = float(norms[intervened_mask].mean())
-        if passthrough_mask.sum() > 0:
-            stats["residual_mag_when_passthrough"] = float(mags[passthrough_mask].mean())
-            stats["residual_norm_when_passthrough"] = float(norms[passthrough_mask].mean())
-
-        return stats
-
     def reset(self) -> None:
-        """Reset both policies and their states"""
-        if self._current_episode is not None and len(self._current_episode.get("base", [])) > 0:
-            self._episode_traces.append(self._current_episode)
-        self._current_episode = None
-        self._base_action_history = deque(maxlen=self._action_history_len)
+        """Reset both policies and their buffers."""
+        self._flush_trace_demo()
         super().reset()
         self._base_action_buffer = None
         self._base_action_idx = 0
+        self._residual_action_buffer = None
+        self._residual_intervention_buffer = None
+        self._residual_action_idx = 0
+        self._intervention_steps_remaining = 0
+        self._current_state = None
         self._base_obs_history = None
         if self.base_policy is not None:
             self.base_policy.reset()
-
-    def save_traces(self, path: str):
-        """Save per-episode action traces to JSON for analysis."""
-        import json
-        if self._current_episode is not None and len(self._current_episode.get("base", [])) > 0:
-            self._episode_traces.append(self._current_episode)
-            self._current_episode = None
-        with open(path, "w") as f:
-            json.dump(self._episode_traces, f)
-        print(f"[ResidualPolicyWrapper] Saved {len(self._episode_traces)} episode traces to {path}")

@@ -1,19 +1,31 @@
 import os
-import sys
 import torch
-from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
-from hydra.core.global_hydra import GlobalHydra
-from hydra.core.hydra_config import HydraConfig
 from il_lib.nn.distributions import GMMHead, CategoricalNet
 from il_lib.policies.policy_base import BasePolicy
 from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.optim import CosineScheduleFunction
-from il_lib.utils.training_utils import freeze_params, load_state_dict, load_torch
-from il_lib.utils.config_utils import register_omegaconf_resolvers
+from il_lib.utils.training_utils import freeze_params, load_state_dict
 from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from typing import Any, Dict, List, Optional
+
+
+class _AlwaysInterveneDistribution:
+    """Minimal distribution interface for the no-intervention head residual mode."""
+
+    def __init__(self, reference: torch.Tensor):
+        self._reference = reference
+
+    def mode(self) -> torch.Tensor:
+        return torch.ones(
+            self._reference.shape[:-1],
+            device=self._reference.device,
+            dtype=torch.long,
+        )
+
+    def sample(self) -> torch.Tensor:
+        return self.mode()
 
 
 class ResidualPolicy(BasePolicy):
@@ -36,7 +48,9 @@ class ResidualPolicy(BasePolicy):
         action_net_hidden_dim: int,
         action_net_hidden_depth: int,
         action_net_activation: str = "relu",
+        action_prediction_horizon: int = 1,
         gmm_low_noise_eval: bool = True,
+        dropout_rate: float = 0.0,
         # ====== Intervention ======
         learn_gripper_action: bool = True,
         include_robot_gripper_action_input: bool = True,
@@ -44,17 +58,11 @@ class ResidualPolicy(BasePolicy):
         intervention_head_hidden_dim: int,
         intervention_head_hidden_depth: int,
         intervention_head_activation: str = "relu",
+        intervention_min_duration_steps: int = 1,
         deterministic_inference: bool = True,
         update_intervention_head_only: bool = False,
         ckpt_path_if_update_intervention_head_only: Optional[str] = None,
         intervention_loss_weight: float = 1.0,
-        supervise_zero_residual_off_intervention: bool = False,
-        zero_residual_loss_weight: float = 1.0,
-        off_intervention_residual_l1_weight: float = 0.0,
-        # ====== Base Policy ======
-        base_policy: BasePolicy,
-        base_policy_ckpt_path: str,
-        base_policy_overrides: Optional[List[str]] = None,
         # ====== Learning ======
         lr: float,
         use_cosine_lr: bool = True,
@@ -87,13 +95,22 @@ class ResidualPolicy(BasePolicy):
         self.action_net = GMMHead(
             input_dim=feature_fusion_output_dim,
             n_modes=action_net_gmm_n_modes,
-            action_dim=action_dim,
+            action_dim=action_dim * action_prediction_horizon,
             hidden_dim=action_net_hidden_dim,
             hidden_depth=action_net_hidden_depth,
             activation=action_net_activation,
             low_noise_eval=gmm_low_noise_eval,
         )
+        if not 0.0 <= dropout_rate < 1.0:
+            raise ValueError("dropout_rate must be in [0, 1).")
+        self.dropout = torch.nn.Dropout(dropout_rate) if dropout_rate > 0 else torch.nn.Identity()
+        self.action_dim = action_dim
+        self.action_prediction_horizon = action_prediction_horizon
         self._use_intervention_head = use_intervention_head
+        if intervention_min_duration_steps < 1:
+            raise ValueError("intervention_min_duration_steps must be >= 1.")
+        self.intervention_min_duration_steps = intervention_min_duration_steps
+        self.intervention_head = None
         if self._use_intervention_head:
             self.intervention_head = CategoricalNet(
                 feature_fusion_output_dim,
@@ -102,122 +119,54 @@ class ResidualPolicy(BasePolicy):
                 hidden_depth=intervention_head_hidden_depth,
                 activation=intervention_head_activation,
             )
-        else:
-            self.intervention_head = None
+        elif update_intervention_head_only:
+            raise ValueError(
+                "update_intervention_head_only requires use_intervention_head=True."
+            )
         if update_intervention_head_only:
-            assert self._use_intervention_head, "update_intervention_head_only requires use_intervention_head=true"
             assert os.path.exists(ckpt_path_if_update_intervention_head_only)
             ckpt = torch.load(
-                ckpt_path_if_update_intervention_head_only, map_location="cpu"
+                ckpt_path_if_update_intervention_head_only, map_location="cpu", weights_only=False
             )
+            state_dict = ckpt["state_dict"]
 
-            feature_extractor_weighs = {
-                k: v
-                for k, v in ckpt["state_dict"].items()
-                if k.startswith("residual_policy.feature_extractor")
-            }
+            def _extract_weights(prefixes: List[str]) -> tuple[Dict[str, Any], str]:
+                for prefix in prefixes:
+                    weights = {k: v for k, v in state_dict.items() if k.startswith(prefix)}
+                    if weights:
+                        return weights, prefix
+                available_keys = list(state_dict.keys())[:10]
+                raise KeyError(
+                    f"Could not find checkpoint weights for any of prefixes {prefixes}. "
+                    f"Sample checkpoint keys: {available_keys}"
+                )
+
+            feature_extractor_weights, feature_prefix = _extract_weights(
+                ["residual_policy.feature_extractor.", "feature_extractor."]
+            )
             load_state_dict(
                 self.feature_extractor,
-                feature_extractor_weighs,
-                strip_prefix="residual_policy.feature_extractor.",
+                feature_extractor_weights,
+                strip_prefix=feature_prefix,
                 strict=True,
             )
             freeze_params(self.feature_extractor)
 
-            action_net_weights = {
-                k: v
-                for k, v in ckpt["state_dict"].items()
-                if k.startswith("residual_policy.action_net")
-            }
+            action_net_weights, action_prefix = _extract_weights(
+                ["residual_policy.action_net.", "action_net."]
+            )
             load_state_dict(
                 self.action_net,
                 action_net_weights,
-                strip_prefix="residual_policy.action_net.",
+                strip_prefix=action_prefix,
                 strict=True,
             )
             freeze_params(self.action_net)
 
         self._deterministic_inference = deterministic_inference
         self._intervention_loss_weight = intervention_loss_weight
-        self._supervise_zero_residual_off_intervention = supervise_zero_residual_off_intervention
-        self._zero_residual_loss_weight = zero_residual_loss_weight
-        self._off_intervention_residual_l1_weight = off_intervention_residual_l1_weight
         self._learn_gripper_action = learn_gripper_action
         self._include_robot_gripper_action_input = include_robot_gripper_action_input
-        
-        self._base_policy = None
-        if base_policy_ckpt_path is not None:
-            assert base_policy is not None, "Must provide base_policy config name when base_policy_ckpt_path is provided!"
-
-            # base_policy is a config name (e.g., "diffusion_rgbd_unet")
-            overrides = [f"arch={base_policy}"]
-
-            # Filter out residual-module-specific overrides that should not leak
-            # into the nested base-policy compose.
-            def _skip_nested_module_override(override: str) -> bool:
-                return (
-                    override.startswith("module.")
-                    or override.startswith("+module.")
-                    or override.startswith("++module.")
-                )
-
-            cli_overrides = []
-            if GlobalHydra.instance().is_initialized():
-                try:
-                    hydra_cfg = HydraConfig.get()
-                    cli_overrides = [
-                        o for o in hydra_cfg.overrides.task
-                        if not o.startswith("arch=")
-                        and not _skip_nested_module_override(o)
-                    ]
-                except Exception:
-                    cli_overrides = []
-
-            # In serve/eval mode HydraConfig may be incomplete. Fall back to
-            # original CLI so the nested base-policy compose still sees robot/task.
-            if (
-                not any(o.startswith("robot=") for o in cli_overrides)
-                or not any(o.startswith("task=") for o in cli_overrides)
-            ):
-                argv_overrides = [
-                    o for o in sys.argv[1:]
-                    if not o.startswith("arch=")
-                    and not _skip_nested_module_override(o)
-                ]
-                for override in argv_overrides:
-                    if override not in cli_overrides:
-                        cli_overrides.append(override)
-
-            overrides.extend(cli_overrides)
-
-            if base_policy_overrides is not None:
-                overrides.extend(base_policy_overrides)
-
-            if GlobalHydra.instance().is_initialized():
-                base_policy_cfg = compose(config_name="base_config", overrides=overrides)
-                base_policy_cfg = base_policy_cfg.module
-            else:
-                config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs")
-                config_dir = os.path.abspath(config_dir)
-                with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
-                    base_policy_cfg = compose(config_name="base_config", overrides=overrides)
-                    base_policy_cfg = base_policy_cfg.module
-            register_omegaconf_resolvers()
-            OmegaConf.resolve(base_policy_cfg)
-            self._base_policy = instantiate(base_policy_cfg, _recursive_=False)
-
-            ckpt = load_torch(
-                base_policy_ckpt_path,
-                map_location="cpu",
-            )
-            load_state_dict(
-                self._base_policy,
-                ckpt["state_dict"],
-                strict=True
-            )
-            self._base_policy = self._base_policy.to("cuda")
-            self._base_policy.eval()
-            freeze_params(self._base_policy)
 
         # ====== Learning ======
         self.lr = lr
@@ -239,39 +188,39 @@ class ResidualPolicy(BasePolicy):
             else:
                 prop_obs.append(obs[prop_key])
         prop_obs = torch.cat(prop_obs, dim=-1)  # (B, L, Prop_dim)
+        obs_time = prop_obs.shape[1]
+        obs = dict(obs)
         obs["proprioception"] = prop_obs
         obs = {k: obs[k] for k in self._features}  # filter obs to only include features we have
+        if "base_action" in obs:
+            obs["base_action"] = self._format_action_chunk(obs["base_action"])
+            if obs["base_action"].shape[1] == 1 and obs_time > 1:
+                obs["base_action"] = obs["base_action"].expand(-1, obs_time, -1)
         obs_feature = self.feature_extractor(obs)  # (B, T_O, D)
+        if obs_feature.dim() >= 3:
+            obs_feature = obs_feature[:, -1:]
+        obs_feature = self.dropout(obs_feature)
         action_dist = self.action_net(obs_feature)
-        intervention_dist = self.intervention_head(obs_feature) if self._use_intervention_head else None
+        if self._use_intervention_head:
+            intervention_dist = self.intervention_head(obs_feature)
+        else:
+            intervention_dist = _AlwaysInterveneDistribution(obs_feature)
         return action_dist, intervention_dist
 
     @torch.no_grad()
-    def act_bundle(self, obs, deterministic=None):
-        action_dist, intervention_dist = self.forward(obs)
+    def act(self, obs, deterministic=None):
         if deterministic is None:
             deterministic = self._deterministic_inference
-
-        residual_action = action_dist.mode() if deterministic else action_dist.sample()
-        if intervention_dist is None:
-            intervention = torch.ones(
-                residual_action.shape[:-1],
-                device=residual_action.device,
-                dtype=torch.long,
-            )
-            intervention_weight = torch.ones(
-                residual_action.shape[:-1],
-                device=residual_action.device,
-                dtype=residual_action.dtype,
-            )
+        
+        residual_action_dist, intervention_dist = self.forward(obs)
+        if deterministic:
+            residual_action = residual_action_dist.mode()
+            intervention = intervention_dist.mode()
         else:
-            intervention = intervention_dist.mode() if deterministic else intervention_dist.sample()
-            intervention_weight = intervention_dist.probs[..., 1]
-        return residual_action, intervention, intervention_weight
+            residual_action = residual_action_dist.sample()
+            intervention = intervention_dist.sample()
+        residual_action = self._unflatten_action_chunk(residual_action)
 
-    @torch.no_grad()
-    def act(self, obs, deterministic=None):
-        residual_action, intervention, _ = self.act_bundle(obs, deterministic=deterministic)
         return residual_action, intervention
 
     def reset(self) -> None:
@@ -327,8 +276,11 @@ class ResidualPolicy(BasePolicy):
 
         pad_mask = batch.pop("masks")
         intervention_mask = batch.pop("int_state") == 2  # intervention happened
-        action_valid_mask = intervention_mask & pad_mask
-        non_intervention_mask = (~intervention_mask) & pad_mask
+        if self._use_intervention_head:
+            action_valid_mask = self._action_valid_mask(pad_mask, intervention_mask)
+        else:
+            action_valid_mask = self._action_valid_mask(pad_mask, torch.ones_like(intervention_mask, dtype=torch.bool))
+        
         # get residual action target
         robot_policy_action = batch["base_action"]
         oracle_action = batch["oracle_action"]
@@ -358,83 +310,94 @@ class ResidualPolicy(BasePolicy):
             target_action = torch.cat([residual_q, residual_gripper], dim=-1)
         else:
             target_action = residual_q
-        if self._supervise_zero_residual_off_intervention:
-            target_action = torch.where(
-                intervention_mask.unsqueeze(-1),
-                target_action,
-                torch.zeros_like(target_action),
+        if not self._use_intervention_head:
+            target_action = target_action * intervention_mask.unsqueeze(-1).to(
+                target_action.dtype
             )
-            action_valid_mask = pad_mask
         if self._include_robot_gripper_action_input:
             batch["robot_policy_gripper_action"] = robot_policy_gripper_action
+        if target_action.dim() == 4:
+            target_action = self._format_action_chunk(target_action)
+            action_valid_mask = self._current_mask(action_valid_mask) & pad_mask.all(dim=-1)
+        elif self.action_prediction_horizon != 1:
+            raise ValueError(
+                "ResidualPolicy expected chunked correction targets with shape "
+                f"(B, T, {self.action_prediction_horizon}, A), but got {target_action.shape}."
+            )
         # forward pass
         pi, intervention_dist = self.forward(batch)
         raw_action_loss = pi.imitation_loss(
             target_action, reduction="none"
         ).reshape(action_valid_mask.shape)
-        intervention_action_loss = raw_action_loss * (intervention_mask & pad_mask)
-        non_intervention_action_loss = raw_action_loss * non_intervention_mask
-        raw_non_intervention_residual_l1 = (
-            -pi.imitation_accuracy(
-                torch.zeros_like(target_action),
-                reduction="none",
-            ).reshape(pad_mask.shape)
-        )
-        non_intervention_residual_l1 = raw_non_intervention_residual_l1 * non_intervention_mask
-        if intervention_dist is not None:
-            raw_intervention_loss = intervention_dist.imitation_loss(
-                intervention_mask.long(), reduction="none"
-            ).reshape(pad_mask.shape)
-            intervention_loss = raw_intervention_loss * pad_mask
-            intervention_acc = intervention_dist.imitation_accuracy(
-                intervention_mask.long(),
-                mask=pad_mask,
-            )
-        else:
-            intervention_loss = torch.zeros_like(raw_action_loss)
-            intervention_acc = torch.ones((), device=target_action.device, dtype=target_action.dtype)
-        intervention_steps = (intervention_mask & pad_mask).sum()
-        non_intervention_steps = non_intervention_mask.sum()
+        action_loss = raw_action_loss * action_valid_mask
         real_batch_size = action_valid_mask.sum()
-        intervention_action_loss = torch.sum(intervention_action_loss) / intervention_steps.clamp_min(1)
-        non_intervention_residual_l1 = (
-            torch.sum(non_intervention_residual_l1) / non_intervention_steps.clamp_min(1)
-        )
-        if self._supervise_zero_residual_off_intervention:
-            non_intervention_action_loss = (
-                torch.sum(non_intervention_action_loss) / non_intervention_steps.clamp_min(1)
+        action_loss = torch.sum(action_loss) / real_batch_size
+
+        # Using an intervention head or not?
+        if self._use_intervention_head:
+            intervention_target = self._current_intervention(intervention_mask)
+            intervention_loss_mask = self._current_mask(pad_mask)
+            raw_intervention_loss = intervention_dist.imitation_loss(
+                intervention_target.long(), reduction="none"
+            ).reshape(intervention_loss_mask.shape)
+            intervention_loss = raw_intervention_loss * intervention_loss_mask
+            intervention_acc = intervention_dist.imitation_accuracy(
+                intervention_target.long(),
+                mask=intervention_loss_mask,
             )
-            loss_weight_denom = 1.0 + (
-                self._zero_residual_loss_weight if non_intervention_steps.item() > 0 else 0.0
-            )
-            action_loss = (
-                intervention_action_loss
-                + self._zero_residual_loss_weight * non_intervention_action_loss
-            ) / loss_weight_denom
+            intervention_loss = torch.sum(intervention_loss) / intervention_loss_mask.sum()
+            loss = action_loss + self._intervention_loss_weight * intervention_loss
         else:
-            non_intervention_action_loss = torch.zeros_like(intervention_action_loss)
-            action_loss = intervention_action_loss
-        intervention_loss = (torch.sum(intervention_loss) / pad_mask.sum())
-        loss = (
-            action_loss
-            + self._intervention_loss_weight * intervention_loss
-            + self._off_intervention_residual_l1_weight * non_intervention_residual_l1
-        )
+            intervention_loss = action_loss.new_zeros(())
+            intervention_acc = action_loss.new_ones(())
+            loss = action_loss
+
         log_dict = {
             "action_loss": action_loss,
-            "intervention_action_loss": intervention_action_loss,
-            "non_intervention_action_loss": non_intervention_action_loss,
-            "non_intervention_residual_l1": non_intervention_residual_l1,
             "intervention_loss": intervention_loss,
             "intervention_acc": intervention_acc,
-            "intervention_rate": intervention_steps.float() / pad_mask.sum().clamp_min(1),
         }
         if not is_train:
             # use the combined loss as a proxy for evaluation
             log_dict.update({
-                "l1": action_loss + intervention_loss,
+                "l1": loss,
             })
         return loss, log_dict, real_batch_size
+
+    def _format_action_chunk(self, action: torch.Tensor) -> torch.Tensor:
+        if action.dim() >= 4:
+            return action.reshape(*action.shape[:-2], action.shape[-2] * action.shape[-1])
+        return action
+
+    def _unflatten_action_chunk(self, action: torch.Tensor) -> torch.Tensor:
+        if self.action_prediction_horizon == 1:
+            return action
+        return action.reshape(
+            *action.shape[:-1],
+            self.action_prediction_horizon,
+            self.action_dim,
+        )
+
+    def _current_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        if mask.dim() >= 3:
+            return mask[..., 0]
+        return mask
+
+    def _current_intervention(self, intervention_mask: torch.Tensor) -> torch.Tensor:
+        if intervention_mask.dim() >= 3:
+            return intervention_mask[..., 0]
+        return intervention_mask
+
+    def _action_valid_mask(
+        self,
+        pad_mask: torch.Tensor,
+        intervention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if pad_mask.dim() >= 3 and intervention_mask.dim() == pad_mask.dim() - 1:
+            intervention_mask = intervention_mask.unsqueeze(-1).expand_as(pad_mask)
+        elif intervention_mask.dim() >= 3 and pad_mask.dim() == intervention_mask.dim() - 1:
+            pad_mask = pad_mask.unsqueeze(-1).expand_as(intervention_mask)
+        return intervention_mask & pad_mask
     
     def process_data(self, data_batch: dict, extract_action: bool = False) -> Any:
         # process observation data

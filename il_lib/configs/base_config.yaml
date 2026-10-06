@@ -33,6 +33,7 @@ online_eval: null
 horizon: ???
 num_latest_obs: ???
 deployed_action_steps: ???
+max_num_demos: null
 
 # ====== Wandb ======
 use_wandb: true
@@ -67,7 +68,12 @@ data:
   val_split_ratio: 0.1
   dataloader_num_workers: 8
   shuffle: ${eval:'not ${trainer.use_distributed_sampler}'}
-  max_num_demos: null 
+  max_num_demos: ${max_num_demos}
+  # Optional source selection: file names to include, per-file train demo caps,
+  # and whether capped-out demos become validation data.
+  included_data_files: null
+  per_file_train_demo_limits: null
+  use_limit_overflow_as_val: false
   seed: ${seed}
   dataset_class: omnigibson.learning.datas.BehaviorIterableDataset
   # ====== Dataset ======
@@ -93,18 +99,19 @@ trainer:
       seconds: 3600
   benchmark: true  # enables cudnn.benchmark
   accumulate_grad_batches: 1
-  num_sanity_val_steps: 1
+  num_sanity_val_steps: 0
   max_steps: ${max_steps}
   val_check_interval: ${val_check_interval}
   check_val_every_n_epoch: ${check_val_every_n_epoch}
+  limit_val_batches: 1.0
   gradient_clip_val: 1.0
   fast_dev_run: false
   use_distributed_sampler: true
   checkpoint:  # this sub-dict will be popped to send to ModelCheckpoint as args
-  - filename: "step_{step}-epoch_{epoch}-loss_{val/l1:.4f}"
+  # Validation can be disabled (data.val_split_ratio=0), so checkpoints are not
+  # tied to a validation metric.
+  - filename: "step_{step}-epoch_{epoch}"
     save_top_k: -1
-    monitor: "val/l1"
-    mode: min
     auto_insert_metric_name: false  # prevent creating subfolder caused by the slash
   callbacks:
     - _target_: pytorch_lightning.callbacks.LearningRateMonitor
